@@ -1,0 +1,135 @@
+# Financial Agent Configuration - Groq Edition
+# Optimized for Small Cap Growth Strategy
+
+# AI Provider
+st
+
+# Stock Screening
+screening:
+  enabled: true
+  strategy: custom
+  stock_universes:
+    - "SP500"
+    - "NASDAQ100"
+    - "RUSSELL2000"
+  
+  # Price Affordability (IMPORTANT!)
+  max_price_per_share: 150       # Maximum price you can afford per share (was $75)
+                                 # Raised to $150 for more realistic options
+                                 # Set this based on your budget!
+                                 # Examples: 50, 100, 200, 500
+
+  # Custom filters (used when strategy="custom")
+  custom_filters:
+    min_market_cap: 300_000_000      # $300M
+    max_market_cap: 50_000_000_000   # $50B (includes mid-cap)
+    min_price: 3                     # Avoid very cheap stocks
+    max_price: 150                   # Maximum affordable price per share
+    min_revenue_growth: 0.10         # 10%+ (more lenient)
+    min_earnings_growth: 0.10        # 10%+ (more lenient)
+    positive_earnings: false         # Allow unprofitable growth companies
+    min_volume: 200_000              # Lower volume = more options
+    
+    # Customize sectors here! Only stocks in these sectors will be included
+    sectors:
+      - "Technology"                 # AI, Software, Semiconductors, etc.
+      - "Healthcare"                 # Biotech, Medical Devices, etc.
+      - "Consumer Cyclical"        # Retail, Entertainment (uncomment to include)
+      - "Consumer Defensive"       # Food, Beverages (uncomment to include)
+      - "Industrials"              # Manufacturing, Aerospace (uncomment to include)
+      - "Communication Services"   # Media, Telecom (uncomment to include)
+      - "Financial Services"       # Banks, Insurance (uncomment to include)
+      - "Energy"                   # Oil, Gas, Renewables (uncomment to include)
+      - "Basic Materials"          # Mining, Chemicals (uncomment to include)
+      - "Real Estate"              # REITs, Property (uncomment to include)
+      - "Utilities"                # Electric, Water, Gas (uncomment to include)
+  
+  # Custom tickers (used when stock_universe="CUSTOM")
+  custom_tickers:
+    - "AAPL"
+    - "MSFT"
+    - "GOOGL"
+  
+  # Limit number of stocks to analyze
+  max_stocks: 50                # Analyze top 50 after screening
+
+# Analysis Parameters
+analysis:
+  # Value Investing Criteria
+  value:
+    max_pe_ratio: 25            # Higher for growth stocks
+    max_pb_ratio: 3.0           # Higher for growth stocks
+    max_debt_equity: 2.0        # More lenient for small caps
+    min_dividend_yield: 0.00    # Growth stocks don't always pay dividends
+  
+  # Growth Investing Criteria (KEY FOR SMALL CAP GROWTH!)
+  growth:
+    min_earnings_growth: 0.10    # 10%+ earnings growth (more lenient)
+    min_revenue_growth: 0.15     # 15%+ revenue growth (more lenient)
+    min_market_cap: 300_000_000  # $300M minimum
+    max_market_cap: 50_000_000_000 # $50B maximum (was $10B - now includes more stocks!)
+  
+  # Technical Analysis
+  technical:
+    rsi_oversold: 30
+    rsi_overbought: 70
+    ma_short_period: 50          # 50-day moving average
+    ma_long_period: 200          # 200-day moving average
+  
+  # Scoring weights (customize for your strategy)
+  weights:
+    value: 0.20      # Less important for growth stocks
+    growth: 0.50     # Most important for small cap growth!
+    technical: 0.30  # Important for timing
+
+# Data Sources
+data_sources:
+  primary: "yfinance"            # yahoo finance
+  backup: "alpha_vantage"        # if yfinance fails
+  cache_duration: 3600           # Cache data for 1 hour (seconds)
+
+# Stock Universe
+stocks:
+  # Predefined lists
+  scan_lists:
+    - "SP500"
+    - "NASDAQ100"
+  
+  # Test tickers for quick testing
+  test_tickers:
+    - "SQ"       # Block (formerly Square)
+    - "SHOP"     # Shopify
+    - "ROKU"     # Roku
+    - "ZM"       # Zoom
+    - "DDOG"     # Datadog
+    - "CRWD"     # CrowdStrike
+    - "NET"      # Cloudflare
+    - "PLTR"     # Palantir
+
+# Logging
+logging:
+  level: "DEBUG"              # DEBUG to see why stocks are filtered
+  file: "logs/agent.log"
+  max_size_mb: 10
+  backup_count: 5
+  console_output: true
+
+# Recommendations
+recommendations:
+  confidence_threshold: 0.6      # Lower for more opportunities
+  risk_levels:
+    - "LOW"
+    - "MEDIUM"
+    - "HIGH"
+  
+  # Minimum scores for recommendations
+  min_score_for_buy: 65         # 65/100 for BUY
+  min_score_for_hold: 40        # 40-64 for HOLD
+  # Below 40 = SELL
+
+# Performance & Cost Optimization
+optimization:
+  parallel_analysis: false       # Analyze stocks in parallel (faster but more API calls)
+  batch_size: 10                 # Process N stocks at a time
+  save_results: true            # Save results to file
+  results_file: "data/analysis_results.json"

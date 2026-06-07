@@ -1,0 +1,1 @@
+- [DSSPT Pairs Trading Module](project_pairs_trading.md) — Architecture, design decisions, and file map for pairs trading feature added 2026-04-17

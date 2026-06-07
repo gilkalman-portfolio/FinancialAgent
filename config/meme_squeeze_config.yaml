@@ -1,0 +1,176 @@
+# Meme-Squeeze Sentinel Configuration
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+watchlist:
+  # Custom tickers to monitor
+  custom:
+    - GME          # GameStop
+    - AMC          # AMC Entertainment
+    - BBBY         # Bed Bath & Beyond
+    - DJT          # Trump Media & Technology
+    
+  # Quantum Computing
+  quantum:
+    - IONQ         # IonQ
+    - RGTI         # Rigetti Computing
+    - QBTS         # D-Wave Quantum
+    - ARQQ         # Arqit Quantum
+    - QUBT         # Quantum Computing Inc
+    
+  # Space Stocks
+  space:
+    - LUNR         # Intuitive Machines
+    - RKLB         # Rocket Lab
+    - SPCE         # Virgin Galactic
+    
+  # High Growth Volatiles
+  growth:
+    - PLTR         # Palantir
+    - SOFI         # SoFi
+    - RIVN         # Rivian
+    - LCID         # Lucid Motors
+
+# Enable Russell 2000 scanning (600+ small caps)
+scan_russell_2000: false  # Set to true for comprehensive scanning
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCORING WEIGHTS (must sum to 1.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+weights:
+  squeeze_factor: 0.35       # Short Interest × Days to Cover
+  social_velocity: 0.25      # Reddit mention acceleration
+  volume_confirmation: 0.25  # Relative Volume
+  technical_trigger: 0.15    # EMA + Breakout
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THRESHOLDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+thresholds:
+  # Minimum short interest to consider (%)
+  min_short_interest: 18.0
+  
+  # Minimum relative volume (times average)
+  min_rvol: 2.5
+  
+  # Flag institutional dump risk if ownership exceeds (%)
+  institutional_dump_risk: 85.0
+  
+  # Minimum explosion score to report
+  min_explosion_score: 60.0
+  
+  # Google Trends minimum interest (0-100)
+  google_trends_threshold: 50
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REDDIT MONITORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+reddit:
+  # Subreddits to monitor
+  subreddits:
+    - wallstreetbets
+    - shortsqueeze
+    - stocks
+    - pennystocks     # Optional
+  
+  # Time windows for velocity calculation (hours)
+  recent_window: 4
+  baseline_window: 24
+  
+  # Maximum posts to scan per subreddit
+  max_posts_per_sub: 100
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TECHNICAL ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+technical:
+  # EMA period for trend detection
+  ema_period: 20
+  
+  # Breakout window (days)
+  breakout_window: 5
+  
+  # Breakout tolerance (allow within X% of high)
+  breakout_tolerance: 0.01  # 1%
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RISK MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+risk:
+  # Stop-loss percentage below entry
+  stop_loss_pct: 0.08  # 8%
+  
+  # Maximum position size (% of portfolio) - informational only
+  max_position_size: 0.05  # 5%
+  
+  # Risk/Reward ratio targets
+  min_risk_reward: 2.0  # Aim for 2:1 minimum
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCHEDULING
+# ══════════════════════════════════════════════════════════════════════════════
+
+schedule:
+  # Scan frequency during market hours (minutes)
+  scan_interval: 60
+  
+  # Market hours (EST)
+  market_open: "09:30"
+  market_close: "16:00"
+  
+  # Run during pre-market/after-hours?
+  include_extended_hours: false
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+
+database:
+  # Path relative to project root
+  path: "data/meme_squeeze.db"
+  
+  # Retention period (days)
+  retention_days: 30
+  
+  # Auto-cleanup old records?
+  auto_cleanup: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALERTS (Future Implementation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+alerts:
+  # Enable Telegram notifications
+  telegram_enabled: false
+  
+  # Alert thresholds
+  critical_score: 85  # Extreme opportunities
+  high_score: 70      # Strong setups
+  
+  # Rate limiting (max alerts per day)
+  max_alerts_per_day: 10
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+logging:
+  # Console log level
+  console_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  
+  # File log level
+  file_level: "DEBUG"
+  
+  # Log file path
+  log_file: "logs/meme_squeeze.log"
+  
+  # Log rotation
+  rotation: "10 MB"
+  retention: "7 days"

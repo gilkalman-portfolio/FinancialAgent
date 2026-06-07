@@ -1,0 +1,96 @@
+{
+  "enabled": true,
+  "times": [
+    "08:30",
+    "15:00"
+  ],
+  "watchlist_time": "12:00",
+  "portfolio_time": "09:15",
+  "market_digest_time": "09:30",
+  "portfolio_news_time": "08:30",
+  "squeeze_scan_time": "12:00",
+  "price_alert_interval_minutes": 5,
+  "news_catalyst_enabled": true,
+  "news_catalyst_interval_minutes": 15,
+  "news_catalyst_threshold": 3,
+  "news_catalyst_max_llm_per_cycle": 3,
+  "news_catalyst_scope": "portfolio+watchlist",
+  "sectors": [
+    "Information Technology",
+    "Cash and/or Derivatives",
+    "Communication",
+    "Consumer Discretionary",
+    "Consumer Staples",
+    "Energy",
+    "Health Care",
+    "Materials",
+    "Industrials",
+    "Financials",
+    "Real Estate",
+    "Utilities"
+  ],
+  "max_stocks": 50,
+  "scan_indices": ["Russell 2000", "S&P 500"],
+  "min_score": 70,
+  "forecast_days": 30,
+  "telegram": true,
+  "auto_watchlist_scan": true,
+  "max_daily_loss_pct": 0.02,
+  "news_catalyst_max_article_age_minutes": 45,
+  "long_setups_enabled": true,
+  "long_setups_time": "09:30",
+  "long_setups_min_score": 55,
+  "long_setups_top_n": 5,
+  "alert_monitor_time": "09:30",
+  "weekly_rotation_time": "08:15",
+  "catalyst_alert_time": "08:05",
+  "momentum_enabled": true,
+  "momentum_interval_minutes": 30,
+  "momentum_threshold": 70,
+  "momentum_indices": ["Russell 2000", "S&P 500"],
+  "auto_watchlist": {
+    "enabled": true,
+    "default_min_score": 60,
+    "default_max_results": 20,
+    "sources": {
+      "squeeze": {
+        "enabled": true,
+        "min_score": 65,
+        "min_si_pct": 15,
+        "min_days_to_cover": 3,
+        "volume_spike_x": 2.5,
+        "alert_pct": 5.0,
+        "max_market_cap": 5000000000,
+        "min_avg_dollar_volume": 1000000
+      },
+      "catalyst": {
+        "enabled": true,
+        "min_explosion_score": 60,
+        "min_si_pct": 5,
+        "volume_spike_x": 1.8,
+        "alert_pct": 4.0,
+        "max_market_cap": 10000000000,
+        "min_avg_dollar_volume": 1000000
+      },
+      "momentum": {
+        "enabled": true,
+        "min_score": 70,
+        "rvol_min": 2.0,
+        "volume_spike_x": 2.0,
+        "breakout_lookback_days": 20,
+        "price_change_5d_min": 8.0,
+        "min_avg_dollar_volume": 2000000
+      }
+    },
+    "deduplication": {
+      "enabled": true,
+      "cooldown_minutes": 1440,
+      "key_fields": ["ticker", "source"]
+    },
+    "watchlist_policy": {
+      "max_items_per_source": 10,
+      "max_items_total": 30,
+      "require_liquidity_check": true
+    }
+  }
+}

@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+
+# Data and logs
+data/*.csv
+data/*.json
+logs/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project specific
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Second venv (Python 3.13 for IBKR worker)
+.venv313/
+
+# Logs directory & PID files
+logs/
+*.pid
+
+# Cached data files
+data/index_cache/
+data/pdufa_cache.json
+data/analysis_results.json
+data/orcl_analysis.json
+data/pattern_analysis_results.json
+data/alert_monitor_log.txt
+
+# Backups
+backups_phase0/
+backups_phase1/
+
+# Reports & temp output
+report_file
+report_file/
+reports/
+
+# Screenshots
+*.png
+
+# Temp / scratch files
+_tmp_*.py
+
+# Binary executables
+cloudflared.exe
+
+# Config backups
+*.bak
+
+# alert audit log
+alert_audit.md

@@ -1,0 +1,92 @@
+# Budget Investor Config - For investors with $1,000-$2,500
+# Focus: Affordable stocks with good growth potential
+
+# Copy this to config_groq.yaml to use
+
+ai_provider:
+  service: "groq"
+  groq_model: "llama-3.1-70b-versatile"
+  fallback_to_rules: true
+
+screening:
+  enabled: true
+  strategy: "small_cap_growth"
+  stock_universe: "SP500"
+  
+  # BUDGET SETTINGS - Only afford stocks under $25!
+  max_price_per_share: 25        # 🎯 KEY: Maximum $25 per share
+  
+  custom_filters:
+    min_market_cap: 300_000_000
+    max_market_cap: 2_000_000_000
+    min_price: 5                  # Avoid penny stocks
+    max_price: 25                 # Match max_price_per_share
+    min_revenue_growth: 0.20
+    min_earnings_growth: 0.15
+    positive_earnings: true
+    min_volume: 500_000
+    sectors:
+      - "Technology"
+      - "Healthcare"
+      - "Consumer Discretionary"
+      - "Industrials"
+  
+  max_stocks: 30
+
+analysis:
+  value:
+    max_pe_ratio: 25
+    max_pb_ratio: 3.0
+    max_debt_equity: 2.0
+    min_dividend_yield: 0.00
+  
+  growth:
+    min_earnings_growth: 0.20
+    min_revenue_growth: 0.25
+    min_market_cap: 300_000_000
+    max_market_cap: 2_000_000_000
+  
+  technical:
+    rsi_oversold: 30
+    rsi_overbought: 70
+    ma_short_period: 50
+    ma_long_period: 200
+  
+  weights:
+    value: 0.20
+    growth: 0.50
+    technical: 0.30
+
+data_sources:
+  primary: "yfinance"
+  cache_duration: 3600
+
+stocks:
+  test_tickers:
+    - "F"        # Ford - ~$12
+    - "INTC"     # Intel - ~$24
+    - "BAC"      # Bank of America - ~$20
+    - "T"        # AT&T - ~$18
+    - "AAL"      # American Airlines - ~$15
+
+logging:
+  level: "INFO"
+  file: "logs/agent.log"
+  max_size_mb: 10
+  backup_count: 5
+
+recommendations:
+  confidence_threshold: 0.6
+  min_score_for_buy: 65
+  min_score_for_hold: 40
+
+optimization:
+  parallel_analysis: false
+  batch_size: 10
+  save_results: true
+  results_file: "data/budget_analysis.json"
+
+# Portfolio Example with $2,000:
+# - 4 stocks × $500 each
+# - Each stock: 20-100 shares (depending on price)
+# - Good diversification even on small budget!

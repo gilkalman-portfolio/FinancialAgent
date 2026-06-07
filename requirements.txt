@@ -1,0 +1,45 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# FINANCIAL AGENT - DEPENDENCIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Core Data & Analysis
+yfinance>=0.2.48           # Stock data
+pandas>=2.2.0              # Data manipulation
+numpy>=1.26.0              # Numerical computing
+pandas-ta>=0.3.14b         # Technical indicators
+scikit-learn>=1.3.0        # MLP forecasting + MinMaxScaler
+statsmodels>=0.14.0        # ARIMA forecasting
+
+# APIs & Web
+requests>=2.31.0           # HTTP requests
+beautifulsoup4>=4.12.0     # HTML scraping (PDUFA calendar)
+python-dotenv>=1.0.0       # Environment variables
+
+# AI / LLM
+google-genai>=1.68.0       # Gemini 2.5 Flash (primary LLM)
+groq>=0.36.0               # Groq / Llama fallback
+
+# Database
+# sqlite3 — built-in, no install needed
+
+# Logging
+loguru>=0.7.2              # Better logging
+
+# Social Media / Trends
+praw>=7.7.1                # Reddit API (optional)
+pytrends>=4.9.2            # Google Trends
+
+# Scheduling
+schedule>=1.2.0            # Task scheduling
+apscheduler>=3.10.0        # Advanced scheduling
+
+# Web Dashboard
+streamlit>=1.41.0          # Web interface
+plotly>=5.18.0             # Interactive charts
+
+# File Export
+openpyxl>=3.1.2            # Excel export
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0

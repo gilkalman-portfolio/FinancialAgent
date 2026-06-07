@@ -1,0 +1,65 @@
+# Financial Agent Configuration
+
+# Analysis Parameters
+analysis:
+  # Value Investing Criteria
+  value:
+    max_pe_ratio: 15          # Maximum P/E ratio
+    max_pb_ratio: 1.5         # Maximum Price-to-Book
+    max_debt_equity: 1.0      # Maximum Debt/Equity ratio
+    min_dividend_yield: 0.02  # Minimum 2% dividend yield
+  
+  # Growth Investing Criteria
+  growth:
+    min_earnings_growth: 0.15  # Minimum 15% earnings growth
+    min_revenue_growth: 0.20   # Minimum 20% revenue growth
+    min_market_cap: 1000000000 # $1B minimum market cap
+  
+  # Technical Analysis
+  technical:
+    rsi_oversold: 30
+    rsi_overbought: 70
+    ma_short_period: 50       # 50-day moving average
+    ma_long_period: 200       # 200-day moving average
+
+# Data Sources
+data_sources:
+  primary: "yfinance"         # yahoo finance
+  backup: "alpha_vantage"     # if yfinance fails
+  cache_duration: 3600        # Cache data for 1 hour (seconds)
+
+# Agent Settings
+agent:
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 2000
+  temperature: 0.3            # Lower = more deterministic
+  
+# Stock Universe
+stocks:
+  # Start with major indices components
+  scan_lists:
+    - "SP500"                 # S&P 500 stocks
+    - "NASDAQ100"             # NASDAQ 100 stocks
+  
+  # Or specific tickers for testing
+  test_tickers:
+    - "AAPL"
+    - "MSFT"
+    - "GOOGL"
+    - "AMZN"
+    - "NVDA"
+
+# Logging
+logging:
+  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+  file: "logs/agent.log"
+  max_size_mb: 10
+  backup_count: 5
+
+# Recommendations
+recommendations:
+  confidence_threshold: 0.7   # Minimum confidence for recommendation
+  risk_levels:
+    - "LOW"
+    - "MEDIUM"
+    - "HIGH"
