@@ -138,8 +138,23 @@ class IBKRConnection:
         target_order.parentId = parent.orderId
         target_order.transmit = True  # transmit the whole bracket
 
-        for order in [parent, stop_order, target_order]:
-            self.ib.placeOrder(contract, order)
+        placed = []
+        try:
+            for order in [parent, stop_order, target_order]:
+                self.ib.placeOrder(contract, order)
+                placed.append(order)
+        except Exception as exc:
+            # Cancel whatever was submitted before the crash so IB doesn't
+            # get a dangling parent with no protective child orders.
+            for submitted in placed:
+                try:
+                    self.ib.cancelOrder(submitted)
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"[ibkr] bracket order failed mid-submission for {ticker} "
+                f"(placed {len(placed)}/3 legs) — rolled back: {exc}"
+            ) from exc
 
         logger.info(
             f"[ibkr] bracket order placed: {action} {shares} {ticker} "

@@ -313,19 +313,19 @@ def run_scan():
                 if _is_auto_ticker(item.get("notes", "")) and _min_hold_satisfied(item.get("added_at", "")):
                     try:
                         from src.database import watchlist_remove
-                        watchlist_remove(ticker)
+                        # Write cooldowns FIRST so they exist even if remove fails
                         watchlist_save_alert(
                             ticker, "auto_exit_score",
                             f"Auto-exit: score {r['score']:.0f} < {EXIT_SCORE_THRESHOLD}",
                             score=r["score"], price=r.get("price")
                         )
-                        # Also write a re-entry cooldown marker (7d) so this
-                        # ticker isn't immediately re-added by a later scan.
+                        # Re-entry cooldown marker (7d) — see _in_auto_exit_cooldown
                         watchlist_save_alert(
                             ticker, "auto_exit_cooldown",
                             f"Cooldown {AUTO_EXIT_COOLDOWN_DAYS}d after auto-exit (score {r['score']:.0f})",
                             score=r["score"], price=r.get("price")
                         )
+                        watchlist_remove(ticker)
                         auto_exited.append(f"{ticker} ({r['score']:.0f})")
                         _auto_exited_this_run.add(ticker)
                         logger.info(f"Auto-exit (scan): removed {ticker} (score {r['score']:.0f})")

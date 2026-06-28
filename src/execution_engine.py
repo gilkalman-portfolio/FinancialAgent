@@ -151,8 +151,8 @@ def check_daily_loss_limit() -> VetoResult:
         return VetoResult(passed=True, reason="")
 
     if portfolio_value <= 0:
-        logger.warning("check_daily_loss_limit: portfolio_value=0 — skipping")
-        return VetoResult(passed=True, reason="")
+        logger.warning("check_daily_loss_limit: portfolio_value unavailable — vetoing trade")
+        return VetoResult(passed=False, reason="portfolio_value unavailable — cannot evaluate daily loss limit")
 
     max_loss_pct = _get_max_daily_loss_pct()
     loss_threshold = -(max_loss_pct * portfolio_value)

@@ -52,13 +52,13 @@ AI-powered stock scanner & financial analysis dashboard.
 | `options_flow.py` | Options chain data, PCR, unusual call/put activity (yfinance). **OI=0 false positive fixed** — contracts with OI=0 and volume<500 are skipped; volume≥500 uses `volume/100` ratio instead of sentinel `9999`. |
 | `auto_watchlist_agent.py` | Auto-adds squeeze/catalyst/momentum candidates to watchlist with Telegram summary. **`alert_score` uses `AUTO_WL_SCORE_ENTRY` (70) from hysteresis.py** — consistent with all other auto-watchlist entry thresholds (was 60 from config). |
 | `ibkr_realtime.py` | IB Gateway connector via `ib_async` — historical bars + live snapshot + bracket order placement + position/account queries for US stocks |
-| `ibkr_worker.py` | Standalone daemon (Python 3.13, `.venv313`) — runs Supertrend(1H) every 5 min on the monitoring queue, fires combined alerts + submits orders via `order_manager` + syncs positions/daily P&L via `position_tracker`. **`sync_positions()` runs at the START of each cycle** (before ticker loop). **`bars_ago != 1` check** in `_check_ticker()` — only fires on the exact bar that flipped, preventing stale-flip duplicates. **`_is_signal_hours()` gate** — signals blocked outside 04:00–20:00 ET (`zoneinfo`), preventing pre-market/overnight order submission. Subscribes to `ib.orderStatusEvent` for fill/cancel callbacks. Startup reconciliation + periodic fill sweep (every 30 min). Hosts `TelegramCommandHandler` thread. |
+| `ibkr_worker.py` | Standalone daemon (Python 3.13, `.venv313`) — runs Supertrend(1H) every 5 min on the monitoring queue, fires combined alerts + submits orders via `order_manager` + syncs positions/daily P&L via `position_tracker`. **`sync_positions()` runs at the START of each cycle** (before ticker loop). **`bars_ago != 1` check** in `_check_ticker()` — only fires on the exact bar that flipped, preventing stale-flip duplicates. **`_is_signal_hours()` gate** — signals blocked outside 04:00–20:00 ET (`zoneinfo`), preventing pre-market/overnight order submission. Subscribes to `ib.orderStatusEvent` for fill/cancel callbacks. Startup reconciliation + periodic fill sweep (every 30 min). Hosts `TelegramCommandHandler` thread. **Windows named mutex singleton** (`Global\FinancialAgent_IBKRWorker_Singleton`) — `_acquire_singleton_lock()` in `main()` prevents two worker instances; second instance exits with code 1 immediately. `multiprocessing.freeze_support()` called in `__main__` to prevent Windows spawn-mode double-execution. **`_update_order_log()` race fix** — FILLED status uses `NOT IN ('FILLED','ERROR')` guard; CANCELLED uses `= 'SUBMITTED'` guard; prevents bracket-order child-leg cancel from overwriting a FILLED status. |
 | `monitoring_queue.py` | Source of truth for "which tickers get real-time IBKR monitoring" — scanner score ≥ 65 + manual watchlist + recent BUY alerts (72h) + liquidity gate (hysteresis: enter $5M / exit $3M ADV). Queue state persisted to `monitoring_queue_snapshot` DB table. **`_persist_queue()` only called when `apply_liquidity_gate=True`** — prevents `signal_combiner.evaluate()` calls (gate=False) from corrupting the snapshot with unfiltered tickers. |
 | `order_manager.py` | Wraps IBKR order calls; runs execution_engine veto checks before submission; logs every attempt to `order_log` DB table. Injects `position_tracker` into execution engine for daily loss limit. **Fetches `portfolio_tickers` from `ibkr_positions` DB before `evaluate_trade()`** — enables sector concentration veto (Layer 6). paper_mode=True default; live requires `IBKR_LIVE=true` env var. Module-level `_trading_paused` flag — when True, `submit()` returns PAUSED without evaluating. Passes `signal_type` ("BUY"/"SELL") to `evaluate_trade()`. |
-| `position_tracker.py` | Syncs IBKR positions to `ibkr_positions` DB table every 5 min; records `daily_pnl` once per day; exposes `get_current_exposure()`, `get_portfolio_value()`, `get_daily_pnl()` for execution engine. `get_portfolio_value()` DB fallback uses `ORDER BY date DESC LIMIT 1` (most recent row, not just today) — prevents returning 0.0 early morning before `record_daily_pnl()` runs. |
-| `signal_combiner.py` | Catalyst + composite score + Supertrend → BUY/SELL alert; enforces daily cap (10), 24h dedup, hysteresis on composite (entry 60 / hold 50). **`_try_claim_dedup()` performs SELECT+INSERT atomically in a single DB connection** — eliminates the race window of the old split check+write. `_record_dedup()` removed (was dead code). |
+| `position_tracker.py` | Syncs IBKR positions to `ibkr_positions` DB table every 5 min; records `daily_pnl` once per day; exposes `get_current_exposure()`, `get_portfolio_value()`, `get_daily_pnl()` for execution engine. `get_portfolio_value()` DB fallback uses `ORDER BY date DESC LIMIT 1` (most recent row, not just today) — prevents returning 0.0 early morning before `record_daily_pnl()` runs. **`record_daily_pnl()` 09:30 ET gate** — skips before 09:30 ET (market open) to avoid writing a $0 row from pre-market account summary; uses `INSERT OR REPLACE` (was `INSERT OR IGNORE`) so the row is updated if re-run after the first write. |
+| `signal_combiner.py` | Catalyst + composite score + Supertrend → BUY/SELL alert; enforces daily cap (10), 24h dedup, hysteresis on composite (entry 60 / hold 50). **`_try_claim_dedup()` performs SELECT+INSERT atomically in a single DB connection** — eliminates the race window of the old split check+write. `_record_dedup()` removed (was dead code). **SELL gate** — before firing a SELL alert, checks `ibkr_positions WHERE ticker = ? AND shares > 0`; suppresses SELL (no Telegram, no order) when no open position exists. |
 | `forward_signals.py` | Records every fired alert with entry price + data quality check; `record_fill()` updates `fill_price`/`fill_source` from IBKR callback — **guards against CANCELLED orders** (cross-checks `order_log.status` before writing, skips if CANCELLED to prevent bracket-order race from corrupting win-rate); daily 18:00 job fills `price_after_{7,14,30}d`; weekly Friday 20:00 Telegram digest with win-rate metrics |
-| `earnings_sentiment.py` | Tier 1 = Finnhub EPS surprise history (free), Tier 2 = LLM transcript analysis (paid). Score 0–5 added to `stock_scorer.py` bonus band |
+| `earnings_sentiment.py` | Tier 1 = Finnhub EPS surprise history (free), Tier 2 = LLM transcript analysis (paid). Score 0–5 added to `stock_scorer.py` bonus band. **EDGAR fallback**: when Finnhub returns empty, uses `edgar_fcf.get_eps_yoy_growth()` (YoY EPS% proxy, `source='edgar_eps_yoy'`) instead of returning score=0. |
 | `hysteresis.py` | Central helper `passes_hysteresis(current, in_set, entry, exit)` + threshold constants (composite, SI, liquidity, watchlist score) |
 | `stock_forecaster.py` | Ensemble forecaster (ARIMA/MA/ES/MLP). Constructor accepts `point_in_time: datetime` — strictly truncates input to ≤ point-in-time to prevent backtest look-ahead bias |
 | `news_catalyst_monitor.py` | Background thread — checks news every N min; freshness gate skips articles older than `max_article_age_minutes` (default 45, config key `news_catalyst_max_article_age_minutes`) |
@@ -73,6 +73,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `alert_monitor.py` | Daily health-check agent at 09:30 — detects noisy alerts, dead threads, portfolio drawdowns >8%; sends Telegram health report. Uses `get_connection()` from `src.database` (WAL-safe). **`THREAD_TYPES` no longer includes `supertrend_intraday_flip`** (hard-removed dead code — was causing daily false-positive "thread dead" warnings). |
 | `telegram_command_handler.py` | Two-way Telegram — polls `getUpdates` every 30s in background thread; commands: `/status`, `/positions`, `/pause`, `/resume`, `/cancel <TICKER>`; security: only responds to `TELEGRAM_CHAT_ID`; offset persisted to `telegram_command_state` DB table. `/status` reads queue size from `monitoring_queue_snapshot` DB and P&L from `daily_pnl` DB (no live IBKR call). `_load_offset()` returns `int(row["value"])` — was returning raw TEXT causing TypeError on `last_update_id + 1`. |
 | `finnhub_client.py` | Finnhub API wrapper — earnings surprises, transcript list/content |
+| `edgar_fcf.py` | SEC EDGAR XBRL provider — free, no API key. Functions: `get_edgar_fcf_median` (median of 4 annual 10-K FCF values for DCF), `get_revenue_cagr` (5yr CAGR), `get_interest_coverage` (EBIT/InterestExpense), `get_current_ratio` (AssetsCurrent/LiabilitiesCurrent), `get_eps_yoy_growth` (quarterly YoY proxy). 24h in-memory cache per ticker. Rate: 0.12s delay between requests (≤10 req/sec SEC policy). |
 
 ---
 
@@ -91,7 +92,7 @@ Base total = 145. Normalized 0–100, plus bonus band up to +20.
 | Short Interest | 10 | SI% of Float |
 | Institutional | 5 | |
 | Insider | 5 | SEC Form 4 |
-| Fundamentals | 10 | P/E, Revenue Growth, Margin, D/E |
+| Fundamentals | 10 | P/E, Revenue CAGR 5yr (EDGAR → yfinance fallback), Margin, Interest Coverage (EDGAR → D/E fallback) |
 | DCF | 15 | Margin of Safety vs intrinsic value |
 | News Sentiment | 5 | Earnings EPS surprise + LLM transcript analysis via `earnings_sentiment.py` |
 | Squeeze Bonus | +15 | SI≥20% + vol spike + price up |
@@ -189,6 +190,17 @@ Verified by `tests/test_db_wal_concurrency.py` — 4 writers + 1 reader, 1000 wr
 ```
 
 Both watchdogs use `CREATE_NO_WINDOW` flag — no CMD windows appear. Registered as Windows Scheduled Tasks: `FinancialAgentWatchdog`, `FinancialAgentIBKRWorker`.
+
+**⚠️ Python Launcher trap (fixed 2026-06-25):** On Windows, `.venv313\Scripts\python.exe` is NOT the real Python 3.13 interpreter — it is `py.exe` (the Windows Python Launcher, ~249 KB). The launcher always spawns the real interpreter as a child process, causing **two processes** to appear for every worker invocation. The fix: `run_ibkr_worker_watchdog.py` reads `pyvenv.cfg` to find the base interpreter (`executable = C:\...\Python313\python.exe`) and invokes it directly, activating the venv via env vars instead of relying on the launcher:
+```python
+env["VIRTUAL_ENV"] = str(VENV313_DIR)
+env["PATH"] = venv_scripts + os.pathsep + env["PATH"]
+env["__PYVENV_LAUNCHER__"] = str(VENV313_DIR / "Scripts" / "python.exe")  # tells base Python which venv's pyvenv.cfg to load
+env.pop("PYTHONHOME", None)
+```
+**Do NOT change `PYTHON` back to `VENV313_DIR / "Scripts" / "python.exe"` — that reverts the two-process bug.**
+
+**Orphan worker prevention:** watchdog writes `ibkr_worker.pid` after `Popen()` and deletes it after `proc.wait()`. On the next watchdog start, `_kill_orphaned_worker()` reads the PID file and calls `TerminateProcess()` on any leftover worker from a previous watchdog crash (Windows does not kill children when parent exits).
 
 **Gateway settings persistence:** `/home/trader/Jts` is mounted via a **named Docker volume** `ibkr_jts` (declared in `docker-compose.yaml`). API settings (Trusted IPs `172.18.0.1`, "Allow connections from localhost only" unchecked, "Read-Only API" unchecked) survive `docker-compose down`/`up` and host restarts. Settings auto-persist when you click OK on the Configure dialog — no explicit Save needed.
 
@@ -349,16 +361,31 @@ Reuses `src/options_flow.py → get_options_summary()` (yfinance).
 ## DCF Engine (`src/dcf_valuation.py`)
 
 ```
-Intrinsic Value = Σ(FCF_t / (1+WACC)^t) + Terminal Value / (1+WACC)^n
-Terminal Value  = FCF_n * (1+g) / (WACC - g)
-Margin of Safety = (Intrinsic - Price) / Intrinsic * 100
+Enterprise Value = Σ FCF_t/(1+WACC)^t  +  TV/(1+WACC)^n
+Terminal Value   = FCF_n*(1+g) / (WACC-g)
+Equity Value     = Enterprise Value − Net Debt   ← net debt subtraction (critical)
+Intrinsic/share  = Equity Value / sharesOutstanding
+Margin of Safety = (Intrinsic − Price) / Intrinsic * 100
 ```
 
-- Growth: avg(revenue+earnings growth), clamped 3%–25%
-- WACC: 10% + up to 3% for high D/E
+**FCF source priority (tiered):**
+1. SEC EDGAR XBRL — median of last 4 annual 10-K values (`edgar_fcf.get_edgar_fcf_median`) — audited, free
+2. yfinance cashflow DataFrame "Free Cash Flow" row — multi-year median of positive years
+3. yfinance `info.freeCashflow` — TTM single value
+4. `operatingCashflow − |capitalExpenditures|`
+
+**WACC:**
+- Cost of equity: CAPM `Ke = Rf (10Y Treasury ^TNX) + Beta × 5.5% ERP` (Damodaran); clamped 7%–20%; fallback 10%
+- Cost of debt: `interestExpense / totalDebt` (actual); falls back to tier estimate (5%/6%/8% by D/E)
+- `WACC = E/(D+E)×Ke + D/(D+E)×Kd×(1−tax)`; clamped 7%–15%
+- Note: higher leverage **lowers** WACC (debt cheaper than equity after tax shield); equity impact captured by net debt subtraction
+
+**Other:**
+- Growth: blend of historical FCF CAGR (60%) + revenue/earnings proxy (40%); clamped −10%–25%
+- Financial sector exclusion: `sector in ("Financial Services", "Banks", "Insurance")` → returns None (fall through to P/S)
+- Over-leveraged exclusion: `equity_value ≤ 0` → returns None
 - Terminal growth: 2.5%, Horizon: 5 years
-- Data: `freeCashflow` from yfinance (fallback: operatingCashflow - capex)
-- Returns `None` for loss-making companies (no positive FCF) — does not affect score
+- Return dict includes: `fcf_source`, `fcf_used_m`, `cost_of_equity_pct`, `cost_of_debt_pct`, `net_debt_m`
 
 ---
 
@@ -570,8 +597,8 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 - Google Trends: occasional 429 errors; 1-hour cache and threading.Lock() mitigate burst issues
 - Borrow fee: Finviz approximation from SI% — directionally correct, not exact; circular dependency with SI% already used in squeeze score
 - Price monitor: only runs when Scheduler is active
-- DCF: returns None for loss-making companies
-- Backtest: requires at least 1 week of scan data in DB; `price_at_signal` uses scan-time price (not close) — ~1-3% discrepancy normal
+- DCF: returns None for loss-making companies (no positive FCF), financial sector (banks/insurance — FCFF invalid), or over-leveraged (equity_value ≤ 0). Falls through to P/S valuation.
+- Backtest: requires at least 1 week of scan data in DB. `price_at_signal` is now fetched from yfinance on the same auto-adjust basis as `price_after` — corporate actions (splits, spinoffs) no longer produce spurious returns.
 - Insider tracker: slow (~4–7s); EDGAR calls now have `timeout=15` to avoid indefinite hangs
 - PDUFA scraper: depends on BioPharma Catalyst HTML structure — returns `[]` gracefully on failure
 - Unusual Options: yfinance options data unavailable for many small caps → returns 0 pts silently
@@ -717,6 +744,42 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 
 - [x] **`_tunnel_healthy()` DNS check** — `run_dashboard_tunnel.py`: health check now performs a public DNS lookup (`socket.getaddrinfo`) on the tunnel hostname in addition to the local cloudflared metrics check. Root cause: cloudflared process stays alive and reports `ha_connections=1` even after Cloudflare deregisters the quick-tunnel DNS record — the local metrics check always returned 🟢 while the URL was NXDOMAIN externally. With the DNS check, 3 consecutive failures trigger a tunnel restart + new URL.
 - [x] **Tunnel watchdog** — `run_tunnel_watchdog.py` added (mirrors `run_scheduler_watchdog.py`): auto-restarts `run_dashboard_tunnel.py` on crash or clean exit; sends Telegram on startup 🟢, restart 🔄, crash 🔴. On restart, `run_dashboard_tunnel.py` naturally sends the new URL to Telegram. Registered as `FinancialAgentTunnelWatchdog` Windows Scheduled Task (trigger: at logon). Stop with `stop_tunnel.flag` sentinel.
+
+### Worker Hardening — 2026-06-25
+
+- [x] **Python Launcher two-process fix** — `run_ibkr_worker_watchdog.py`: root cause of chronic "two workers always running" — `.venv313\Scripts\python.exe` is the Windows Python Launcher (`py.exe`, ~249 KB), which always spawns the real interpreter as a child → perpetual parent+child pair per worker. Fix: reads `pyvenv.cfg` to extract `executable = C:\...\Python313\python.exe` and uses it directly. Venv activated via `__PYVENV_LAUNCHER__` + `VIRTUAL_ENV` + PATH env vars (same mechanism the launcher uses internally). Result: exactly ONE python313.exe process when worker is running.
+- [x] **Orphan worker kill on watchdog restart** — `run_ibkr_worker_watchdog.py`: `_kill_orphaned_worker()` reads `ibkr_worker.pid` file (written by watchdog after `Popen()`), calls `TerminateProcess()` via ctypes on any leftover worker PID, then deletes the PID file. Prevents two workers when watchdog crashes and Task Scheduler restarts it (Windows does not kill orphan children on parent exit).
+- [x] **Worker singleton mutex** — `src/ibkr_worker.py`: `_acquire_singleton_lock()` creates Windows named mutex `Global\FinancialAgent_IBKRWorker_Singleton`; second instance exits with code 1 immediately. Defense-in-depth — should never fire in normal operation after the Launcher fix, but guards against manual double-start. Mutex auto-released by OS on process exit even if `_release_singleton_lock()` is not called (crash-safe). Also writes `ibkr_worker_running.lock` file with PID for diagnostic purposes.
+- [x] **`multiprocessing.freeze_support()`** — `src/ibkr_worker.py`: added in `if __name__ == "__main__"` block. Prevents Windows spawn-mode from double-executing `main()` when libraries that import `multiprocessing` (loguru, multitasking) trigger the multiprocessing infrastructure.
+- [x] **SELL gate in signal_combiner** — `src/signal_combiner.py`: SELL signal suppressed when `ibkr_positions` has no row with `shares > 0` for the ticker. Prevents spurious SELL alerts + phantom orders when Supertrend flips bearish but position was already closed. Complementary to the existing Layer -1 veto in `execution_engine` (defense-in-depth at the signal layer before order submission).
+- [x] **`record_daily_pnl()` 09:30 ET gate** — `src/position_tracker.py`: skips before 09:30 ET to avoid writing a $0 / $0 row from pre-market account summary (IBKR returns 0 net liquidation before market open). Changed `INSERT OR IGNORE` → `INSERT OR REPLACE` so a corrected re-run overwrites the early row rather than silently discarding it.
+- [x] **`_update_order_log()` race condition** — `src/ibkr_worker.py`: FILLED update uses `WHERE status NOT IN ('FILLED','ERROR')` — prevents CANCELLED child leg from overwriting a parent FILLED status. CANCELLED update uses `WHERE status = 'SUBMITTED'` — only demotes rows that are still pending; FILLED rows are never touched. Previously used a single `WHERE ibkr_order_id = ?` with no status guard, allowing bracket-order async callbacks to corrupt terminal statuses.
+
+### DCF & Data Quality Hardening — 2026-06-26
+
+- [x] **Backtester corporate action fix** — `src/backtester.py`: `price_at_signal` now fetched from yfinance on same `auto_adjust=True` basis as `price_after`. Existing corrupted rows refreshed via `UPDATE` (was `INSERT OR IGNORE` which silently kept the bad value). **One-time DB cleanup**: deleted 3 `backtest_results` rows for DD (pct_change >100%, reverse split artifact, 7d/14d) and 1 row for POWL (pct_change <-50%, forward split artifact, 7d).
+- [x] **DCF net debt subtraction** — `src/dcf_valuation.py`: Enterprise Value now correctly converted to Equity Value by subtracting `totalDebt − totalCash`. Over-leveraged companies (equity_value ≤ 0) return None → P/S fallback. Previously: EV used directly as equity value, inflating intrinsic by debt amount.
+- [x] **DCF proper WACC** — CAPM cost of equity (`Ke = Rf(^TNX) + Beta × 5.5%`); actual cost of debt (`interestExpense/totalDebt`); proper `WACC = E/(D+E)×Ke + D/(D+E)×Kd×(1−tax)`. Higher leverage lowers WACC (debt cheaper after tax shield), equity impact captured by net debt subtraction.
+- [x] **DCF financial sector exclusion** — Banks, Insurance, Financial Services return None from DCF (FCFF invalid for balance-sheet-driven businesses). TCBI, BAC etc. now correctly fall through to P/S.
+- [x] **DCF growth floor** — changed +3% to −10%; declining businesses (revenueGrowth < 0) no longer get an artificial 3% floor.
+- [x] **DCF FCF tiered sourcing** — `src/edgar_fcf.py` (new module): Tier 1 = SEC EDGAR XBRL median of 4 annual 10-K values (audited, free, no key); Tier 2 = yfinance cashflow DataFrame multi-year median; Tier 3 = yfinance TTM; Tier 4 = OCF−CapEx.
+- [x] **EDGAR fundamentals** — `src/edgar_fcf.py` extended with: `get_revenue_cagr` (5yr CAGR from 10-K), `get_interest_coverage` (EBIT/InterestExpense), `get_current_ratio` (AssetsCurrent/LiabilitiesCurrent), `get_eps_yoy_growth` (quarterly YoY proxy). All 24h cached.
+- [x] **Fundamentals scorer EDGAR integration** — `_score_fundamentals` in `stock_scorer.py`: Revenue CAGR 5yr (EDGAR) replaces yfinance 1yr; Interest Coverage (EDGAR) replaces D/E as debt quality signal (D/E kept as fallback). Thresholds: revenue 20%/8%/2%; ICR ≥5=2pts / ≥2=1pt.
+- [x] **Earnings sentiment EDGAR fallback** — `src/earnings_sentiment.py`: when Finnhub returns empty, `_edgar_eps_fallback()` computes YoY EPS% from EDGAR 10-Q filings and maps to 0–5 score (`source='edgar_eps_yoy'`). Prevents `score=0, source='none'` for tickers Finnhub doesn't cover.
+
+### QA Hardening Sprint — 2026-06-28
+
+Multi-agent QA audit (6 specialized agents) surfaced 9 HIGH findings, all fixed in this sprint.
+
+- [x] **Auto-exit transaction order** — `scheduler.py` `run_scan()`: both `watchlist_save_alert()` calls (`auto_exit_score` + `auto_exit_cooldown`) now written **BEFORE** `watchlist_remove()`. Matches the hardened pattern already in `run_watchlist_scan()`. Prevents cooldown loss if DB remove succeeds but alert write fails.
+- [x] **Daily loss limit unavailable-data veto** — `src/execution_engine.py` `check_daily_loss_limit()`: `portfolio_value ≤ 0` now returns `passed=False` ("portfolio_value unavailable") instead of `passed=True`. Previously a data-fetch failure or pre-market 0.0 silently bypassed the daily loss limit entirely.
+- [x] **Supertrend pandas CoW** — `src/supertrend.py`: all `series.iloc[i] =` writes in the Supertrend band/trend loop replaced with `series.iat[i] =`. `iloc[i] =` triggers `SettingWithCopyWarning` in pandas ≥ 2.0 CoW mode and is scheduled to raise an error in future pandas; `iat[i]` is the correct scalar-position write.
+- [x] **XSS in `page_options_flow.py`** — `_rtl()` helper: added `html.escape(text)` before `.replace('\n', '<br>')`. LLM-supplied text was injected raw into `st.markdown(unsafe_allow_html=True)`.
+- [x] **`alert_monitor.py` connection leak** — replaced `conn = get_connection()` / `conn.close()` pattern with `with get_connection() as conn:` — connection is now guaranteed to close even on exception.
+- [x] **EDGAR dual-cache eliminated** — `src/edgar_fcf.py`: `_FCF_CACHE` and its standalone HTTP fetch in `get_edgar_fcf_series()` removed. Function now delegates to `_fetch_facts()` (shared `_FACTS_CACHE`). Eliminates ~946 duplicate `companyfacts` SEC requests per scan (one per ticker was being made twice — once for FCF, once for fundamentals).
+- [x] **BUY composite gate restored** — `src/signal_combiner.py` `evaluate()`: BUY signals now gated by composite score hysteresis (`COMPOSITE_BUY_ENTRY=60` / `COMPOSITE_BUY_EXIT=50`). Hold band uses `_recent_buy_tickers()` (72h window). SELL remains ungated. CLAUDE.md documented this gate but code said "no gate" — contradiction resolved. `src/hysteresis.py` comment updated to show correct exit threshold (was "—").
+- [x] **`meme_squeeze_sentinel.py` WAL** — `SqueezeDatabase`: added `_connect()` helper that sets `journal_mode=WAL`, `busy_timeout=10000`, `synchronous=NORMAL`. All methods now use `with self._connect() as conn:` context managers. Removes 6 bare `sqlite3.connect()` + `conn.close()` calls and associated connection leaks.
+- [x] **Bracket order crash-atomicity** — `src/ibkr_realtime.py` `place_bracket_order()`: the 3 `placeOrder()` calls are now wrapped in `try/except`; if any leg fails, all already-submitted legs are cancelled to prevent dangling parent orders with no stop/target protection.
 
 ### Known Caveats (fixed 2026-05-29)
 

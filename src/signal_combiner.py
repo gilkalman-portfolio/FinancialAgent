@@ -174,6 +174,9 @@ def _format_sell_message(ev: SupertrendEvent, ctx: dict) -> str:
         f"Price: ${ev.last_price:.2f}",
         f"Level: ${ev.level:.2f}",
     ]
+    score = ctx.get("composite_score")
+    if score is not None:
+        parts.append(f"Score:  {score:.0f}")
     rec = ctx.get("recommendation")
     if rec:
         parts.append(f"Recommendation: {rec}")
@@ -188,11 +191,12 @@ def evaluate(event: SupertrendEvent) -> Optional[CombinedAlert]:
     """
     Decide whether a Supertrend flip should fire a combined alert.
 
-    Signal logic: Supertrend 1H flip is the sole trigger for both BUY and SELL.
-    No composite score gate — any watchlist ticker gets alerted on flip.
+    Signal logic: Supertrend 1H flip is the trigger.
+    BUY: gated by composite score hysteresis (entry 60 / hold 50 within 72h window).
+    SELL: ungated — any flip on an open position fires.
 
     Returns the CombinedAlert (already persisted + deduped) if fired,
-    or None if suppressed (cap reached, deduped, queue-miss).
+    or None if suppressed (cap reached, deduped, queue-miss, score below gate).
     """
     # 1. Ticker must be in the monitoring queue (watchlist + scanner ≥65 + recent BUY 72h)
     queued = {e.ticker for e in build_queue(apply_liquidity_gate=False)}
@@ -208,12 +212,39 @@ def evaluate(event: SupertrendEvent) -> Optional[CombinedAlert]:
     is_buy = event.signal == "BUY"
     alert_type = ALERT_TYPE_BUY if is_buy else ALERT_TYPE_SELL
 
-    # 3. Pull context for message enrichment (score shown in message but does NOT gate the alert)
+    # 3. Pull context — composite score gates BUY (entry 60 / hold 50); SELL is ungated
     ctx = _latest_scan_context(event.ticker)
     score = ctx.get("composite_score")
 
+    if is_buy and score is not None:
+        from src.hysteresis import passes_hysteresis, COMPOSITE_BUY_ENTRY, COMPOSITE_BUY_EXIT
+        from src.monitoring_queue import _recent_buy_tickers
+        in_hold_band = event.ticker in {tk for tk, _ in _recent_buy_tickers()}
+        if not passes_hysteresis(score, in_hold_band, COMPOSITE_BUY_ENTRY, COMPOSITE_BUY_EXIT):
+            logger.info(
+                f"[combiner] {event.ticker} BUY suppressed — composite {score:.0f} "
+                f"below gate (entry={COMPOSITE_BUY_ENTRY} hold={COMPOSITE_BUY_EXIT})"
+            )
+            return None
+
     # 4. Build message
     message = _format_buy_message(event, ctx) if is_buy else _format_sell_message(event, ctx)
+
+    # 4a. For SELL alerts: suppress if no open position in ibkr_positions.
+    # signal_combiner fires SELL on any monitoring queue ticker, but 92.5% of SELLs
+    # have no corresponding open position — they are noise that floods Telegram and
+    # corrupts forward_signals win-rate calculations.
+    if not is_buy:
+        with get_connection() as conn:
+            has_position = conn.execute(
+                "SELECT 1 FROM ibkr_positions WHERE ticker = ? AND shares > 0",
+                (event.ticker,),
+            ).fetchone()
+        if not has_position:
+            logger.info(
+                f"[combiner] {event.ticker}: SELL suppressed — no open position in ibkr_positions"
+            )
+            return None
 
     # 5. Atomically claim dedup slot — check + insert in a single DB transaction to
     # eliminate the race window that allowed duplicate alerts when two cycles overlapped.

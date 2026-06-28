@@ -26,7 +26,7 @@ Project bands (see CLAUDE.md → Risk #3 fix):
     Threshold                        ENTRY   EXIT
     ──────────────────────────────────────────────
     Auto-watchlist score              70      40
-    Composite-for-BUY                 60      —  (one-shot)
+    Composite-for-BUY                 60      50 (hold band: recent BUY in 72h)
     Squeeze SI%                       15      10
     Catalyst SI%                      10       5
     Liquidity ADV ($)                 5M       3M

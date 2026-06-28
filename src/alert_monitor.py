@@ -267,25 +267,23 @@ def run_alert_monitor():
     _log("=" * 60)
     _log("Alert Monitor starting")
 
-    conn = get_connection()
     telegram = TelegramNotifier()
 
-    # 1. Alert volume
-    total_24h, breakdown = get_alert_summary(conn)
+    with get_connection() as conn:
+        # 1. Alert volume
+        total_24h, breakdown = get_alert_summary(conn)
 
-    # 2. Breakout noise
-    breakout_noisy, breakout_suppressed = check_breakout_noise(conn)
+        # 2. Breakout noise
+        breakout_noisy, breakout_suppressed = check_breakout_noise(conn)
 
-    # 3. score_drop noise
-    drop_noisy, drop_suppressed = check_score_drop_noise(conn)
+        # 3. score_drop noise
+        drop_noisy, drop_suppressed = check_score_drop_noise(conn)
 
-    # 4. Dead threads
-    dead_threads = check_dead_threads(conn)
+        # 4. Dead threads
+        dead_threads = check_dead_threads(conn)
 
-    # 5. Portfolio health
-    portfolio_flags = check_portfolio_health(conn)
-
-    conn.close()
+        # 5. Portfolio health
+        portfolio_flags = check_portfolio_health(conn)
 
     # ── Build Telegram report ─────────────────────────────────────────────
     all_suppressed = breakout_suppressed + drop_suppressed

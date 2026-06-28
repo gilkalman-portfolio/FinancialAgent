@@ -231,112 +231,93 @@ class SqueezeScore:
 
 class SqueezeDatabase:
     """SQLite database for tracking squeeze scores over time"""
-    
+
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-    
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open a WAL-mode connection to the local sentinel DB."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
     def _init_db(self):
         """Initialize database schema"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS squeeze_scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                explosion_score REAL NOT NULL,
-                squeeze_factor REAL,
-                social_velocity REAL,
-                volume_confirmation REAL,
-                technical_trigger REAL,
-                short_interest_pct REAL,
-                days_to_cover REAL,
-                reddit_mentions_4h INTEGER,
-                reddit_mentions_24h INTEGER,
-                rvol REAL,
-                price REAL,
-                ema_20 REAL,
-                high_5d REAL,
-                institutional_ownership REAL,
-                high_inst_risk BOOLEAN,
-                bull_trap_detected BOOLEAN,
-                google_trend_spike BOOLEAN,
-                catalyst TEXT,
-                stop_loss_suggestion REAL
-            )
-        ''')
-        
-        # Create indices for faster queries
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker ON squeeze_scores(ticker)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON squeeze_scores(timestamp)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_score ON squeeze_scores(explosion_score)')
-        
-        conn.commit()
-        conn.close()
-        
+        with self._connect() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS squeeze_scores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    explosion_score REAL NOT NULL,
+                    squeeze_factor REAL,
+                    social_velocity REAL,
+                    volume_confirmation REAL,
+                    technical_trigger REAL,
+                    short_interest_pct REAL,
+                    days_to_cover REAL,
+                    reddit_mentions_4h INTEGER,
+                    reddit_mentions_24h INTEGER,
+                    rvol REAL,
+                    price REAL,
+                    ema_20 REAL,
+                    high_5d REAL,
+                    institutional_ownership REAL,
+                    high_inst_risk BOOLEAN,
+                    bull_trap_detected BOOLEAN,
+                    google_trend_spike BOOLEAN,
+                    catalyst TEXT,
+                    stop_loss_suggestion REAL
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_ticker ON squeeze_scores(ticker)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON squeeze_scores(timestamp)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_score ON squeeze_scores(explosion_score)')
+
         logger.info(f"Database initialized at {self.db_path}")
-    
+
     def insert_score(self, score: SqueezeScore):
         """Insert a new squeeze score"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
         data = score.to_dict()
         data['timestamp'] = data['timestamp'].isoformat()
-        
         placeholders = ', '.join(['?' for _ in data])
         columns = ', '.join(data.keys())
-        
-        cursor.execute(
-            f'INSERT INTO squeeze_scores ({columns}) VALUES ({placeholders})',
-            tuple(data.values())
-        )
-        
-        conn.commit()
-        conn.close()
-    
+        with self._connect() as conn:
+            conn.execute(
+                f'INSERT INTO squeeze_scores ({columns}) VALUES ({placeholders})',
+                tuple(data.values())
+            )
+
     def get_top_scores(self, limit: int = 10, min_score: float = 60.0) -> List[Dict]:
         """Get top explosion scores from latest scan"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Get latest timestamp
-        cursor.execute('SELECT MAX(timestamp) FROM squeeze_scores')
-        latest = cursor.fetchone()[0]
-        
-        if not latest:
-            conn.close()
-            return []
-        
-        cursor.execute('''
-            SELECT * FROM squeeze_scores 
-            WHERE timestamp = ? AND explosion_score >= ?
-            ORDER BY explosion_score DESC
-            LIMIT ?
-        ''', (latest, min_score, limit))
-        
-        columns = [desc[0] for desc in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        
-        conn.close()
-        return results
-    
+        with self._connect() as conn:
+            latest = conn.execute(
+                'SELECT MAX(timestamp) FROM squeeze_scores'
+            ).fetchone()[0]
+            if not latest:
+                return []
+            rows = conn.execute('''
+                SELECT * FROM squeeze_scores
+                WHERE timestamp = ? AND explosion_score >= ?
+                ORDER BY explosion_score DESC
+                LIMIT ?
+            ''', (latest, min_score, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def get_ticker_history(self, ticker: str, days: int = 7) -> pd.DataFrame:
         """Get historical scores for a ticker"""
-        conn = sqlite3.connect(self.db_path)
-        
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        
-        df = pd.read_sql_query('''
-            SELECT * FROM squeeze_scores 
-            WHERE ticker = ? AND timestamp >= ?
-            ORDER BY timestamp DESC
-        ''', conn, params=(ticker, cutoff))
-        
-        conn.close()
+        with self._connect() as conn:
+            df = pd.read_sql_query('''
+                SELECT * FROM squeeze_scores
+                WHERE ticker = ? AND timestamp >= ?
+                ORDER BY timestamp DESC
+            ''', conn, params=(ticker, cutoff))
         return df
 
 

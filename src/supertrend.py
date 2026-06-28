@@ -80,26 +80,26 @@ def supertrend(
 
         for i in range(1, len(hist)):
             # Lower band: only raise if previous close was above it (or new band is higher)
-            if close.iloc[i - 1] >= final_lower.iloc[i - 1]:
-                final_lower.iloc[i] = max(lower.iloc[i], final_lower.iloc[i - 1])
+            if close.iloc[i - 1] >= final_lower.iat[i - 1]:
+                final_lower.iat[i] = max(lower.iat[i], final_lower.iat[i - 1])
             else:
-                final_lower.iloc[i] = lower.iloc[i]
+                final_lower.iat[i] = lower.iat[i]
 
             # Upper band: only lower if previous close was below it (or new band is lower)
-            if close.iloc[i - 1] <= final_upper.iloc[i - 1]:
-                final_upper.iloc[i] = min(upper.iloc[i], final_upper.iloc[i - 1])
+            if close.iloc[i - 1] <= final_upper.iat[i - 1]:
+                final_upper.iat[i] = min(upper.iat[i], final_upper.iat[i - 1])
             else:
-                final_upper.iloc[i] = upper.iloc[i]
+                final_upper.iat[i] = upper.iat[i]
 
         # ── Trend direction ──────────────────────────────────────────────────
         trend = pd.Series(1, index=hist.index, dtype=int)
 
         for i in range(1, len(hist)):
-            prev_trend = trend.iloc[i - 1]
+            prev_trend = trend.iat[i - 1]
             if prev_trend == 1:
-                trend.iloc[i] = -1 if close.iloc[i] < final_lower.iloc[i] else 1
+                trend.iat[i] = -1 if close.iat[i] < final_lower.iat[i] else 1
             else:
-                trend.iloc[i] = 1  if close.iloc[i] > final_upper.iloc[i] else -1
+                trend.iat[i] = 1  if close.iat[i] > final_upper.iat[i] else -1
 
         # ── Signal: detect flip within last `lookback` closed bars ──────────
         signal: Optional[str] = None

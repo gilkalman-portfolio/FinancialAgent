@@ -1,4 +1,5 @@
 """Page: Options Flow"""
+import html
 import streamlit as st
 from datetime import datetime
 
@@ -13,7 +14,7 @@ def _rtl(text: str) -> str:
         '<div dir="rtl" style="text-align:right;font-family:\'Segoe UI\',Arial,sans-serif;'
         'font-size:14px;line-height:1.8;color:#1e293b;background:#f8fafc;'
         'border:1px solid #e2e8f0;border-radius:10px;padding:16px 20px;">'
-        + text.replace("\n", "<br>")
+        + html.escape(text).replace("\n", "<br>")
         + "</div>"
     )
 
