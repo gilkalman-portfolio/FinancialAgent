@@ -192,6 +192,10 @@ def scan_momentum(
             spy_roc_20d = float(
                 (spy_close.iloc[-1] - spy_close.iloc[-21]) / spy_close.iloc[-21] * 100
             )
+        else:
+            logger.warning(f"Momentum scan: SPY has only {len(spy_close)} bars — RS scores will use 0% benchmark")
+    else:
+        logger.warning("Momentum scan: SPY data missing from download — RS scores will use 0% benchmark")
 
     results = []
     for ticker in tickers:

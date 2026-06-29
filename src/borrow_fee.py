@@ -23,13 +23,16 @@ correct and avoids showing N/A on everything.
 Cache: 2 hours per ticker.
 """
 import re
+import threading
 import time
 import requests
 from typing import Optional
 from loguru import logger
 
 _cache: dict[str, tuple[Optional[float], float]] = {}
-_CACHE_TTL = 2 * 3600
+_cache_lock = threading.Lock()
+_CACHE_TTL       = 2 * 3600   # successful result
+_CACHE_TTL_ERROR = 5 * 60     # failed fetch (rate-limited/blocked) — retry sooner
 
 _HEADERS = {
     "User-Agent": (
@@ -68,17 +71,20 @@ def get_borrow_fee(ticker: str) -> Optional[float]:
     """
     ticker = ticker.upper().strip()
 
-    if ticker in _cache:
-        fee, ts = _cache[ticker]
-        if time.time() - ts < _CACHE_TTL:
-            return fee
+    with _cache_lock:
+        if ticker in _cache:
+            fee, ts = _cache[ticker]
+            if time.time() - ts < _CACHE_TTL:
+                return fee
 
     fee = _fetch_finviz(ticker)
     if fee is None:
         fee = _fetch_stockanalysis(ticker)
 
-    _cache[ticker] = (fee, time.time())
-    logger.debug(f"Borrow fee {ticker}: {fee}")
+    ttl = _CACHE_TTL if fee is not None else _CACHE_TTL_ERROR
+    with _cache_lock:
+        _cache[ticker] = (fee, time.time() + ttl - _CACHE_TTL)  # store adjusted ts so TTL check works
+    logger.debug(f"Borrow fee {ticker}: {fee} (cache ttl={ttl//60}min)")
     return fee
 
 

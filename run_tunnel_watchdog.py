@@ -34,6 +34,8 @@ SCRIPT = ROOT / "run_dashboard_tunnel.py"
 RESTART_DELAY = 15       # seconds to wait before restarting after a crash
 CLEAN_EXIT_DELAY = 60    # seconds to wait before restarting after a clean exit
 STOP_SENTINEL = ROOT / "stop_tunnel.flag"
+_TELEGRAM_FLOOD_INTERVAL = 300  # minimum seconds between crash/restart Telegram notifications
+_last_telegram_ts = 0.0
 
 
 def _load_env() -> dict:
@@ -50,7 +52,14 @@ def _load_env() -> dict:
     return env
 
 
-def _send_telegram(message: str) -> None:
+def _send_telegram(message: str, flood_guard: bool = False) -> None:
+    global _last_telegram_ts
+    if flood_guard:
+        now = time.time()
+        if now - _last_telegram_ts < _TELEGRAM_FLOOD_INTERVAL:
+            logging.debug(f"Telegram flood guard — suppressing: {message[:60]}")
+            return
+        _last_telegram_ts = now
     try:
         cfg = _load_env()
         token = cfg.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -79,7 +88,7 @@ def main():
         attempt += 1
         logging.info(f"Launching tunnel (attempt #{attempt})")
         if attempt > 1:
-            _send_telegram(f"🔄 <b>Tunnel</b> — restarting (attempt #{attempt}), new URL will follow...")
+            _send_telegram(f"🔄 <b>Tunnel</b> — restarting (attempt #{attempt}), new URL will follow...", flood_guard=True)
 
         try:
             proc = subprocess.run(
@@ -91,7 +100,7 @@ def main():
             )
         except Exception as e:
             logging.error(f"Failed to launch tunnel: {e}")
-            _send_telegram(f"🔴 <b>Tunnel</b> — failed to launch: {e}")
+            _send_telegram(f"🔴 <b>Tunnel</b> — failed to launch: {e}", flood_guard=True)
             time.sleep(RESTART_DELAY)
             continue
 
@@ -111,7 +120,8 @@ def main():
                 f"Restarting in {CLEAN_EXIT_DELAY}s..."
             )
             _send_telegram(
-                f"🔄 <b>Tunnel</b> — exited cleanly, restarting in {CLEAN_EXIT_DELAY}s..."
+                f"🔄 <b>Tunnel</b> — exited cleanly, restarting in {CLEAN_EXIT_DELAY}s...",
+                flood_guard=True,
             )
             time.sleep(CLEAN_EXIT_DELAY)
             continue
@@ -122,7 +132,8 @@ def main():
         )
         _send_telegram(
             f"🔴 <b>Tunnel</b> — crashed (returncode={proc.returncode})\n"
-            f"Restarting in {RESTART_DELAY}s..."
+            f"Restarting in {RESTART_DELAY}s...",
+            flood_guard=True,
         )
         time.sleep(RESTART_DELAY)
 

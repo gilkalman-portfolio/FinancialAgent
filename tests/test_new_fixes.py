@@ -131,7 +131,8 @@ class TestCheckTickerBarsAgo:
             "level": 99.5,
             "bars_ago": 1,
         }
-        with patch("src.ibkr_worker.supertrend", return_value=supertrend_result):
+        with patch("src.ibkr_worker.supertrend", return_value=supertrend_result), \
+             patch("src.ibkr_worker._is_signal_hours", return_value=True):
             event = _check_ticker(mock_conn, "TEST")
 
         assert event is not None

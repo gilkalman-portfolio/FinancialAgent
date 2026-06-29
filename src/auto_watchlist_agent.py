@@ -278,21 +278,26 @@ def run(results: list, source: str, cfg: dict) -> list:
         score = r.get("explosion_score") or r.get("score", 0)
         price = r.get("price", 0)
 
-        if ticker not in existing:
-            watchlist_add(
-                ticker,
-                notes=notes,
-                alert_score=alert_score,
-                alert_pct=alert_pct,
-                volume_spike_x=vol_x,
-            )
-            existing.add(ticker)
+        try:
+            if ticker not in existing:
+                watchlist_add(
+                    ticker,
+                    notes=notes,
+                    alert_score=alert_score,
+                    alert_pct=alert_pct,
+                    volume_spike_x=vol_x,
+                )
+                existing.add(ticker)
 
-        # Always save alert — this is the dedup key even if ticker was already in watchlist
-        watchlist_save_alert(
-            ticker, f"auto_wl_{source}", notes,
-            score=score, price=price
-        )
+            # Always save alert — this is the dedup key even if ticker was already in watchlist
+            watchlist_save_alert(
+                ticker, f"auto_wl_{source}", notes,
+                score=score, price=price
+            )
+        except Exception as _add_err:
+            logger.error(f"auto_watchlist [{source}]: DB write failed for {ticker}: {_add_err} — skipping")
+            continue
+
         added.append(r)
         logger.info(
             f"auto_watchlist [{source}]: added {ticker} "

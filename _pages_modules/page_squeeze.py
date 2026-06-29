@@ -1,4 +1,5 @@
 """Page: Short Squeeze Scanner"""
+import html as _html_mod
 import streamlit as st
 from datetime import datetime
 
@@ -263,12 +264,15 @@ def _render_insider_buyers_panel():
 
         rows_html = ""
         for b in buyers[:20]:
-            val_str = f"${b['value']:,.0f}"
+            val_str   = f"${b['value']:,.0f}"
+            t_ticker  = _html_mod.escape(str(b.get("ticker", "")))
+            t_insider = _html_mod.escape(str(b.get("insider", "")))
+            t_role    = _html_mod.escape(str(b.get("role", "")))
             rows_html += _html(f"""
                 <tr>
-                  <td style='font-weight:700;color:#1e3a8a;padding:6px 8px;'>{b['ticker']}</td>
-                  <td style='padding:6px 8px;'>{b['insider']}</td>
-                  <td style='color:#64748b;font-size:11px;padding:6px 8px;'>{b['role']}</td>
+                  <td style='font-weight:700;color:#1e3a8a;padding:6px 8px;'>{t_ticker}</td>
+                  <td style='padding:6px 8px;'>{t_insider}</td>
+                  <td style='color:#64748b;font-size:11px;padding:6px 8px;'>{t_role}</td>
                   <td style='color:#16a34a;font-weight:600;padding:6px 8px;'>{val_str}</td>
                   <td style='color:#64748b;padding:6px 8px;'>{f"${b['price']:.2f}" if b['price'] else "N/A"}</td>
                   <td style='color:#64748b;font-size:11px;padding:6px 8px;'>{b['date']}</td>
@@ -532,9 +536,9 @@ def _render_ai_verdict(r: dict):
     ai_key = f"sq_ai_{r['ticker']}"
 
     def _rtl(text: str) -> str:
-        html = text.replace('\n', '<br>')
+        safe = _html_mod.escape(text).replace('\n', '<br>')
         return (f'<div style="direction:rtl;text-align:right;font-size:14px;'
-                f'line-height:1.9;color:#1e293b;padding:4px 0;">{html}</div>')
+                f'line-height:1.9;color:#1e293b;padding:4px 0;">{safe}</div>')
 
     with st.expander(f"🤖 AI Verdict — {r['ticker']}", expanded=False):
         if ai_key in st.session_state:

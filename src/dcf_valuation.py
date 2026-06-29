@@ -4,16 +4,22 @@ Calculates intrinsic value and margin of safety vs current price.
 Integrates into fundamentals score in stock_scorer.py.
 
 Formula:
-  Intrinsic Value = sum(FCF_t / (1+r)^t) + Terminal Value / (1+r)^n
-  Terminal Value  = FCF_n * (1 + g) / (r - g)
-  Margin of Safety = (Intrinsic - Price) / Intrinsic * 100
+  Enterprise Value = Σ FCF_t/(1+WACC)^t  +  TV/(1+WACC)^n
+  Terminal Value   = FCF_n*(1+g) / (WACC-g)
+  Equity Value     = Enterprise Value − Net Debt
+  Intrinsic/share  = Equity Value / sharesOutstanding
+  Margin of Safety = (Intrinsic − Price) / Intrinsic * 100
 
-Data from yfinance:
-  - freeCashflow (TTM)
-  - revenueGrowth (YoY)
-  - earningsGrowth (YoY)
-  - sharesOutstanding
-  - currentPrice
+FCF source priority:
+  1. SEC EDGAR XBRL (median of last 4 annual 10-K values) — audited, free
+  2. yfinance cashflow DataFrame "Free Cash Flow" row
+  3. yfinance info.freeCashflow (TTM)
+  4. operatingCashflow − |capitalExpenditures|
+
+WACC:
+  Cost of equity — CAPM: Rf (10Y Treasury) + Beta × 5.5% ERP
+  Cost of debt   — interestExpense / totalDebt (actual); falls back to tier estimate
+  WACC = E/(D+E)×Ke  +  D/(D+E)×Kd×(1−tax)
 """
 
 import numpy as np
@@ -25,22 +31,73 @@ def _clamp(val: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, val))
 
 
-def calculate_dcf(info: dict, cashflow_df=None) -> Optional[dict]:
+def _capm_cost_of_equity(info: dict) -> float:
+    """Ke = Rf + Beta × ERP. Rf from 10Y Treasury via yfinance; ERP = 5.5% (Damodaran)."""
+    try:
+        import yfinance as yf
+        beta = _clamp(float(info.get("beta") or 1.0), 0.5, 3.0)
+        tnx  = yf.Ticker("^TNX").history(period="5d")
+        rf   = float(tnx["Close"].iloc[-1]) / 100 if not tnx.empty else 0.045
+        return _clamp(rf + beta * 0.055, 0.07, 0.20)
+    except Exception:
+        return 0.10
+
+
+def calculate_dcf(info: dict, cashflow_df=None, ticker: str = "") -> Optional[dict]:
     """
     Run DCF on a yfinance info dict.
     Returns dict with intrinsic_value, margin_of_safety, dcf_score, and details.
     Returns None if data is insufficient.
     """
     try:
-        # ── Base FCF ───────────────────────────────────────────────────────────
-        fcf = info.get("freeCashflow")
+        # ── Financial sector exclusion — DCF (FCFF) is methodologically invalid
+        #    for banks and insurance: operating cash flow reflects balance-sheet
+        #    flows (loans, deposits) not business operations. Fall through to P/S.
+        sector = info.get("sector", "")
+        if sector in ("Financial Services", "Banks", "Insurance"):
+            return None
+
+        # ── Base FCF — tiered sourcing ────────────────────────────────────────
+        # Tier 1: SEC EDGAR XBRL (median of 4 annual 10-K values — most reliable)
+        fcf = None
+        fcf_source = "yfinance"
+        if ticker:
+            try:
+                from src.edgar_fcf import get_edgar_fcf_median
+                edgar_fcf = get_edgar_fcf_median(ticker)
+                if edgar_fcf and edgar_fcf > 0:
+                    fcf = edgar_fcf
+                    fcf_source = "edgar_xbrl"
+            except Exception:
+                pass
+
+        # Tier 2: yfinance cashflow DataFrame "Free Cash Flow" row (multi-year median)
+        if fcf is None and cashflow_df is not None and not cashflow_df.empty:
+            try:
+                if "Free Cash Flow" in cashflow_df.index:
+                    vals = cashflow_df.loc["Free Cash Flow"].dropna().values
+                    pos  = [v for v in vals if v > 0]
+                    if pos:
+                        import statistics
+                        fcf = statistics.median(pos)
+                        fcf_source = "yf_cashflow_df"
+            except Exception:
+                pass
+
+        # Tier 3: yfinance info.freeCashflow (TTM single value)
+        if fcf is None:
+            fcf = info.get("freeCashflow")
+            if fcf and fcf > 0:
+                fcf_source = "yf_info"
+            else:
+                # Tier 4: operatingCashflow - capex
+                ocf   = info.get("operatingCashflow") or 0
+                capex = info.get("capitalExpenditures") or 0
+                fcf   = ocf - abs(capex)
+                fcf_source = "yf_ocf_capex"
+
         if not fcf or fcf <= 0:
-            # fallback: operatingCashflow - capex
-            ocf  = info.get("operatingCashflow") or 0
-            capex = info.get("capitalExpenditures") or 0
-            fcf  = ocf - abs(capex)
-            if fcf <= 0:
-                return None
+            return None
 
         shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
         if not shares or shares <= 0:
@@ -55,8 +112,12 @@ def calculate_dcf(info: dict, cashflow_df=None) -> Optional[dict]:
         earnings_growth = info.get("earningsGrowth")
         if rev_growth is not None and earnings_growth is not None:
             raw_growth_proxy = (rev_growth + earnings_growth) / 2
+        elif rev_growth is not None:
+            raw_growth_proxy = rev_growth
+        elif earnings_growth is not None:
+            raw_growth_proxy = earnings_growth
         else:
-            raw_growth_proxy = rev_growth if rev_growth is not None else (earnings_growth or 0)
+            raw_growth_proxy = None   # both unavailable — defer to historical FCF growth
 
         # ── Historical FCF growth from cashflow DataFrame (more accurate) ──────
         historical_fcf_growth = None
@@ -80,21 +141,43 @@ def calculate_dcf(info: dict, cashflow_df=None) -> Optional[dict]:
                 pass
 
         # Blend: historical FCF trend 60% + info proxy 40% (fall back if unavailable)
-        if historical_fcf_growth is not None:
+        if historical_fcf_growth is not None and raw_growth_proxy is not None:
             raw_growth = historical_fcf_growth * 0.6 + raw_growth_proxy * 0.4
-        else:
+        elif historical_fcf_growth is not None:
+            raw_growth = historical_fcf_growth
+            growth_source = "historical_fcf_only"
+        elif raw_growth_proxy is not None:
             raw_growth = raw_growth_proxy
+        else:
+            logger.debug(f"DCF {ticker}: growth data unavailable — using 0% (conservative)")
+            raw_growth = 0.0
 
-        # Conservative growth: clamp to 3%-25% for projection
-        growth_rate = _clamp(raw_growth, 0.03, 0.25)
+        # Allow mild negative growth (-10%) for declining businesses; 25% ceiling.
+        growth_rate = _clamp(raw_growth, -0.10, 0.25)
 
         # Terminal growth: 2-3% (long-run GDP)
         terminal_growth = 0.025
 
-        # Discount rate: WACC proxy — 10% base
-        # Adjust up for high debt/equity
-        de = info.get("debtToEquity") or 0
-        wacc = 0.10 + _clamp(de / 100 * 0.02, 0, 0.03)   # max +3% for very high leverage
+        # ── WACC — CAPM cost of equity + actual cost of debt ─────────────────
+        de_ratio      = (info.get("debtToEquity") or 0) / 100   # yfinance: D/E×100
+        weight_debt   = de_ratio / (1 + de_ratio)
+        weight_equity = 1 - weight_debt
+
+        cost_of_equity = _capm_cost_of_equity(info)   # Rf + Beta × 5.5% ERP
+
+        # Actual cost of debt = interestExpense / totalDebt (from filings).
+        # Falls back to leverage-tiered estimate when unavailable.
+        interest_expense = abs(info.get("interestExpense") or 0)
+        total_debt_raw   = info.get("totalDebt") or 0
+        if interest_expense > 0 and total_debt_raw > 0:
+            cost_of_debt = _clamp(interest_expense / total_debt_raw, 0.02, 0.15)
+        elif de_ratio >= 2.0:   cost_of_debt = 0.08
+        elif de_ratio >= 1.0:   cost_of_debt = 0.06
+        else:                   cost_of_debt = 0.05
+
+        tax_rate = _clamp(info.get("effectiveTaxRate") or 0.21, 0.0, 0.40)
+        wacc = weight_equity * cost_of_equity + weight_debt * cost_of_debt * (1 - tax_rate)
+        wacc = _clamp(wacc, 0.07, 0.15)
 
         # ── 5-year DCF projection ──────────────────────────────────────────────
         n = 5
@@ -109,39 +192,54 @@ def calculate_dcf(info: dict, cashflow_df=None) -> Optional[dict]:
         fcf_terminal = fcf_t * (1 + terminal_growth)
         if wacc <= terminal_growth:
             wacc = terminal_growth + 0.01   # safety: avoid division by zero
-        terminal_value    = fcf_terminal / (wacc - terminal_growth)
-        pv_terminal       = terminal_value / (1 + wacc) ** n
+        terminal_value = fcf_terminal / (wacc - terminal_growth)
+        pv_terminal    = terminal_value / (1 + wacc) ** n
 
-        # ── Intrinsic value per share ──────────────────────────────────────────
-        intrinsic_equity  = sum(pv_fcfs) + pv_terminal
-        intrinsic_per_share = intrinsic_equity / shares
+        # ── Enterprise Value → Equity Value (subtract net debt) ───────────────
+        # sum(pv_fcfs) + pv_terminal is the FCFF-based Enterprise Value.
+        # Converting to equity value requires subtracting net financial debt.
+        # Cash-rich companies (negative net debt) get a positive adjustment.
+        total_debt    = info.get("totalDebt") or 0
+        total_cash    = info.get("totalCash") or 0
+        net_debt      = total_debt - total_cash
+        equity_value  = sum(pv_fcfs) + pv_terminal - net_debt
+        if equity_value <= 0:
+            return None   # negative equity → company is over-leveraged; use P/S fallback
+
+        intrinsic_per_share = equity_value / shares
+        if intrinsic_per_share == 0:
+            return None  # guard: tiny equity / huge share count → MoS undefined
 
         # ── Margin of safety ───────────────────────────────────────────────────
         mos_pct = (intrinsic_per_share - price) / intrinsic_per_share * 100
 
-        # ── DCF Score (0-15 pts, replaces part of fundamentals) ───────────────
-        # > 40% MoS = deeply undervalued  → max score
-        # 20-40%     = undervalued        → good score
-        # 0-20%      = fair value         → moderate
-        # negative   = overvalued         → low or 0
-        if mos_pct >= 40:   dcf_score = 15
-        elif mos_pct >= 20: dcf_score = 11
-        elif mos_pct >= 5:  dcf_score = 7
+        # ── DCF Score (0-15 pts) ───────────────────────────────────────────────
+        if mos_pct >= 40:    dcf_score = 15
+        elif mos_pct >= 20:  dcf_score = 11
+        elif mos_pct >= 5:   dcf_score = 7
         elif mos_pct >= -10: dcf_score = 3
-        else:               dcf_score = 0
+        else:                dcf_score = 0
+
+        ev_total = sum(pv_fcfs) + pv_terminal
+        tv_pct = round(pv_terminal / ev_total * 100, 1) if ev_total != 0 else 0.0
 
         return {
-            "intrinsic_value":   round(intrinsic_per_share, 2),
-            "current_price":     round(price, 2),
-            "margin_of_safety":  round(mos_pct, 1),
-            "dcf_score":         dcf_score,
-            "fcf_ttm":           round(fcf / 1e6, 1),       # in millions
-            "growth_rate_used":  round(growth_rate * 100, 1),
-            "wacc_used":         round(wacc * 100, 1),
-            "terminal_growth":   round(terminal_growth * 100, 1),
-            "upside_pct":        round(mos_pct, 1),
-            "valuation":         _valuation_label(mos_pct),
-            "growth_source":     growth_source,
+            "intrinsic_value":    round(intrinsic_per_share, 2),
+            "current_price":      round(price, 2),
+            "margin_of_safety":   round(mos_pct, 1),
+            "dcf_score":          dcf_score,
+            "fcf_used_m":         round(fcf / 1e6, 1),
+            "fcf_source":         fcf_source,
+            "growth_rate_used":   round(growth_rate * 100, 1),
+            "wacc_used":          round(wacc * 100, 1),
+            "cost_of_equity_pct": round(cost_of_equity * 100, 1),
+            "cost_of_debt_pct":   round(cost_of_debt * 100, 1),
+            "terminal_growth":    round(terminal_growth * 100, 1),
+            "terminal_value_pct": tv_pct,
+            "net_debt_m":         round(net_debt / 1e6, 1),
+            "upside_pct":         round(mos_pct, 1),
+            "valuation":          _valuation_label(mos_pct),
+            "growth_source":      growth_source,
         }
 
     except Exception as e:

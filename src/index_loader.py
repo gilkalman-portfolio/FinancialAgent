@@ -54,6 +54,17 @@ def _load_cache(index_name: str) -> Optional[dict]:
         return None
 
 
+def _load_cache_stale(index_name: str) -> Optional[dict]:
+    """Return cached data regardless of TTL — last-resort fallback when all live sources fail."""
+    p = _cache_path(index_name)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
 def _save_cache(index_name: str, tickers: list, sectors: dict):
     p = _cache_path(index_name)
     p.write_text(json.dumps({
@@ -108,6 +119,16 @@ def _fetch_sp500_wikipedia() -> Optional[pd.DataFrame]:
         if r.status_code != 200:
             return None
         tables = pd.read_html(io.StringIO(r.text))
+        if not tables:
+            logger.error("Wikipedia S&P 500: no tables found in page — site structure may have changed")
+            return None
+        expected_cols = {"Symbol", "Security", "GICS Sector"}
+        if not expected_cols.issubset(set(tables[0].columns)):
+            logger.error(
+                f"Wikipedia S&P 500: expected columns {expected_cols} not found "
+                f"(got {list(tables[0].columns)[:5]}) — site structure may have changed"
+            )
+            return None
         df = tables[0][["Symbol", "Security", "GICS Sector"]].copy()
         df.columns = ["ticker", "name", "sector"]
         # BRK.B → BRK-B (yfinance format)
@@ -185,7 +206,18 @@ def get_index(index_name: str, force_refresh: bool = False) -> Optional[pd.DataF
         df = _fetch_sp500_wikipedia()
 
     if df is None or df.empty:
-        logger.error(f"Could not load {index_name}")
+        logger.error(f"Could not load {index_name} from any live source")
+        # Serve stale cache rather than returning None (empty scan universe is worse than stale data)
+        stale = _load_cache_stale(index_name)
+        if stale and stale.get("tickers"):
+            logger.warning(
+                f"{index_name}: serving stale cache (cached_at={stale.get('cached_at', 'unknown')}) "
+                f"— all live sources failed"
+            )
+            return pd.DataFrame([
+                {"ticker": t, "name": "", "sector": stale["sectors"].get(t, "Unknown")}
+                for t in stale["tickers"]
+            ])
         return None
 
     # שמור cache

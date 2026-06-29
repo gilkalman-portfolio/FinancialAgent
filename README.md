@@ -1,7 +1,21 @@
 # Financial Agent
 **AI-Powered Stock Scanner & Financial Analysis Dashboard**
 
-Streamlit dashboard combining technical analysis, DCF valuation, short squeeze scanning, catalyst detection, news impact analysis, and real-time Telegram alerts.
+Streamlit dashboard combining technical analysis, DCF valuation, short squeeze scanning, catalyst detection, news impact analysis, and real-time IBKR order execution with Telegram alerts.
+
+---
+
+## Stack
+
+| Layer | Technology |
+|---|---|
+| UI | Streamlit 1.52.2 |
+| Language | Python 3.14 (main) · Python 3.13 (IBKR worker) |
+| DB | SQLite (WAL mode, WAL hardened) |
+| LLMs | Gemini 2.0 Flash → Groq Llama 3.3 70B fallback |
+| Market Data | yfinance · Finnhub · Alpha Vantage · SEC EDGAR (free) |
+| Broker | Interactive Brokers via `ib_async` (Python 3.13 venv, Docker IB Gateway) |
+| Alerts | Telegram Bot (outbound + two-way commands) |
 
 ---
 
@@ -9,17 +23,17 @@ Streamlit dashboard combining technical analysis, DCF valuation, short squeeze s
 
 | Page | What it does |
 |---|---|
-| **Scan** | Multi-factor scoring with DCF column. Background scan worker. |
+| **Scan** | Multi-factor scoring (0–100) with DCF column. Background scan worker. |
 | **Research** | Deep Dive (DCF card, Bull/Bear debate, AI analysis) + Compare Side-by-Side |
-| **Watchlist & Portfolio** | Price targets, real-time alerts, P&L dashboard, sector allocation, 12 alert types |
+| **Watchlist & Portfolio** | Price targets, real-time alerts, P&L dashboard, sector allocation, 21 alert types |
 | **Market** | Live indices, Futures bar, VIX level, sector heatmap, mood, earnings, macro events |
 | **News Impact** | 3-layer LLM analysis + Stock News + Upcoming Events tab |
 | **Short Squeeze** | Squeeze Score 0–100, sparklines, AI Verdict, sector scan mode, insider overlay |
-| **Catalyst Scanner** | Small/mid-cap stocks with upcoming catalyst + explosion score, news catalyst flag, insider buy/sell detail |
+| **Catalyst Scanner** | Upcoming catalyst + explosion score, PDUFA/AdCom, unusual options, insider |
 | **Options Flow** | Options chain data, PCR, unusual call/put activity |
-| **Backtest** | Signal accuracy validation |
+| **Backtest** | Signal accuracy + Supertrend P&L simulator + Forward Signal win-rate (live) |
 | **History** | Score trend over time per ticker |
-| **Scheduler** | Automated scans + Telegram news digest + price target + volume spike monitor |
+| **Scheduler** | Automated scans + Telegram digest + price monitor + IBKR queue status |
 
 ---
 
@@ -36,67 +50,65 @@ GEMINI_API_KEY=...
 FINNHUB_API_KEY=...
 ALPHA_VANTAGE_API_KEY=...
 SEC_USER_AGENT_EMAIL=your@email.com
-SEC_API_KEY=...                  # optional — sec-api.io, enables fast insider data
 TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
+IBKR_LIVE=              # leave unset for paper mode (port 4002); set to "true" for live (port 4001)
 ```
 
 ```bash
-streamlit run dashboard.py                          # → http://localhost:8501
-python -m pytest tests/test_scorer.py              # 56 tests
-python -m pytest tests/test_insider_sec_api.py     # insider + sec-api tests
+streamlit run dashboard.py                     # → http://localhost:8501
+python -m pytest tests/ --ignore=tests/test_new_apis.py   # 269 tests, 0 failures
 ```
 
 ---
 
-## Background Scheduler (Watchdog + Task Scheduler)
+## Process Architecture
 
-הסריקות וה-price alerts רצים ברקע גם כשהדשבורד סגור, ומתחילים אוטומטית עם Windows — ללא תלות ב-NSSM.
+Two watchdogs start at Windows login (Task Scheduler), each supervising a long-running child:
 
 ```
-run_scheduler_watchdog.py    # מאתחל את scheduler.py אוטומטית אחרי כל קריסה
-logs/scheduler.log           # פעילות ה-scheduler
-logs/watchdog.log            # crash + restart events
-```
-
-**רישום חד-פעמי (בוצע):**
-```powershell
-# Task Scheduler: FinancialAgentWatchdog — At Startup, Run as Admin
-Start-ScheduledTask -TaskName "FinancialAgentWatchdog"   # הפעלה ידנית
-Stop-ScheduledTask  -TaskName "FinancialAgentWatchdog"   # עצירה מלאה
-# עצירה רכה (jobs בלבד): כפתור Disable בדף Scheduler ב-Streamlit
+FinancialAgentWatchdog          FinancialAgentIBKRWorker        FinancialAgentTunnelWatchdog
+(run_scheduler_watchdog.py)     (run_ibkr_worker_watchdog.py)   (run_tunnel_watchdog.py)
+        │                               │                               │
+        ▼                               ▼                               ▼
+  scheduler.py                  src/ibkr_worker.py              run_dashboard_tunnel.py
+  .venv (Py 3.14)               .venv313 (Py 3.13)              (Cloudflare Quick Tunnel)
+  All scoring/alerts             Supertrend(1H) loop
+  DB writes via WAL              + bracket orders
+                    ◄──── SQLite DB (WAL) ────►
 ```
 
-**ארכיטקטורה:**
-```
-Watchdog (run_scheduler_watchdog.py)
-└── scheduler.py
-    ├── Market Digest:        08:00  → Telegram
-    ├── Catalyst+SI Alert:    08:05  → Telegram (SI≥10% + catalyst ≤7d + explosion≥40)
-    ├── Portfolio News:       08:15  → Telegram
-    ├── Squeeze+SI Alert:     07:45  → Telegram (SI>15% + DTC>10)
-    ├── Scan:                 08:30, 16:30  (auto-watchlist if score≥70)
-    ├── Watchlist:            09:00  (score/price/supertrend/delta alerts)
-    ├── Portfolio:            09:15  (stop loss / target / score drop / delta alerts)
-    ├── Price Monitor:        כל 5 דקות (thread) → price_target + volume_spike + supertrend (15m+daily)
-    ├── Momentum Monitor:     כל 30 דקות (thread)
-    └── News Catalyst Monitor: כל 15 דקות (thread)
-```
+**Stop cleanly:** create `stop_scheduler.flag`, `stop_ibkr_worker.flag`, or `stop_tunnel.flag` in the project root.
+
+**Python Launcher fix:** `.venv313\Scripts\python.exe` is the Windows Python Launcher, not the real interpreter. The IBKR watchdog reads `pyvenv.cfg` to find the real `Python313\python.exe` and invokes it directly, preventing a phantom parent+child process pair.
 
 ---
 
-## Auto-Refresh (Streamlit)
+## Scheduler Jobs
 
-דפים נבחרים מתרעננים אוטומטית באמצעות `streamlit-autorefresh` — רק כשאתה נמצא בדף.
+> Times from `scheduler_config.json` — overrides code defaults.
 
-| דף | מרווח | סיבה |
+| Job | Time | Channel |
 |---|---|---|
-| Market | 10 דקות | indices + futures |
-| Watchlist | 5 דקות | מחירים live |
-| News Impact | 20 דקות | LLM calls יקרים |
-| Squeeze | 15 דקות | שילוב API calls |
-| Scan / Research / Backtest | ידני בלבד | סריקות ארוכות |
+| Watchlist Cleanup | 08:00 | Telegram (summary) |
+| Catalyst + High-SI Alert | 08:05 | Telegram (combined) |
+| Cloudflare heartbeat | 08:05 | Telegram |
+| Portfolio News | 08:30 | Telegram |
+| Scan + Auto-Watchlist | 08:30, 15:00 | Telegram (auto-added summary) |
+| Portfolio Scan | 09:15 | Telegram (stop/target/score) |
+| Market Digest | 09:30 | Telegram |
+| Alert Monitor health | 09:30 | Telegram |
+| Watchlist Scan | 12:00 | Telegram (score/price alerts) |
+| Squeeze Scan | 12:00 | Telegram |
+| Long Setups | 09:30 | DB only |
+| Weekly Rotation | Mon 08:15 | Telegram |
+| Forward Outcomes | 18:00 daily | DB only |
+| Forward Digest | Fri 20:00 | Telegram (win-rate) |
+| Price Monitor + Supertrend | every 5 min (thread) | DB only |
+| Momentum Monitor | every 30 min (thread) | Telegram (auto-add) |
+| News Catalyst Monitor | every 15 min (thread) | Telegram (LLM analysis) |
+| IBKR combined_buy / combined_sell | real-time, every 5 min | Telegram + bracket order |
 
 ---
 
@@ -112,157 +124,104 @@ Watchdog (run_scheduler_watchdog.py)
 | SI% of Float | 10 | Short interest |
 | Institutional | 5 | |
 | Insider | 5 | SEC Form 4 |
-| Fundamentals | 10 | P/E, Revenue Growth, Margin, D/E |
-| **DCF** | **15** | **Margin of Safety vs intrinsic value** |
-| Squeeze Bonus | +15 | SI≥20% + volume spike + price rising |
+| Fundamentals | 10 | P/E, Revenue CAGR (EDGAR), Interest Coverage (EDGAR), Margin |
+| DCF | 15 | CAPM WACC · EDGAR FCF (Tier 1) · net debt subtracted |
+| Squeeze Bonus | +15 | SI≥20% + vol spike + price up |
 | Google Trends | +5 | bonus |
+| Earnings Sentiment | +5 | EPS surprise (Finnhub) + LLM transcript + EDGAR EPS YoY fallback |
 
 **Signals:** 75+ = STRONG BUY · 60–74 = BUY · 45–59 = WATCH · 35–44 = NEUTRAL · <35 = SKIP
 
 ---
 
-## Catalyst Scanner
+## DCF Engine (`src/dcf_valuation.py`)
 
-Finds small/mid-cap stocks with an upcoming catalyst and high explosion potential.
+```
+Enterprise Value = Σ FCF_t/(1+WACC)^t + TV/(1+WACC)^n
+Equity Value     = Enterprise Value − Net Debt
+Intrinsic/share  = Equity Value / sharesOutstanding
+```
 
-| Component | Max pts | Logic |
-|---|---|---|
-| Urgency | 30 | Today=30 · 1d=27 · 3d=17 · 7d=8 |
-| SI% Fuel | 25 | ≥20%=25 · ≥15%=18 · ≥10%=11 |
-| Float Amplifier | 20 | ≤5M=20 · ≤15M=16 · ≤40M=11 · ≤100M=6 |
-| Volume Building | 10 | ≥3x=10 · ≥2x=7 · ≥1.5x=4 |
-| Insider Buying | 10 | net buying 90d (Form 4) |
-| Momentum | 5 | 5-day price change |
-| Unusual Options | +8 | Unusual CALL activity via yfinance; +4 if PCR<0.7 |
+**FCF source priority (tiered):**
+1. SEC EDGAR XBRL — median of 4 annual 10-K values (audited, free)
+2. yfinance cashflow DataFrame — multi-year median
+3. yfinance TTM `info.freeCashflow`
+4. OCF − CapEx
 
-**Labels:** ≥70 = HIGH · 50–69 = MEDIUM · 30–49 = LOW · <30 = WATCH
+**WACC:** CAPM cost of equity (Rf = ^TNX + Beta × 5.5% ERP) + actual cost of debt (InterestExpense/totalDebt). Clamped 7%–15%.
 
-**Catalyst types:** Earnings (Nasdaq API) · Analyst Upgrade (Finnhub) · SEC 8-K (EDGAR, parallel fetch) · **💊 FDA/PDUFA** (BioPharma Catalyst, no key, 6h cache)
-
-**Extra columns:** News Catalyst 🔵 (regex on headlines: FDA/merger/deal/approval/…) · Insider 🟢/🔴 (buy/sell count from Form 4) · 📊 Options (unusual call activity badge)
-
-**Biotech scan:** Index / Sector → Russell 2000 → Health Care (~150 tickers)
+**Exclusions:** Financial sector (banks/insurance) → returns None → P/S fallback. Over-leveraged (equity_value ≤ 0) → None.
 
 ---
 
-## Watchlist Alert Types (12)
+## IBKR Real-Time Order Execution
 
-| Type | Trigger | Frequency |
-|---|---|---|
-| `score_threshold` | Score ≥ configured threshold | On scan |
-| `price_change` | Price moved ≥ configured % | On scan |
-| `price_target` | Price within $0.05 of target | Every 5 min |
-| `price_above` | Price crossed above level | On scan |
-| `price_below` | Price dropped below level | On scan |
-| `stop_loss` | Portfolio: price ≤ stop loss | On scan |
-| `target_hit` | Portfolio: price ≥ target | On scan |
-| `score_drop` | Portfolio: score < 35 | On scan |
-| `volume_spike` | Volume > X × 10d avg | Every 5 min |
-| `supertrend_flip` | Supertrend BUY/SELL flip — Daily bars | Every 5 min + on scan |
-| `supertrend_intraday_flip` | Supertrend BUY/SELL flip — 15-min bars | Every 5 min |
-| `score_delta_drop` | Score fell ≥15 pts since last scan | On scan |
-| `score_delta_rise` | Score rose ≥15 pts since last scan | On scan |
+**Flow:** Supertrend 1H flip → `signal_combiner.evaluate()` → Telegram alert → `order_manager.submit()` → execution engine (7 veto layers) → `ibkr_realtime.place_bracket_order()`.
 
-Cooldown: 24h per ticker+type · price_target + volume_spike: 4h · supertrend_intraday_flip: 1h
-
----
-
-## Supertrend Alert (`src/supertrend.py`)
-
-Pine Script v4 algorithm implemented in Python (1:1 translation).
-
-- **Parameters:** ATR period=10, multiplier=3.0 (Pine Script defaults)
-- **BUY signal:** trend flips from -1 → 1 (price crosses above support band)
-- **SELL signal:** trend flips from 1 → -1 (price crosses below support band)
-- Enable per ticker in Watchlist → `📈 Supertrend Alert` checkbox
-- **Real-time check every 5 min** via `price_alert_monitor.py`:
-  - **15-min bars** (`interval="15m", period="5d"`) — intraday flip detection, cooldown 1h
-  - **Daily bars** (`period="60d"`) — trend confirmation, cooldown 4h
-- Also checked during scheduled `scan_watchlist()` at 09:00
-
----
-
-## Portfolio P&L Dashboard
-
-The Portfolio tab shows a full P&L breakdown — no scan required, uses live prices.
-
-**KPI bar (6 metrics):** Invested Capital · Portfolio Value · Total P&L · Return % · Winners · Losers
-
-**3 sub-tabs:**
-| Tab | Content |
+**Execution engine layers:**
+| Layer | Check |
 |---|---|
-| **P&L Table** | Sortable DataFrame: Price, Entry, Shares, Invested, Value, P&L $, P&L %, Score, Sector, Stop, Target |
-| **Sector Allocation** | Bar chart of portfolio weight % per sector + summary table (sector fetched from yfinance, cached 1h) |
-| **Position Cards** | Detailed per-position cards with stop/target progress bar |
+| -1 | SELL veto: no open position |
+| 0 | Daily loss limit (max_daily_loss_pct from config) |
+| 1 | Hard vetos: ADV < $5M, R:R < 1.5:1, gap-down |
+| 2 | Confluence score |
+| 3 | Position sizing (regime-adjusted) |
+| 4 | Time-of-day noise filter |
+| 5 | Sector concentration |
+
+**Safety:** `paper_mode=True` by default. BEAR regime veto is BUY-only — SELL exits always pass.
+
+**Two-way Telegram commands:** `/status`, `/positions`, `/pause`, `/resume`, `/cancel <TICKER>`
 
 ---
 
-## Market Page
+## Hysteresis Bands
 
-| Widget | Source | Notes |
+All binary thresholds use entry/exit deadbands to prevent thrashing:
+
+| Threshold | Entry | Exit |
 |---|---|---|
-| **Futures Bar** | yfinance (ES=F, NQ=F, YM=F, GC=F, CL=F) | Pre/post market direction |
-| **VIX Card** | yfinance (^VIX) | Level: Calm / Normal / Caution / Fear / Panic |
-| **Indices** | yfinance | S&P, Nasdaq, Dow, Russell, Oil, Gold, Bond, FX, BTC |
-| **Sector Heatmap** | yfinance (XL* ETFs) | 1D / 5D |
-| **Market Mood** | Alpha Vantage + Finnhub | Sentiment from 40 articles |
-| **Earnings** | Nasdaq API | This week, by date |
-| **Macro Events** | Hardcoded schedule | CPI, Fed, NFP, etc. |
+| Auto-watchlist score | 70 | 40 |
+| Squeeze SI% | 15% | 10% |
+| Catalyst SI% | 10% | 5% |
+| Liquidity ADV | $5M | $3M |
 
-**VIX Levels:** <15 Calm · 15-20 Normal · 20-30 Caution · 30-40 Fear · 40+ Panic
+Auto-exit cooldown: 7 days after auto-exit before re-add (bypass only if score ≥ 75).
 
 ---
 
-## DCF Valuation
+## Alert Types (21)
 
-5-year discounted cash flow model built into the scoring engine.
+Real-time alerts go via `ibkr_worker` → Supertrend 1H flip. All yfinance-based alerts are DB-log-only (silenced from Telegram to reduce noise).
 
-**Formula:** `Intrinsic Value = Σ(FCF_t / (1+WACC)^t) + Terminal Value`
-
-- Growth rate: avg(revenue growth, earnings growth), clamped 3%–25%
-- WACC: 10% base + up to 3% for high leverage · Terminal growth: 2.5%
-- Data: `freeCashflow` from yfinance
-
-**Margin of Safety → Score:** ≥40% → 15pts · 20-40% → 11pts · 5-20% → 7pts · 0-5% → 3pts · <0% → 0pts
-
----
-
-## LLM Architecture
-
-- **Primary:** Gemini 2.5 Flash
-- **Fallback:** Groq / Llama 3.3 70B — triggered automatically on Gemini 429 rate-limit
-- All LLM calls routed through `src/llm_client.py → llm_complete()`
-
----
-
-## Insider Tracking (SEC Form 4)
-
-| Mode | Speed | Source |
+| Type | Source | Telegram |
 |---|---|---|
-| **sec-api.io** (with `SEC_API_KEY`) | ~1s per ticker | Single API call |
-| **EDGAR XML** (fallback) | 4–7s per ticker | Manual XML scraping |
-
-**Catalyst Scanner insider column:** shows 🟢 3B (3 buys) / 🔴 2S (2 sells) / ★ cluster (3+ insiders) instead of a plain boolean.
-
-**Reverse Lookup** (requires `SEC_API_KEY`): Short Squeeze page — shows who bought in 1/3/7 days. Cache 15 min.
+| `combined_buy` / `combined_sell` | IBKR real-time | ✅ |
+| `catalyst_si_alert` | daily scan | ✅ |
+| `news_catalyst` | LLM analysis every 15 min | ✅ |
+| `price_above` / `price_below` / `price_target` / `price_change` | user-defined | ✅ |
+| `stop_loss` / `target_hit` / `score_drop` | portfolio monitor | ✅ |
+| `auto_wl_momentum` / `auto_wl_squeeze` | scan auto-add | ✅ |
+| `breakout_alert` / `score_delta_rise` / `score_delta_drop` | daily scan | DB only |
+| `supertrend_flip` / `supertrend_1h_flip` | price monitor | DB only |
 
 ---
 
-## Short Squeeze Scanner
+## DB Schema (key tables)
 
-| Component | Weight | Adjustment |
-|---|---|---|
-| SI% of Float | 50% | — |
-| Days to Cover | 20% | — |
-| Est. Borrow Fee | 20% | None → -20pts · ≥20% → +15pts |
-| Volume Ratio | 10% | — |
+| Table | Purpose |
+|---|---|
+| `scan_results` | Raw scan output per ticker (JSON) |
+| `watchlist` / `portfolio` | User-managed tickers |
+| `watchlist_alerts` | Alert log + cooldown registry |
+| `forward_signals` | Every BUY/SELL alert + 7/14/30d outcomes |
+| `ibkr_positions` | Live IBKR positions (synced every 5 min) |
+| `daily_pnl` | One row per calendar day from IBKR |
+| `order_log` | Every order attempt (SUBMITTED/VETOED/FILLED/CANCELLED/ERROR/PAUSED) |
+| `monitoring_queue_snapshot` | Persisted IBKR monitoring queue |
+| `telegram_command_state` | Telegram polling offset (crash-safe) |
 
-- **Borrow Fee:** estimated from SI% via Finviz
-- **Sparkline:** 7-day price + volume chart
-- **Critical Alert 🚨:** dist <5% AND all metrics Top 10%
-- **Insider Overlay 🥇:** SEC Form 4 reverse lookup
-- **AI Verdict:** on-demand Hebrew analysis (RTL rendered)
-- **Sector mode:** iShares index + sector
+WAL hardening: `journal_mode=WAL`, `synchronous=FULL`, `busy_timeout=30s`, `retry_on_busy` decorator (5 attempts, exponential backoff).
 
 ---
 
@@ -270,128 +229,86 @@ The Portfolio tab shows a full P&L breakdown — no scan required, uses live pri
 
 ```
 FinancialAgent/
-├── dashboard.py
-├── scheduler.py
-├── install_service.bat
-├── service_control.bat
+├── dashboard.py                    # Streamlit router (11 pages)
+├── scheduler.py                    # Background jobs + daemon threads
+├── run_scheduler_watchdog.py       # Auto-restart on crash
+├── run_ibkr_worker_watchdog.py     # Auto-restart + orphan kill + singleton
+├── run_dashboard_tunnel.py         # Cloudflare Quick Tunnel + heartbeat
+├── run_tunnel_watchdog.py          # Tunnel auto-restart
 ├── _pages_modules/
 │   ├── page_scan.py
 │   ├── page_research.py
-│   ├── page_watchlist.py        # 12 alert types, P&L dashboard, sector allocation
+│   ├── page_watchlist.py
 │   ├── page_market.py
 │   ├── page_news_impact.py
-│   ├── page_squeeze.py          # insider overlay 🥇
-│   ├── page_catalyst.py         # catalyst scanner + news flag + insider + PDUFA + options
-│   ├── page_options_flow.py     # options chain, PCR, unusual activity
+│   ├── page_squeeze.py
+│   ├── page_catalyst.py
+│   ├── page_options_flow.py
 │   ├── page_backtest.py
 │   ├── page_history.py
 │   └── page_scheduler.py
 ├── src/
-│   ├── stock_scorer.py
-│   ├── dcf_valuation.py
-│   ├── squeeze_scanner.py
-│   ├── borrow_fee.py
-│   ├── supertrend.py            # Supertrend algorithm (Pine Script 1:1)
-│   ├── catalyst_scanner.py      # explosion_score(), scan_catalysts(), PDUFA, unusual options
-│   ├── price_alert_monitor.py   # price_target + volume_spike + supertrend (15m+daily) every 5 min
-│   ├── watchlist_manager.py     # scan_watchlist() — all alert types including score delta
-│   ├── options_flow.py          # get_options_summary(), scan_unusual_activity()
-│   ├── news_fetcher.py          # detect_news_catalyst(), fetch_yfinance_news()
-│   ├── news_catalyst_monitor.py # background thread — news-triggered alerts every 15 min
-│   ├── momentum_scanner.py      # background thread — momentum alerts every 30 min
-│   ├── telegram_news_digest.py
-│   ├── insider_tracker.py
-│   ├── sec_api_client.py
-│   ├── market_feed.py
-│   ├── database.py              # SQLite CRUD + auto migration
-│   ├── llm_client.py            # Gemini → Groq fallback
-│   ├── earnings_sentiment.py    # EPS surprise history (Tier 1) + LLM transcript (Tier 2)
-│   └── pattern_detectors/
-│       └── technical_indicators.py
-├── tests/
-│   ├── test_scorer.py           # 56 unit tests
-│   └── test_insider_sec_api.py
+│   ├── stock_scorer.py             # Scoring engine 0–100
+│   ├── dcf_valuation.py            # CAPM WACC + EDGAR FCF + net debt
+│   ├── edgar_fcf.py                # SEC EDGAR XBRL (FCF, CAGR, ICR, current ratio, EPS)
+│   ├── stock_forecaster.py         # ARIMA/MA/ES/MLP ensemble (point-in-time safe)
+│   ├── earnings_sentiment.py       # EPS surprise + LLM transcript + EDGAR fallback
+│   ├── squeeze_scanner.py          # Squeeze Score + AI Verdict
+│   ├── catalyst_scanner.py         # Explosion score, PDUFA, 8-K, unusual options
+│   ├── momentum_scanner.py         # 5-factor momentum (ROC/RS/MA/RSI/Volume)
+│   ├── long_setup_scanner.py       # Daily long setup scanner
+│   ├── options_flow.py             # Options chain, PCR, unusual activity
+│   ├── supertrend.py               # ATR Wilder EMA (TradingView-identical)
+│   ├── ibkr_realtime.py            # IB Gateway connector (ib_async)
+│   ├── ibkr_worker.py              # Standalone daemon (Py 3.13) — Supertrend loop + orders
+│   ├── signal_combiner.py          # Supertrend flip → BUY/SELL dedup + daily cap
+│   ├── order_manager.py            # Execution engine veto → bracket order → DB log
+│   ├── execution_engine.py         # 7-layer veto + position sizing (regime-aware)
+│   ├── position_tracker.py         # IBKR position sync → ibkr_positions DB
+│   ├── market_regime.py            # BULL/CAUTION/BEAR (VIX + SPY SMA200)
+│   ├── forward_signals.py          # Alert → 7/14/30d outcome tracking
+│   ├── monitoring_queue.py         # Which tickers get real-time IBKR monitoring
+│   ├── auto_watchlist_agent.py     # Auto-adds squeeze/catalyst/momentum candidates
+│   ├── hysteresis.py               # Central entry/exit deadband thresholds
+│   ├── price_alert_monitor.py      # Price target + supertrend (15m/1h/daily) every 5 min
+│   ├── watchlist_manager.py        # Score/price/delta alert logic
+│   ├── score_alert.py              # Score jump/drop for all scanned tickers
+│   ├── news_catalyst_monitor.py    # Background thread — LLM news analysis every 15 min
+│   ├── news_impact_analyzer.py     # 3-layer LLM news analysis
+│   ├── news_fetcher.py             # Multi-source news fetch + catalyst_score
+│   ├── alert_monitor.py            # Daily health-check (noisy alerts, dead threads, drawdown)
+│   ├── telegram_notifier.py        # Telegram send (4000-char truncation guard)
+│   ├── telegram_command_handler.py # Two-way Telegram polling (/status /positions /pause…)
+│   ├── telegram_news_digest.py     # Market digest + Portfolio news
+│   ├── opportunity_tracker.py      # BUY signal → T1/stop outcome tracking
+│   ├── market_feed.py              # Live indices + macro events
+│   ├── macro_signals.py            # Macro signals
+│   ├── index_loader.py             # iShares + Wikipedia S&P 500 fallback
+│   ├── borrow_fee.py               # SI% → borrow rate estimate (Finviz, 5-min error TTL)
+│   ├── finnhub_client.py           # Finnhub API wrapper
+│   ├── llm_client.py               # Gemini → Groq fallback
+│   ├── database.py                 # SQLite CRUD + WAL + retry_on_busy
+│   └── scan_worker.py              # Background scan thread
+├── tests/                          # 269 tests, 0 failures
 ├── logs/
 └── data/
-    └── financial_agent.db
+    ├── financial_agent.db
+    └── pdufa_cache.json
 ```
 
 ---
 
-## UI / UX
+## Known Limitations
 
-- **Tooltips:** hover over column headers and metric labels (RSI, MACD, MA Trend, SI%, DCF/MoS, WACC, DTC, Borrow Fee, Vol Ratio, VIX)
-- **Catalyst Scanner:** scan only on button click — no auto-run on page load or filter change
-- **AI Verdict (Short Squeeze):** Hebrew analysis displayed RTL
-
----
-
-## Known Issues
-
-- DCF returns None for loss-making companies (no positive FCF)
-- DCF MoS extreme negative for high-growth stocks (e.g. TSLA) — correct by design
-- Form 4 `pricePerShare` sometimes absent — shows "N/A"
-- Price monitor / volume spike only run when Scheduler is active (or Windows Service)
-- Borrow fee approximated from SI% — directionally correct, not exact
-- Backtest requires at least one week of scan data in DB
-- Google Trends occasional 429 errors
-- Alpha Vantage free tier: 25 req/day
-- sec-api.io trial: 100 credits per endpoint
-- PDUFA scraper depends on BioPharma Catalyst HTML layout — falls back to empty list gracefully
-- Unusual Options: yfinance options data absent for many small caps → 0 pts, no crash
-- Score delta alerts require at least one prior scan result in DB per ticker
-
----
-
-## Execution Engine (In Development)
-
-Layers being built to bridge the gap from "interesting candidate" to "actionable trade":
-
-| Layer | Module | Status |
-|---|---|---|
-| **1. Market Regime Throttle** | `src/market_regime.py` | 🔨 In progress |
-| **2. Hard Veto Engine** | `src/execution_engine.py` | 🔨 In progress |
-| **3. Two-Track Confluence** | `src/execution_engine.py` | 🔨 In progress |
-| **4. Position Sizing** | `src/execution_engine.py` | 🔨 In progress |
-| **5. Time-of-Day Flag** | `src/execution_engine.py` | Planned |
-| **6. Sector Warn / Heatmap** | `src/execution_engine.py` | Planned |
-| **7. Walk-Forward Backtest** | `_pages_modules/page_backtest.py` | Planned |
-| **8. Paper Trading Audit Trail** | `src/paper_trading.py` | Planned |
-
-### Regime Throttle
-Three states — not a binary kill switch. Affects position size multiplier, signal frequency, and stop width:
-
-| Regime | Trigger | Effect |
-|---|---|---|
-| **BULL** | SPY above 200d SMA + VIX < 20 | Full size, all signals active |
-| **CAUTION** | SPY near 200d SMA or VIX 20–28 | 50% size, tighter stops |
-| **BEAR** | SPY below 200d SMA + VIX > 28 | 30% size, exits only |
-
-VIX thresholds are starting points — require walk-forward calibration per strategy.
-
-### Two-Track Signal System
-
-**Track A — High-Quality Confluence** (standard breakouts, momentum)
-Weighted pillars (Technical 40 + Fundamental 30 + Catalyst 30), min total 60. Hard vetos apply.
-
-**Track B — Special Situations** (squeeze, PDUFA, SEC 8-K surprise)
-Dynamic catalyst weights: catalyst pillar increases to 50% when SI > 20% OR days-to-event < 5.
-Max position size capped at 1.5% portfolio regardless of signal strength.
-
-### Hard Vetos (both tracks)
-- Avg daily dollar volume < $5M → reject
-- R:R < 1.5:1 → reject
-- Stock gapped down > 5% on earnings and signal is on the bounce → reject
-- Regime = BEAR → exits only (no new longs)
-
-### Enriched Alert Format
-```
-✅ AAPL — Track A Confluence | Regime: BULL
-Technical ✅ 38/40 | Fundamental ✅ 26/30 | Catalyst ✅ Earnings in 4d
-Entry: $182.50 | Stop: $178.20 (-2.4%) | Target: $194.00 (+6.3%)
-Size: 27 shares ($4,928) — 1% portfolio risk | R:R: 2.7:1
-⚠️ Time: first 30 min — wait for confirmation
-```
+- Alpha Vantage: 25 req/day free tier — warns at 23
+- Google Trends: occasional 429; 1-hour cache + threading.Lock()
+- DCF: returns None for loss-making (no +FCF), financial sector, over-leveraged companies
+- Forecast weight (15) is defined but `forecast_score=0` in code — inactive ("indicative only")
+- MLP `early_stopping` uses shuffled validation split — not ideal for time series, flagged but unchanged
+- PDUFA scraper depends on BioPharma Catalyst HTML structure — returns `[]` gracefully on failure
+- Unusual Options: yfinance options data absent for many small caps → 0 pts
+- `get_upcoming_macro()` is approximate weekly schedule — events marked `*`
+- Backtest requires ≥1 week of scan data in DB
 
 ---
 
@@ -401,4 +318,4 @@ This is NOT financial advice. For research and educational purposes only.
 
 ---
 
-*Last updated: 2026-04-24*
+*Last updated: 2026-06-29*

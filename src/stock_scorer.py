@@ -155,8 +155,11 @@ def score_stock(ticker: str, forecast_days: int = 30) -> Optional[Dict[str, Any]
         timings['forecast'] = round(_time.time() - t, 2)
 
         # ── Short interest ────────────────────────────────────────────────────
-        short_pct   = info.get('shortPercentOfFloat') or 0
-        short_ratio = info.get('shortRatio') or 0
+        import math as _math
+        _sp = info.get('shortPercentOfFloat')
+        short_pct   = float(_sp) if _sp is not None and not _math.isnan(float(_sp)) else 0.0
+        _sr = info.get('shortRatio')
+        short_ratio = float(_sr) if _sr is not None and not _math.isnan(float(_sr)) else 0.0
         si_score    = _score_short_interest(short_pct, short_ratio)
 
         # ── Active Squeeze Detection ──────────────────────────────────────────
@@ -179,11 +182,11 @@ def score_stock(ticker: str, forecast_days: int = 30) -> Optional[Dict[str, Any]
         inst_score  = _score_institutional(inst_pct, inst_change)
 
         # ── Fundamentals (P/E, growth, margin, D/E) ──────────────────────────
-        fund_score = _score_fundamentals(info)
+        fund_score = _score_fundamentals(info, ticker=ticker)
 
         # ── DCF Valuation — P/S fallback for loss-making companies ───────────
         t = _time.time()
-        dcf_data  = calculate_dcf(info, cashflow_df=cashflow_df)
+        dcf_data  = calculate_dcf(info, cashflow_df=cashflow_df, ticker=ticker)
         if dcf_data is None:
             dcf_data = calculate_ps_valuation(info)   # P/S proxy for negative-FCF names
         dcf_score = dcf_data["dcf_score"] if dcf_data else 0
@@ -235,7 +238,7 @@ def score_stock(ticker: str, forecast_days: int = 30) -> Optional[Dict[str, Any]
                     WEIGHTS['institutional'] + WEIGHTS['insider'] +
                     WEIGHTS['fundamentals'] + WEIGHTS['dcf'])
         bonus = trends_scr + squeeze_bonus + news_score
-        total = round(min((core / core_max) * 90 + min(bonus, 20), 100.0), 1)
+        total = round(min((core / core_max if core_max > 0 else 0) * 90 + min(bonus, 20), 100.0), 1)
 
         result = {
             'ticker':           ticker,
@@ -343,27 +346,60 @@ def _score_institutional(inst_pct: float, inst_change: Optional[float]) -> int:
     return min(score, w)
 
 
-def _score_fundamentals(info: dict) -> int:
-    w, score = WEIGHTS['fundamentals'], 0
-    pe = info.get('trailingPE') or info.get('forwardPE')
+def _score_fundamentals(info: dict, ticker: str = "") -> int:
+    score = 0
+
+    # P/E — unchanged
+    pe = info.get("trailingPE") or info.get("forwardPE")
     if pe:
-        if 0 < pe <= 20:     score += 3
-        elif 20 < pe <= 40:  score += 2
-        elif 40 < pe <= 80:  score += 1
-    rev_growth = info.get('revenueGrowth')
+        if   pe <= 20: score += 3
+        elif pe <= 40: score += 2
+        elif pe <= 80: score += 1
+
+    # Revenue Growth — EDGAR 5yr CAGR preferred, yfinance 1yr as fallback
+    rev_growth = None
+    if ticker:
+        try:
+            from src.edgar_fcf import get_revenue_cagr
+            rev_growth = get_revenue_cagr(ticker, years=5)
+        except Exception:
+            pass
+    if rev_growth is None:
+        rev_growth = info.get("revenueGrowth")   # yfinance fallback (1yr)
+
     if rev_growth is not None:
-        if rev_growth >= 0.30:   score += 3
-        elif rev_growth >= 0.15: score += 2
-        elif rev_growth >= 0.05: score += 1
-    margin = info.get('profitMargins')
-    if margin is not None:
-        if margin >= 0.20:   score += 2
+        if   rev_growth >= 0.20: score += 3
+        elif rev_growth >= 0.08: score += 2
+        elif rev_growth >= 0.02: score += 1
+
+    # Profit Margin — unchanged (yfinance)
+    margin = info.get("profitMargins")
+    if margin:
+        if   margin >= 0.20: score += 2
         elif margin >= 0.10: score += 1
-    de = info.get('debtToEquity')
-    if de is not None:
-        if de <= 0.5:    score += 2
-        elif de <= 1.5:  score += 1
-    return min(score, w)
+
+    # Debt Quality — Interest Coverage from EDGAR preferred, D/E as fallback
+    icr = None
+    if ticker:
+        try:
+            from src.edgar_fcf import get_interest_coverage
+            icr = get_interest_coverage(ticker)
+        except Exception:
+            pass
+
+    if icr is not None:
+        # ICR = EBIT/Interest: >5 = safe, 2-5 = adequate, <2 = risky
+        if   icr >= 5.0: score += 2
+        elif icr >= 2.0: score += 1
+    else:
+        # D/E fallback
+        de = info.get("debtToEquity")
+        if de is not None:
+            de_decimal = de / 100   # yfinance: 150 = 1.5 D/E
+            if   de_decimal <= 0.5: score += 2
+            elif de_decimal <= 1.5: score += 1
+
+    return min(score, 10)
 
 
 def signal_label(score: float) -> str:

@@ -6,7 +6,7 @@ AI-powered stock scanner & financial analysis dashboard.
 - **Stack:** Python 3.14, Streamlit 1.52.2, SQLite, yfinance, Finnhub, Alpha Vantage, SEC EDGAR
 - **LLMs:** Gemini 2.0 Flash (primary) → Groq Llama 3.3 70B (fallback) via `src/llm_client.py`
 - **Run:** `streamlit run dashboard.py` → http://localhost:8501
-- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py` → 273 tests, 0 failures
+- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → 269 passed, 4 pre-existing failures (bars_ago × 3, fill_callback × 1)
 
 ---
 
@@ -766,6 +766,27 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 - [x] **EDGAR fundamentals** — `src/edgar_fcf.py` extended with: `get_revenue_cagr` (5yr CAGR from 10-K), `get_interest_coverage` (EBIT/InterestExpense), `get_current_ratio` (AssetsCurrent/LiabilitiesCurrent), `get_eps_yoy_growth` (quarterly YoY proxy). All 24h cached.
 - [x] **Fundamentals scorer EDGAR integration** — `_score_fundamentals` in `stock_scorer.py`: Revenue CAGR 5yr (EDGAR) replaces yfinance 1yr; Interest Coverage (EDGAR) replaces D/E as debt quality signal (D/E kept as fallback). Thresholds: revenue 20%/8%/2%; ICR ≥5=2pts / ≥2=1pt.
 - [x] **Earnings sentiment EDGAR fallback** — `src/earnings_sentiment.py`: when Finnhub returns empty, `_edgar_eps_fallback()` computes YoY EPS% from EDGAR 10-Q filings and maps to 0–5 score (`source='edgar_eps_yoy'`). Prevents `score=0, source='none'` for tickers Finnhub doesn't cover.
+
+### QA Hardening Phase 2 — 2026-06-29
+
+Second pass over the multi-agent audit list (16 fixes: HIGH + MEDIUM + LOW priorities).
+
+- [x] **`score_delta_rise` suppression after auto-add** — `scheduler.py`: added `"score_delta_rise"` to the post-auto-add suppression loop (was only `score_threshold` + `price_change`). Prevents 12:00 watchlist scan from re-firing a delta alert for just-added tickers.
+- [x] **`short_pct`/`short_ratio` NaN guard** — `stock_scorer.py`: `info.get('shortPercentOfFloat') or 0` returns `NaN` when yfinance returns NaN (NaN is truthy). Replaced with explicit `math.isnan()` check + float cast.
+- [x] **DCF `growth_proxy` missing-data path** — `dcf_valuation.py`: when both `revenueGrowth` and `earningsGrowth` are None, `raw_growth_proxy` is now `None` (was `0`). Blend logic respects `None`; falls through to `historical_fcf_growth` alone, or logs 0% with a DEBUG message.
+- [x] **`core_max` division-by-zero guard** — `stock_scorer.py`: `(core / core_max if core_max > 0 else 0)` — unreachable in normal operation but guards against future weight-config changes.
+- [x] **Price monitor cycle timing** — `scheduler.py`: added `_t0 / _elapsed` around the `_price_monitor_thread` check loop; logs duration and emits WARNING if cycle exceeds 80% of the interval.
+- [x] **Momentum scanner SPY missing warning** — `src/momentum_scanner.py`: logs `WARNING` when SPY data is absent or has < 21 bars, so RS scores using 0% benchmark are visible in logs.
+- [x] **`borrow_fee.py` short error TTL** — Failure results (403/429/parse error) now cached for 5 min instead of 2 hours. Uses timestamp offset trick to preserve the existing TTL check logic.
+- [x] **`/cancel` ticker validation** — `src/telegram_command_handler.py`: ticker validated with `re.fullmatch(r"[A-Z]{1,6}", ticker)` before calling IBKR. Rejects empty, too-long, or non-alpha inputs.
+- [x] **`_reply()` truncation guard** — `src/telegram_command_handler.py`: replies truncated at 4000 chars with `…` to match TelegramNotifier behavior.
+- [x] **`page_scheduler.py` XSS** — all `st.error(f"Error: {e}")` calls now use `html.escape(str(e))` to prevent raw exception text (potentially from external API responses) reaching the browser.
+- [x] **`get_interest_coverage()` zero-debt fix** — `src/edgar_fcf.py`: when `InterestExpense == 0`, returns `100.0` (max cap) instead of `None`. Zero-debt companies now receive full ICR score instead of D/E fallback.
+- [x] **`auto_watchlist_agent` DB write protection** — `src/auto_watchlist_agent.py`: `watchlist_add()` + `watchlist_save_alert()` wrapped in `try/except`. DB failure for one ticker no longer aborts the entire loop.
+- [x] **Tunnel watchdog Telegram flood guard** — `run_tunnel_watchdog.py`: crash/restart notifications rate-limited to one per 5 minutes via `flood_guard=True` param. Startup and stop-sentinel messages always send.
+- [x] **MLP `early_stopping` caveat documented** — `src/stock_forecaster.py`: added comment explaining the shuffled-validation-split limitation (non-ideal for time series, intentionally unchanged).
+- [x] **PDUFA scraper column-order validation** — `src/catalyst_scanner.py`: reads `<thead>` headers to determine actual column indices for ticker/catalyst/date. Falls back to hardcoded defaults (0/2/3) if headers absent or unrecognized.
+- [x] **`score_delta_rise` auto-add suppression** — already listed above.
 
 ### QA Hardening Sprint — 2026-06-28
 

@@ -1,4 +1,5 @@
 """Page: Scan"""
+import html as _html_mod
 import streamlit as st
 import pandas as pd
 import json, sys, time as _time
@@ -6,6 +7,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import subprocess
 from src.ui_theme import badge, tooltip, score_cell
+
+
+def _html(raw: str) -> str:
+    return " ".join(raw.split())
 from src.stock_scorer import score_stock, signal_label
 from src.database import get_latest_scan, create_scan_job, get_scan_job, get_connection
 from src.index_loader import get_index, get_sectors, get_tickers_by_sector, list_indices
@@ -64,9 +69,9 @@ def render():
         max_stocks    = st.number_input("Max stocks per sector", 10, 500, 50, step=10)
         forecast_days = st.number_input("Forecast days", 7, 90, 30)
 
-    st.markdown("""<div class="scan-info-box">
+    st.markdown(_html("""<div class="scan-info-box">
     Estimated scan time: ~6-10 sec per stock. Scan runs in background — you can navigate freely.
-    </div>""", unsafe_allow_html=True)
+    </div>"""), unsafe_allow_html=True)
 
     st.markdown('<div class="btn-primary">', unsafe_allow_html=True)
     run = st.button("Run scan")
@@ -187,18 +192,20 @@ def render():
 def _render_results_table(results):
     buys    = [r for r in results if signal_label(r["score"]) in ("BUY", "STRONG BUY")]
     watches = [r for r in results if signal_label(r["score"]) == "WATCH"]
-    top     = max(results, key=lambda x: x["score"])
+    top     = max(results, key=lambda x: x["score"]) if results else None
 
     # DCF summary
     undervalued = [r for r in results if (r.get("dcf") or {}).get("margin_of_safety", -999) >= 20]
 
-    st.markdown(f"""<div class="metric-row">
+    top_ticker = _html_mod.escape(str(top["ticker"])) if top else "—"
+    top_score  = f"{top['score']:.0f}" if top else "—"
+    st.markdown(_html(f"""<div class="metric-row">
       <div class="metric-card"><div class="metric-num">{len(results)}</div><div class="metric-lbl">Stocks above threshold</div></div>
       <div class="metric-card"><div class="metric-num">{len(buys)}</div><div class="metric-lbl">Buy signals</div></div>
       <div class="metric-card"><div class="metric-num">{len(watches)}</div><div class="metric-lbl">Watch signals</div></div>
-      <div class="metric-card"><div class="metric-num">{top['score']:.0f}</div><div class="metric-lbl">Top score ({top['ticker']})</div></div>
+      <div class="metric-card"><div class="metric-num">{top_score}</div><div class="metric-lbl">Top score ({top_ticker})</div></div>
       <div class="metric-card"><div class="metric-num">{len(undervalued)}</div><div class="metric-lbl">DCF Undervalued</div></div>
-    </div>""", unsafe_allow_html=True)
+    </div>"""), unsafe_allow_html=True)
 
     df = _results_to_df(results)
     html_rows = ""
@@ -218,19 +225,22 @@ def _render_results_table(results):
         else:
             dcf_cell = "<td style='color:#94a3b8;font-size:11px;'>N/A</td>"
 
+        t_ticker   = _html_mod.escape(str(row["Ticker"]))
+        t_macd     = _html_mod.escape(str(row["MACD"])) if row["MACD"] else "N/A"
+        t_ma_trend = _html_mod.escape(str(row["MA Trend"])) if row["MA Trend"] else "N/A"
         html_rows += f"""<tr>
-          <td><strong>{row['Ticker']}</strong></td>
+          <td><strong>{t_ticker}</strong></td>
           <td>{score_cell(row['Score'])}</td>
           <td>{badge(row['Signal'])}</td>
           <td>{pr}</td>
           {fc}<td>{rsi}</td>
-          <td>{row['MACD'] or 'N/A'}</td>
-          <td>{row['MA Trend'] or 'N/A'}</td>
+          <td>{t_macd}</td>
+          <td>{t_ma_trend}</td>
           <td>{si}</td>
           {dcf_cell}
         </tr>"""
 
-    st.markdown(f"""<table>
+    st.markdown(_html(f"""<table>
       <thead><tr>
         <th>Ticker</th><th>{tooltip('Score')}</th><th>Signal</th><th>Price</th>
         <th style="color:#94a3b8;">{tooltip('FC%')} *</th>
@@ -239,5 +249,5 @@ def _render_results_table(results):
         <th>{tooltip('DCF / MoS')}</th>
       </tr></thead>
       <tbody>{html_rows}</tbody>
-    </table>""", unsafe_allow_html=True)
+    </table>"""), unsafe_allow_html=True)
     st.caption("* FC% = indicative forecast only · MoS = Margin of Safety vs intrinsic value")

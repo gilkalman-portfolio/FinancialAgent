@@ -300,7 +300,11 @@ def run_scan():
 
     for source, tickers in tickers_map.items():
         for ticker in tickers:
-            r = score_stock(ticker, forecast_days=fc_days)
+            try:
+                r = score_stock(ticker, forecast_days=fc_days)
+            except Exception as e:
+                logger.warning(f"run_scan: {ticker} scoring failed — skipping: {e}")
+                continue
             if r and r["score"] >= min_score:
                 r["source"] = source
                 all_results.append(r)
@@ -383,10 +387,15 @@ def run_scan():
         )
 
     # ── Auto-add high-score stocks to watchlist ───────────────────────────────
-    if cfg.get("auto_watchlist", True):
+    _aw_cfg = cfg.get("auto_watchlist", True)
+    # Normalize: bool True, string "true", or non-empty dict all enable auto-watchlist
+    _aw_enabled = (_aw_cfg is True or _aw_cfg == "true" or
+                   (isinstance(_aw_cfg, dict) and _aw_cfg))
+    if _aw_enabled:
         existing = {w["ticker"] for w in watchlist_get_all()}
         # Ensure we don't exceed max total items (usually 30)
-        max_total = cfg.get("auto_watchlist", {}).get("watchlist_policy", {}).get("max_items_total", 30)
+        _aw_policy = _aw_cfg.get("watchlist_policy", {}) if isinstance(_aw_cfg, dict) else {}
+        max_total = _aw_policy.get("max_items_total", 30)
         
         auto_added = []
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -415,7 +424,7 @@ def run_scan():
                 )
                 existing.add(r["ticker"])
                 # Suppress immediate re-alert — the auto-add itself is the notification
-                for atype in ("score_threshold", "price_change"):
+                for atype in ("score_threshold", "price_change", "score_delta_rise"):
                     watchlist_save_alert(
                         r["ticker"], atype,
                         f"suppressed — auto-added at score {r['score']:.0f}",
@@ -431,9 +440,12 @@ def run_scan():
                 + ", ".join(auto_added)
             )
 
-    jumped = check_alerts(all_results)
-    if jumped:
-        logger.info(f"Score alerts: {len(jumped)}")
+    try:
+        jumped = check_alerts(all_results)
+        if jumped:
+            logger.info(f"Score alerts: {len(jumped)}")
+    except Exception as e:
+        logger.warning(f"run_scan: check_alerts failed: {e}")
 
     try:
         from src.backtester import run_backtest
@@ -518,6 +530,17 @@ def run_weekly_rotation():
             )
             return
 
+        # Write cooldown rows BEFORE removing, so they persist even if remove fails
+        watchlist_save_alert(
+            weakest_ticker, "auto_exit_score",
+            f"Weekly rotation: replaced (3d avg score {weakest_score:.0f})",
+            score=weakest_score,
+        )
+        watchlist_save_alert(
+            weakest_ticker, "auto_exit_cooldown",
+            f"Cooldown {AUTO_EXIT_COOLDOWN_DAYS}d after weekly rotation exit",
+            score=weakest_score,
+        )
         watchlist_remove(weakest_ticker)
         today_str = datetime.now().strftime("%Y-%m-%d")
         watchlist_add(
@@ -551,13 +574,16 @@ def run_watchlist_scan():
         cfg = load_config()
         telegram_on = cfg.get("telegram", True)
         auto_exited = []
-        
+
+        # Build watchlist lookup once — avoids N×watchlist_get_all() queries in the loop
+        watchlist_map_scan = {w["ticker"]: w for w in watchlist_get_all()}
+
         # Hysteresis exit — see src/hysteresis.py. Was 50 (symmetric with old entry).
         EXIT_SCORE_THRESHOLD = AUTO_WL_SCORE_EXIT  # 40
 
         for r in results:
             if r.get("score", 100) < EXIT_SCORE_THRESHOLD:
-                item = next((w for w in watchlist_get_all() if w["ticker"] == r["ticker"]), None)
+                item = watchlist_map_scan.get(r["ticker"])
                 if item and _is_auto_ticker(item.get("notes", "")) and _min_hold_satisfied(item.get("added_at", "")):
                     if _alert_sent_recently(r["ticker"], "auto_exit_score", hours=12):
                         continue  # already exited in this morning's run_scan
@@ -847,23 +873,14 @@ def run_watchlist_cleanup():
             if len(scores) >= 3 and all(s < 50 for s in scores):
                 try:
                     last_score = float(scores[0]) if scores else 0.0
-                    with get_connection() as conn:
-                        conn.execute(
-                            "INSERT INTO watchlist_alerts (ticker, alert_type, message, sent_at, score, price) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (
-                                ticker.upper(),
-                                "auto_exit_cooldown",
-                                f"Cleanup auto-exit after 3x score<50 (scores={scores})",
-                                datetime.now().isoformat(),
-                                last_score,
-                                None,
-                            ),
-                        )
-                        conn.execute(
-                            "DELETE FROM watchlist WHERE ticker = ?",
-                            (ticker.upper(),),
-                        )
+                    # Write cooldown BEFORE removing (retry_on_busy wrapped)
+                    watchlist_save_alert(
+                        ticker, "auto_exit_cooldown",
+                        f"Cleanup auto-exit after 3x score<50 (scores={scores})",
+                        score=last_score, price=None,
+                    )
+                    from src.database import watchlist_remove as _wl_remove
+                    _wl_remove(ticker)
                     removed.append(ticker)
                     logger.info(f"Watchlist cleanup: removed {ticker} (scores {scores})")
                 except Exception as e:
@@ -1015,7 +1032,7 @@ def _price_monitor_thread(interval_minutes: int):
     _log(f"Price alert monitor started — checking every {interval_minutes} min")
     while True:
         try:
-            _log("Price alert monitor: running check...")
+            _t0 = time.time()
             check_price_targets()
             check_volume_spikes()
             check_supertrend_flips()
@@ -1024,7 +1041,10 @@ def _price_monitor_thread(interval_minutes: int):
             check_supertrend_triple_alignment()
             check_expired_alert_trades()
             check_price_surge()
-            _log("Price alert monitor: check complete")
+            _elapsed = round(time.time() - _t0, 1)
+            _log(f"Price alert monitor: check complete ({_elapsed}s)")
+            if _elapsed > interval_minutes * 60 * 0.8:
+                _log(f"Price monitor WARNING: cycle took {_elapsed}s — exceeds 80% of {interval_minutes}min interval")
         except Exception as e:
             _log(f"Price monitor error: {e}")
 

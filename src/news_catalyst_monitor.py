@@ -142,6 +142,13 @@ def _impact_on_ticker(ticker: str, analysis: Dict, tracker_info: Dict) -> Option
     }
 
 
+def _escape_md(text: str) -> str:
+    """Escape Telegram Markdown v1 special chars to prevent parse errors."""
+    for ch in ("*", "_", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _build_telegram_message(
     ticker: str,
     tracker_info: Dict,
@@ -163,11 +170,14 @@ def _build_telegram_message(
                  "macro": "מאקרו", "sector": "סקטור"}
     layer_he = layer_map.get(impact.get("layer", ""), impact.get("layer", ""))
 
+    safe_headline = _escape_md(headline[:150])
+    safe_summary  = _escape_md(summary)
+
     lines = [
         f"{impact_emoji} *התראת חדשות — {ticker}*",
         f"{source_badge} | קשר: {layer_he}",
         "",
-        f"📰 _{headline[:150]}_",
+        f"📰 _{safe_headline}_",
         f"🔗 {article_url}" if article_url else "",
         f"📡 {source}" if source else "",
         "",
@@ -175,7 +185,7 @@ def _build_telegram_message(
 
     # Summary
     if summary:
-        lines += [f"📋 *סיכום:*", summary, ""]
+        lines += [f"📋 *סיכום:*", safe_summary, ""]
 
     # Direct impact on this ticker
     if impact.get("reason"):
@@ -291,7 +301,17 @@ def run_catalyst_check(
             logger.info(f"[CatalystMonitor] Running LLM for {ticker}: '{headline[:60]}'")
             llm_calls += 1
 
-            analysis = run_full_analysis(headline)
+            try:
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _Timeout
+                with ThreadPoolExecutor(max_workers=1) as _ex:
+                    _fut = _ex.submit(run_full_analysis, headline)
+                    analysis = _fut.result(timeout=45)
+            except _Timeout:
+                logger.warning(f"[CatalystMonitor] LLM timeout (45s) for {ticker} — skipping")
+                continue
+            except Exception as _e:
+                logger.warning(f"[CatalystMonitor] LLM error for {ticker}: {_e}")
+                continue
             if not analysis or analysis.get("error"):
                 logger.warning(f"[CatalystMonitor] LLM failed for {ticker}: {analysis.get('error') if analysis else 'None'}")
                 continue

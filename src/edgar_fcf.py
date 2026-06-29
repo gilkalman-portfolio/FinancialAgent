@@ -12,6 +12,7 @@ Falls back gracefully to None so callers can use yfinance as backup.
 """
 
 import os
+import threading
 import time
 import statistics
 import requests
@@ -34,14 +35,20 @@ _CIK_TTL = timedelta(days=1)
 _FACTS_CACHE: dict = {}   # ticker -> (loaded_at: datetime, facts: dict)
 _FACTS_TTL = timedelta(hours=24)
 
+# Single lock protecting both _FACTS_CACHE and _TICKER_CIK/_CIK_LOADED_AT.
+# Scanner runs ~946 tickers across multiple threads; without a lock, concurrent
+# threads can both pass the TTL check and issue duplicate SEC requests.
+_CACHE_LOCK = threading.Lock()
+
 
 def _fetch_facts(ticker: str) -> Optional[dict]:
     """Fetch and cache full EDGAR facts dict for a ticker (one HTTP request per ticker per day)."""
     now = datetime.now()
-    if ticker in _FACTS_CACHE:
-        cached_at, facts = _FACTS_CACHE[ticker]
-        if now - cached_at < _FACTS_TTL:
-            return facts
+    with _CACHE_LOCK:
+        if ticker in _FACTS_CACHE:
+            cached_at, facts = _FACTS_CACHE[ticker]
+            if now - cached_at < _FACTS_TTL:
+                return facts
     cik = _get_cik(ticker)
     if not cik:
         return None
@@ -51,7 +58,8 @@ def _fetch_facts(ticker: str) -> Optional[dict]:
         r = requests.get(url, headers=_HEADERS, timeout=20)
         r.raise_for_status()
         facts = r.json().get("facts", {})
-        _FACTS_CACHE[ticker] = (now, facts)
+        with _CACHE_LOCK:
+            _FACTS_CACHE[ticker] = (now, facts)
         return facts
     except Exception as exc:
         logger.debug(f"[EDGAR] {ticker}: {exc}")
@@ -65,8 +73,9 @@ _CAPEX_TAG = "PaymentsToAcquirePropertyPlantAndEquipment"
 def _load_cik_map() -> dict:
     global _TICKER_CIK, _CIK_LOADED_AT
     now = datetime.now()
-    if _CIK_LOADED_AT and (now - _CIK_LOADED_AT) < _CIK_TTL:
-        return _TICKER_CIK
+    with _CACHE_LOCK:
+        if _CIK_LOADED_AT and (now - _CIK_LOADED_AT) < _CIK_TTL:
+            return _TICKER_CIK
     try:
         r = requests.get(
             "https://www.sec.gov/files/company_tickers.json",
@@ -74,15 +83,18 @@ def _load_cik_map() -> dict:
         )
         r.raise_for_status()
         data = r.json()
-        _TICKER_CIK = {
+        new_map = {
             v["ticker"].upper(): str(v["cik_str"]).zfill(10)
             for v in data.values()
         }
-        _CIK_LOADED_AT = now
+        with _CACHE_LOCK:
+            _TICKER_CIK = new_map
+            _CIK_LOADED_AT = now
         logger.debug(f"[EDGAR FCF] CIK map: {len(_TICKER_CIK)} tickers loaded")
     except Exception as exc:
         logger.warning(f"[EDGAR FCF] CIK map fetch failed: {exc}")
-    return _TICKER_CIK
+    with _CACHE_LOCK:
+        return _TICKER_CIK
 
 
 def _get_cik(ticker: str) -> Optional[str]:
@@ -202,7 +214,8 @@ def get_interest_coverage(ticker: str) -> Optional[float]:
     interest = interest_vals[0]
 
     if interest == 0:
-        return None
+        # No debt — interest coverage is effectively infinite; return max capped value
+        return 100.0
 
     icr = abs(ebit) / abs(interest)
     return min(max(icr, 0.0), 100.0)

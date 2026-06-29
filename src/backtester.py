@@ -103,18 +103,26 @@ def run_backtest(days_ahead: int = 7) -> Dict:
     correct = 0
 
     for row in candidates:
-        ticker     = row["ticker"]
-        score      = row["score"]
-        price_sig  = row["price_signal"]
-        scan_date  = datetime.fromisoformat(row["scan_date"])
+        ticker      = row["ticker"]
+        score       = row["score"]
+        price_sig_db = row["price_signal"]
+        scan_date   = datetime.fromisoformat(row["scan_date"])
         target_date = scan_date + timedelta(days=days_ahead)
 
         if target_date > datetime.now():
             continue  # עדיין לא עבר מספיק זמן
 
         price_after = _get_price_at_date(ticker, target_date)
-        if not price_sig or not price_after:
+        if not price_sig_db or not price_after:
             continue
+
+        # Fetch signal-date price from yfinance on the same auto_adjust basis as price_after.
+        # scan_results.price is the actual market price saved at scan time; after a corporate
+        # action (reverse split, spinoff) yfinance retroactively adjusts historical prices, so
+        # comparing the DB price to the post-action price produces a spurious return.
+        # If yfinance returns an adjusted signal price, use it; fall back to DB price otherwise.
+        price_sig_adj = _get_price_at_date(ticker, scan_date)
+        price_sig = price_sig_adj if price_sig_adj else price_sig_db
 
         pct = ((price_after - price_sig) / price_sig) * 100
         signal = _signal_label(score)
@@ -150,6 +158,17 @@ def run_backtest(days_ahead: int = 7) -> Dict:
                          days_ahead,signal_date,checked_at,correct)
                         VALUES (?,?,?,?,?,?,?,?,?,?)
                     """, tuple(r.values()))
+                else:
+                    # Re-check rows whose price_at_signal may have been saved before a corporate
+                    # action (split/spinoff). Re-run with the current adjusted prices so the
+                    # stored pct_change stays consistent with the adjusted-basis calculation.
+                    conn.execute("""
+                        UPDATE backtest_results
+                        SET price_at_signal=?, price_after=?, pct_change=?, checked_at=?, correct=?
+                        WHERE ticker=? AND signal_date=? AND days_ahead=?
+                    """, (r["price_at_signal"], r["price_after"], r["pct_change"],
+                          r["checked_at"], r["correct"],
+                          r["ticker"], r["signal_date"], r["days_ahead"]))
 
     accuracy = (correct / len(results) * 100) if results else 0
     avg_return = (sum(r["pct_change"] for r in results) / len(results)) if results else 0

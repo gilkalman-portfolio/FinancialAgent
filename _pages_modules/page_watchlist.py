@@ -1,4 +1,5 @@
 """Page: Watchlist & Portfolio"""
+import html as _html_mod
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -220,9 +221,11 @@ def _render_watch_card_v2(item, r, news):
 
         news_html = ""
         for a in news[:1]:
-            h = a.get("headline","")[:70].replace("<","&lt;")
-            u = a.get("url","")
-            news_html = f'<div style="font-size:11px;margin-top:6px;"><a href="{u}" target="_blank" style="color:#1d4ed8;text-decoration:none;">{h}</a></div>'
+            h = _html_mod.escape(str(a.get("headline", ""))[:70])
+            u = a.get("url", "")
+            if not u.startswith(("http://", "https://")):
+                u = "#"
+            news_html = f'<div style="font-size:11px;margin-top:6px;"><a href="{_html_mod.escape(u)}" target="_blank" style="color:#1d4ed8;text-decoration:none;">{h}</a></div>'
 
         st.markdown(_html(f"""
             <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;
@@ -269,7 +272,7 @@ def _render_watch_card_v2(item, r, news):
               </div>
               <div style="font-size:20px;font-weight:700;color:#1e293b;margin:6px 0 2px;">{price_str}</div>
               {target_html}
-              {f'<div style="font-size:10px;color:#94a3b8;margin-top:4px;">{item["notes"]}</div>' if item.get("notes") else ''}
+              {f'<div style="font-size:10px;color:#94a3b8;margin-top:4px;">{_html_mod.escape(str(item["notes"]))}</div>' if item.get("notes") else ''}
             </div>
         """), unsafe_allow_html=True)
 
@@ -603,7 +606,7 @@ def _render_portfolio_card(item, r):
         score_color  = "#16a34a" if score >= 60 else "#d97706" if score >= 45 else "#dc2626"
         badge_html   = badge(signal_label(score))
         pnl_val_html = f" (${pnl_val:+,.0f})" if pnl_val else ""
-        notes_html   = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>{item['notes']}</div>" if item.get("notes") else ""
+        notes_html   = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>{_html_mod.escape(str(item['notes']))}</div>" if item.get("notes") else ""
 
         bar_html = ""
         if stop_loss and target_price and target_price > stop_loss:
@@ -667,7 +670,7 @@ def _render_portfolio_card(item, r):
                 f"</div></div>"
             )
 
-        notes_html = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>{item['notes']}</div>" if item.get("notes") else ""
+        notes_html = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>{_html_mod.escape(str(item['notes']))}</div>" if item.get("notes") else ""
 
         html = _html(f"""
             <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 16px;margin-bottom:4px;">
@@ -742,16 +745,17 @@ def _render_alerts():
 
     for a in alerts:
         color  = type_colors.get(a["alert_type"], "#6b7280")
-        label  = type_labels.get(a["alert_type"], a["alert_type"])
+        label  = _html_mod.escape(type_labels.get(a["alert_type"], a["alert_type"]))
         ts     = a["sent_at"][:16].replace("T", " ")
         lines  = a["message"].split("\n")
-        detail = lines[1] if len(lines) > 1 else lines[0]
+        detail = _html_mod.escape(lines[1] if len(lines) > 1 else lines[0])
+        t_ticker = _html_mod.escape(str(a["ticker"]))
         st.markdown(_html(f"""
             <div style="border-left:4px solid {color};padding:8px 14px;margin-bottom:6px;
                         background:#f8fafc;border-radius:0 8px 8px 0;">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
                 <div style="display:flex;gap:8px;align-items:center;">
-                  <span style="font-weight:700;font-size:14px;">{a['ticker']}</span>
+                  <span style="font-weight:700;font-size:14px;">{t_ticker}</span>
                   <span style="font-size:11px;background:{color};color:white;padding:1px 8px;border-radius:4px;">{label}</span>
                 </div>
                 <span style="font-size:11px;color:#94a3b8;">{ts}</span>

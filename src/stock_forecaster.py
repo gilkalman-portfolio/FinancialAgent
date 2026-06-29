@@ -197,6 +197,9 @@ class StockForecaster:
             X = np.array([scaled[i:i + window] for i in range(len(scaled) - window)])
             y = scaled[window:]
 
+            # early_stopping uses a randomly shuffled validation split (not time-ordered).
+            # This is not strict label leakage but is suboptimal for time series.
+            # Intentionally left unchanged — fixing would require a manual time-split loop.
             model = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
                                  random_state=42, early_stopping=True,
                                  validation_fraction=0.1, n_iter_no_change=20)

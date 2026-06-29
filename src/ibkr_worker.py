@@ -70,13 +70,26 @@ def _send_telegram(message: str) -> None:
 def _update_order_log(ibkr_order_id: int, status: str,
                       fill_price: float | None = None,
                       notes: str | None = None) -> None:
-    """Update order_log row when IBKR reports a status change."""
+    """Update order_log row when IBKR reports a status change.
+
+    WHERE clause is status-dependent to handle the bracket-order race condition:
+    TWS sometimes fires Cancelled for the parent order (on reconnect/reconcile)
+    before (or concurrently with) the Filled callback, causing CANCELLED to block
+    the subsequent FILLED update. Fix:
+      - FILLED overrides CANCELLED (fill always wins)
+      - CANCELLED only transitions from SUBMITTED (never overwrites FILLED)
+    """
     now = datetime.now().isoformat()
+    if status == "FILLED":
+        where_clause = "WHERE ibkr_order_id = ? AND status NOT IN ('FILLED', 'ERROR')"
+    elif status == "CANCELLED":
+        where_clause = "WHERE ibkr_order_id = ? AND status = 'SUBMITTED'"
+    else:
+        where_clause = "WHERE ibkr_order_id = ? AND status NOT IN ('FILLED', 'CANCELLED', 'ERROR')"
     with get_connection() as conn:
         conn.execute(
-            "UPDATE order_log SET status = ?, fill_price = COALESCE(?, fill_price), "
-            "updated_at = ?, notes = COALESCE(?, notes) "
-            "WHERE ibkr_order_id = ? AND status NOT IN ('FILLED', 'CANCELLED', 'ERROR')",
+            f"UPDATE order_log SET status = ?, fill_price = COALESCE(?, fill_price), "
+            f"updated_at = ?, notes = COALESCE(?, notes) {where_clause}",
             (status, fill_price, now, notes, ibkr_order_id),
         )
 
@@ -376,11 +389,71 @@ def _submit_order(conn: IBKRConnection, alert, tracker: PositionTracker | None =
     return mgr.submit(alert)
 
 
+_MUTEX_NAME = "Global\\FinancialAgent_IBKRWorker_Singleton"
+_mutex_handle = None   # kept alive to maintain mutex ownership
+
+
+def _acquire_singleton_lock() -> bool:
+    """Create a named Windows mutex. Returns False if another instance already owns it.
+
+    Named mutexes are released by the OS when the owning process exits (even on crash),
+    so no cleanup is needed after a hard kill. This is truly atomic — no race window.
+    """
+    global _mutex_handle
+    import ctypes, os
+
+    ERROR_ALREADY_EXISTS = 183
+    # CREATE_MUTEX_INITIAL_OWNER = bInitialOwner=True claims ownership on creation
+    handle = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+    if not handle:
+        logger.warning("[worker] CreateMutex failed — OS error, proceeding without singleton guard")
+        return True
+    last_err = ctypes.windll.kernel32.GetLastError()
+    if last_err == ERROR_ALREADY_EXISTS:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        logger.warning(
+            "[worker] another ibkr_worker is already running (named mutex exists). Exiting."
+        )
+        return False
+    # We own the mutex — keep the handle open for the lifetime of this process
+    _mutex_handle = handle
+    # Also write PID to a file for human inspection (best-effort, not relied upon for locking)
+    try:
+        lock_path = __import__("pathlib").Path(__file__).parent.parent / "ibkr_worker_running.lock"
+        lock_path.write_text(str(os.getpid()))
+    except Exception:
+        pass
+    return True
+
+
+def _release_singleton_lock() -> None:
+    global _mutex_handle
+    if _mutex_handle:
+        import ctypes
+        ctypes.windll.kernel32.ReleaseMutex(_mutex_handle)
+        ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        _mutex_handle = None
+    try:
+        lock_path = __import__("pathlib").Path(__file__).parent.parent / "ibkr_worker_running.lock"
+        lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    if not _acquire_singleton_lock():
+        return 1
+    try:
+        return _main_body()
+    finally:
+        _release_singleton_lock()
+
+
+def _main_body() -> int:
     init_db()
     logger.info(f"[worker] starting — port={PORT} clientId={CLIENT_ID} interval={POLL_INTERVAL_SECS}s")
 
@@ -455,4 +528,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     import sys
+    import multiprocessing
+    multiprocessing.freeze_support()   # prevents spawn-mode double-execution on Windows
     sys.exit(main())

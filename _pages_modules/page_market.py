@@ -1,4 +1,5 @@
 """Page: Market"""
+import html as _html_mod
 import streamlit as st
 import time as _time
 from datetime import datetime
@@ -246,16 +247,19 @@ def render():
             else:                                                        lc = "#94a3b8"
             tickers_html = "".join(
                 f"<span style='background:#1e3a8a;color:#93c5fd;padding:1px 6px;"
-                f"border-radius:3px;font-size:10px;margin-right:3px;'>{t}</span>"
+                f"border-radius:3px;font-size:10px;margin-right:3px;'>{_html_mod.escape(str(t))}</span>"
                 for t in a["tickers"][:3]
             )
-            h = a['headline'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
-            s = a['source'].replace('&','&amp;')
+            h = _html_mod.escape(str(a.get("headline", "")))
+            s = _html_mod.escape(str(a.get("source", "")))
+            _url = a.get("url", "") or ""
+            if not _url.startswith(("http://", "https://")):
+                _url = "#"
             return _html(f"""
                 <div style="border-left:4px solid {lc};padding:9px 14px;margin-bottom:7px;
                             background:#ffffff;border-radius:0 8px 8px 0;border:1px solid #e2e8f0;border-left:4px solid {lc};">
                   <div style="display:flex;justify-content:space-between;gap:8px;">
-                    <a href="{a['url']}" target="_blank"
+                    <a href="{_html_mod.escape(_url)}" target="_blank"
                        style="font-size:13px;font-weight:600;color:#1e293b;text-decoration:none;flex:1;">{h}</a>
                     <span style="color:{lc};font-weight:700;font-size:12px;white-space:nowrap;">
                       {sent.replace('Somewhat-','~')}
@@ -303,11 +307,13 @@ def render():
         if earnings:
             rows_html = ""
             for e in earnings[:15]:
-                eps = f"EPS est. {e['estimate']}" if e['estimate'] else ""
+                eps = f"EPS est. {_html_mod.escape(str(e['estimate']))}" if e['estimate'] else ""
+                t_symbol = _html_mod.escape(str(e.get("symbol", "")))
+                t_name   = _html_mod.escape(str(e.get("name", ""))[:20])
                 rows_html += _html(f"""
                     <tr>
-                      <td style="font-weight:700;font-size:13px;padding:7px 8px;">{e['symbol']}</td>
-                      <td style="font-size:12px;color:#374151;padding:7px 8px;">{e['name'][:20]}</td>
+                      <td style="font-weight:700;font-size:13px;padding:7px 8px;">{t_symbol}</td>
+                      <td style="font-size:12px;color:#374151;padding:7px 8px;">{t_name}</td>
                       <td style="font-size:11px;color:#1d4ed8;font-weight:600;padding:7px 8px;">{e['date']}</td>
                       <td style="font-size:11px;color:#6b7280;padding:7px 8px;">{e['time']}</td>
                       <td style="font-size:11px;color:#6b7280;padding:7px 8px;">{e['mcap']}</td>
@@ -334,15 +340,17 @@ def render():
         if macro:
             rows_html = ""
             for m in macro:
+                t_name   = _html_mod.escape(str(m.get("name", "")))
+                t_impact = _html_mod.escape(str(m.get("impact", "")).upper())
                 rows_html += _html(f"""
                     <div style="display:flex;justify-content:space-between;padding:7px 10px;
                                 border-left:3px solid {m['color']};margin-bottom:5px;
                                 background:#fafafa;border-radius:0 6px 6px 0;">
                       <div>
-                        <span style="font-weight:600;font-size:13px;color:#1e293b;">{m['name']}</span>
+                        <span style="font-weight:600;font-size:13px;color:#1e293b;">{t_name}</span>
                         <span style="font-size:10px;background:{m['color']};color:white;
                                      padding:1px 6px;border-radius:3px;margin-left:6px;">
-                          {m['impact'].upper()}
+                          {t_impact}
                         </span>
                       </div>
                       <div style="text-align:right;font-size:11px;color:#6b7280;">

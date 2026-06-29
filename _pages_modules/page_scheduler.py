@@ -1,4 +1,5 @@
 """Page: Scheduler"""
+import html as _html_mod
 import streamlit as st
 import json
 import subprocess
@@ -284,7 +285,7 @@ def render():
                     send_market_digest()
                     st.success("Market digest sent!")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Error: {_html_mod.escape(str(e))}")
     with mc2:
         if st.button("💼 Send portfolio news now"):
             with st.spinner("Sending..."):
@@ -293,7 +294,7 @@ def render():
                     send_portfolio_news()
                     st.success("Portfolio news sent!")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Error: {_html_mod.escape(str(e))}")
     with mc3:
         if st.button("🔥 Run squeeze scan now"):
             with st.spinner("Scanning... this may take a few minutes"):
@@ -302,7 +303,7 @@ def render():
                     run_squeeze_scan()
                     st.success("Squeeze scan complete — check Telegram!")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Error: {_html_mod.escape(str(e))}")
     with mc4:
         if st.button("📡 Run catalyst check now"):
             with st.spinner("Checking news catalysts..."):
@@ -317,7 +318,7 @@ def render():
                     )
                     st.success(f"Done — {alerts} alert(s) sent to Telegram")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Error: {_html_mod.escape(str(e))}")
 
     # ── Process controls ───────────────────────────────────────────────────────
     st.markdown("---")

@@ -7,6 +7,7 @@ Returns score 0-5 and sentiment label for use in stock_scorer.py bonus.
 """
 
 import json
+import threading
 import time
 from typing import Dict
 from loguru import logger
@@ -14,17 +15,20 @@ from loguru import logger
 # ── In-memory cache: ticker → (result_dict, timestamp) ──────────────────────
 _CACHE: Dict[str, tuple] = {}
 _CACHE_TTL = 6 * 3600   # 6 hours
+_CACHE_LOCK = threading.Lock()
 
 
 def _cached(ticker: str):
-    entry = _CACHE.get(ticker)
+    with _CACHE_LOCK:
+        entry = _CACHE.get(ticker)
     if entry and (time.time() - entry[1]) < _CACHE_TTL:
         return entry[0]
     return None
 
 
 def _store(ticker: str, result: dict):
-    _CACHE[ticker] = (result, time.time())
+    with _CACHE_LOCK:
+        _CACHE[ticker] = (result, time.time())
 
 
 # ── Tier 1: EPS surprise scoring ────────────────────────────────────────────
@@ -61,6 +65,38 @@ def _score_eps_surprises(surprises: list) -> tuple:
         detail = f"{misses}/{n} misses — consistent disappointment"
 
     return score, sentiment, detail
+
+
+# ── EDGAR EPS YoY fallback ──────────────────────────────────────────────────
+
+def _edgar_eps_fallback(ticker: str) -> dict:
+    """
+    EDGAR EPS YoY growth proxy — used when Finnhub returns no data.
+    Computes average YoY EPS% change over last 4 quarters.
+    Maps to score 0-5 as rough earnings quality proxy.
+    NOT equivalent to EPS surprise — no analyst estimate available.
+    """
+    try:
+        from src.edgar_fcf import get_eps_yoy_growth
+        yoy = get_eps_yoy_growth(ticker)
+        if yoy is None:
+            return {"score": 0, "sentiment": "neutral", "source": "none", "detail": "no data"}
+
+        if   yoy >= 0.30: score, sentiment = 5, "bullish"
+        elif yoy >= 0.15: score, sentiment = 4, "bullish"
+        elif yoy >= 0.05: score, sentiment = 3, "neutral"
+        elif yoy >= -0.05: score, sentiment = 2, "neutral"
+        elif yoy >= -0.15: score, sentiment = 1, "bearish"
+        else:              score, sentiment = 0, "bearish"
+
+        return {
+            "score":     score,
+            "sentiment": sentiment,
+            "source":    "edgar_eps_yoy",
+            "detail":    f"EPS YoY avg: {yoy*100:+.1f}% (4Q)",
+        }
+    except Exception:
+        return {"score": 0, "sentiment": "neutral", "source": "none", "detail": "edgar fallback failed"}
 
 
 # ── Tier 2: Transcript LLM analysis ─────────────────────────────────────────
@@ -133,14 +169,30 @@ def get_earnings_sentiment(ticker: str, finnhub_key: str) -> dict:
 
         llm_score = _analyze_transcript(transcript_text)
 
-        # ── Merge ─────────────────────────────────────────────────────────────
+        # ── EDGAR fallback when Finnhub has no EPS data ───────────────────────
+        if not surprises:
+            edgar_result = _edgar_eps_fallback(ticker)
+            # If transcript LLM also produced something, blend it in
+            if llm_score >= 0:
+                blended = round((edgar_result['score'] * 0.5) + (llm_score * 0.5))
+                edgar_result = {
+                    'score':     blended,
+                    'sentiment': ('bullish' if blended >= 4 else 'bearish' if blended <= 1 else 'neutral'),
+                    'source':    'transcript_llm',
+                    'detail':    f"{edgar_result['detail']} | LLM score: {llm_score}/5",
+                }
+            _store(ticker, edgar_result)
+            logger.debug(f"earnings_sentiment {ticker} (EDGAR fallback): {edgar_result}")
+            return edgar_result
+
+        # ── Merge (Finnhub data present) ──────────────────────────────────────
         if llm_score >= 0:
             final_score = round((eps_score * 0.5) + (llm_score * 0.5))
             source      = 'transcript_llm'
             detail      = f"EPS: {eps_detail} | LLM score: {llm_score}/5"
         else:
             final_score = eps_score
-            source      = 'eps_surprise' if surprises else 'none'
+            source      = 'eps_surprise'
             detail      = eps_detail
 
         # Map score to sentiment
@@ -162,5 +214,7 @@ def get_earnings_sentiment(ticker: str, finnhub_key: str) -> dict:
         return result
 
     except Exception as e:
-        logger.debug(f"earnings_sentiment failed for {ticker}: {e}")
-        return fallback
+        logger.debug(f"earnings_sentiment Finnhub failed for {ticker}: {e} — trying EDGAR fallback")
+        edgar_result = _edgar_eps_fallback(ticker)
+        _store(ticker, edgar_result)
+        return edgar_result

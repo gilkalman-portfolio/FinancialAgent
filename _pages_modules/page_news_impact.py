@@ -1,4 +1,5 @@
 """Page: News Impact"""
+import html as _html_mod
 import streamlit as st
 from src.stock_scorer import score_stock, signal_label
 
@@ -130,13 +131,20 @@ def render():
                             age_str = f"{int(hours_ago)}h ago"
                         else:
                             age_str = f"{int(hours_ago/24)}d ago"
-                    origin_badge = f'<span style="font-size:10px;background:#e2e8f0;color:#475569;padding:1px 5px;border-radius:3px;margin-left:4px;">{a.get("origin","")}</span>' if a.get("origin") else ""
+                    _origin = _html_mod.escape(str(a.get("origin", "")))
+                    origin_badge = f'<span style="font-size:10px;background:#e2e8f0;color:#475569;padding:1px 5px;border-radius:3px;margin-left:4px;">{_origin}</span>' if a.get("origin") else ""
+                    _url = a.get("url", "") or ""
+                    if not _url.startswith(("http://", "https://")):
+                        _url = "#"
+                    _headline = _html_mod.escape(str(a.get("headline", "")))
+                    _source   = _html_mod.escape(str(a.get("source", "")))
+                    _published = _html_mod.escape(str(a.get("published", "")))
                     st.markdown(_html(f"""<div style="border-left:4px solid {s_color};padding:10px 14px;margin-bottom:8px;background:#f8fafc;border-radius:0 6px 6px 0;">
                       <div style="display:flex;justify-content:space-between;">
-                        <a href="{a['url']}" target="_blank" style="font-size:14px;font-weight:600;color:#1e293b;text-decoration:none;">{a['headline']}</a>
+                        <a href="{_html_mod.escape(_url)}" target="_blank" style="font-size:14px;font-weight:600;color:#1e293b;text-decoration:none;">{_headline}</a>
                         <span style="color:{s_color};font-weight:700;margin-left:12px;">{s_label}</span>
                       </div>
-                      <div style="font-size:12px;color:#6b7280;margin-top:4px;">{a.get('source','')} · {a.get('published','')} <span style="color:#94a3b8;">{age_str}</span>{origin_badge}</div>
+                      <div style="font-size:12px;color:#6b7280;margin-top:4px;">{_source} · {_published} <span style="color:#94a3b8;">{age_str}</span>{origin_badge}</div>
                     </div>"""), unsafe_allow_html=True)
 
     # ── Tab 3: Upcoming Events ─────────────────────────────────────────────────
@@ -260,7 +268,7 @@ def _render_analysis(analysis: dict):
         from src.macro_signals import MACRO_CORRELATION_MATRIX
         signals_html = "".join(
             f'<span style="background:#b45309;color:white;padding:3px 10px;border-radius:5px;font-size:12px;margin-right:6px;">'
-            f'{MACRO_CORRELATION_MATRIX.get(s.get("signal",""), {}).get("description", s.get("signal",""))}'
+            f'{_html_mod.escape(str(MACRO_CORRELATION_MATRIX.get(s.get("signal",""), {}).get("description", s.get("signal",""))))}'
             f'{"⚡" if s.get("surprise") else ""}</span>'
             for s in macro_signals
         )

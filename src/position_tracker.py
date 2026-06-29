@@ -105,15 +105,20 @@ class PositionTracker:
 
     @retry_on_busy()
     def record_daily_pnl(self) -> bool:
-        """Write one daily_pnl row per calendar day. Returns True if written, False if skipped."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        """Write/update today's P&L row. Uses INSERT OR REPLACE so the last call of the day wins.
 
-        with get_connection() as conn:
-            existing = conn.execute(
-                "SELECT 1 FROM daily_pnl WHERE date = ?", (today,)
-            ).fetchone()
-            if existing:
-                return False
+        Gated to after 09:30 ET — IB paper DailyPnL resets to 0 at midnight ET and
+        doesn't start accumulating until the market opens. Recording before 09:30
+        would persist 0 and the INSERT OR IGNORE would block all subsequent updates.
+        """
+        from datetime import time as _dtime
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.time() < _dtime(9, 30):
+            logger.debug("[position_tracker] record_daily_pnl: before 09:30 ET, skipping")
+            return False
+
+        today = now_et.strftime("%Y-%m-%d")
 
         try:
             summary = self.ibkr.get_account_summary()
@@ -121,18 +126,18 @@ class PositionTracker:
             logger.error(f"[position_tracker] record_daily_pnl failed: {e}")
             return False
 
-        now = datetime.now().isoformat()
+        now_iso = datetime.now().isoformat()
         with get_connection() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO daily_pnl (date, day_pnl, net_liquidation, recorded_at)
+                INSERT OR REPLACE INTO daily_pnl (date, day_pnl, net_liquidation, recorded_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (today, summary["day_pnl"], summary["net_liquidation"], now),
+                (today, summary["day_pnl"], summary["net_liquidation"], now_iso),
             )
 
         logger.info(
-            f"[position_tracker] daily_pnl recorded: date={today} "
+            f"[position_tracker] daily_pnl updated: date={today} "
             f"pnl={summary['day_pnl']:.2f} nlv={summary['net_liquidation']:.2f}"
         )
         return True

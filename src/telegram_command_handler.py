@@ -103,6 +103,11 @@ class TelegramCommandHandler:
             resp = requests.get(
                 f"{self._api_base}/getUpdates", params=params, timeout=15
             )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 30))
+                logger.warning("[cmd_handler] Telegram 429 — backing off %ds", retry_after)
+                time.sleep(retry_after)
+                return
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -120,9 +125,8 @@ class TelegramCommandHandler:
             uid = update["update_id"]
             self._last_update_id = uid
             self._handle_update(update)
-
-        if results:
-            self._persist_offset(self._last_update_id)
+            # Persist after each update so a crash mid-batch doesn't replay already-handled updates
+            self._persist_offset(uid)
 
     # ── Dispatch ─────────────────────────────────────────────────────────
 
@@ -162,8 +166,8 @@ class TelegramCommandHandler:
         try:
             handler(args)
         except Exception as e:
-            logger.error("[cmd_handler] %s failed: %s", cmd, e)
-            self._reply(f"Error processing {cmd}: {e}")
+            logger.error("[cmd_handler] %s failed: %s", cmd, e, exc_info=True)
+            self._reply(f"Error processing {cmd} — check worker logs.")
 
     # ── Commands ─────────────────────────────────────────────────────────
 
@@ -260,10 +264,14 @@ class TelegramCommandHandler:
         self._reply("▶️ Trading RESUMED. Orders will be processed normally.")
 
     def _cmd_cancel(self, args: list[str]) -> None:
+        import re as _re
         if not args:
             self._reply("Usage: /cancel <TICKER>")
             return
         ticker = args[0].upper()
+        if not _re.fullmatch(r"[A-Z]{1,6}", ticker):
+            self._reply(f"Invalid ticker '{ticker}'. Expected 1–6 uppercase letters.")
+            return
 
         try:
             open_orders = self._ibkr.get_open_orders()
@@ -289,6 +297,8 @@ class TelegramCommandHandler:
     # ── Reply helper ─────────────────────────────────────────────────────
 
     def _reply(self, text: str) -> None:
+        if len(text) > 4000:
+            text = text[:3997] + "…"
         try:
             resp = requests.post(
                 f"{self._api_base}/sendMessage",

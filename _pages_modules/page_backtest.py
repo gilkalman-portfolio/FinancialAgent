@@ -1,4 +1,5 @@
 """Page: Backtest"""
+import html as _html_mod
 import math
 import streamlit as st
 import pandas as pd
@@ -230,9 +231,10 @@ def render():
             if top5:
                 rows = ""
                 for r in top5:
-                    color = "#16a34a" if r["pct_change"] > 0 else "#dc2626"
+                    color    = "#16a34a" if r["pct_change"] > 0 else "#dc2626"
                     sig_date = r["signal_date"][:10] if r["signal_date"] else "—"
-                    rows += (f"<tr><td><strong>{r['ticker']}</strong></td><td>{r['score']:.0f}</td>"
+                    t_ticker = _html_mod.escape(str(r["ticker"]))
+                    rows += (f"<tr><td><strong>{t_ticker}</strong></td><td>{r['score']:.0f}</td>"
                              f"<td style='color:{color};font-weight:600;'>{r['pct_change']:+.1f}%</td>"
                              f"<td>{r['days_ahead']}d</td><td style='color:#9ca3af;'>{sig_date}</td></tr>")
                 st.markdown(f"""<table style="width:100%;font-size:13px;border-collapse:collapse;">
@@ -245,7 +247,8 @@ def render():
                 rows = ""
                 for r in worst5:
                     sig_date = r["signal_date"][:10] if r["signal_date"] else "—"
-                    rows += (f"<tr><td><strong>{r['ticker']}</strong></td><td>{r['score']:.0f}</td>"
+                    t_ticker = _html_mod.escape(str(r["ticker"]))
+                    rows += (f"<tr><td><strong>{t_ticker}</strong></td><td>{r['score']:.0f}</td>"
                              f"<td style='color:#dc2626;font-weight:600;'>{r['pct_change']:+.1f}%</td>"
                              f"<td>{r['days_ahead']}d</td><td style='color:#9ca3af;'>{sig_date}</td></tr>")
                 st.markdown(f"""<table style="width:100%;font-size:13px;border-collapse:collapse;">

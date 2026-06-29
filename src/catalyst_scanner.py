@@ -313,6 +313,21 @@ def _scrape_biopharma_catalyst() -> List[Dict]:
         soup = BeautifulSoup(r.text, "html.parser")
         events: List[Dict] = []
 
+        # Detect column order from header row (guards against site restructuring)
+        table = soup.select_one("table")
+        col_ticker, col_catalyst, col_date = 0, 2, 3  # default fallback indices
+        if table:
+            header_cells = [th.get_text(strip=True).lower() for th in table.select("thead th")]
+            if header_cells:
+                for _i, _h in enumerate(header_cells):
+                    if "ticker" in _h or "symbol" in _h:
+                        col_ticker = _i
+                    elif "catalyst" in _h or "type" in _h or "event" in _h:
+                        col_catalyst = _i
+                    elif "date" in _h or "pdufa" in _h:
+                        col_date = _i
+                logger.debug(f"biopharmacatalyst: headers={header_cells} → col_ticker={col_ticker} col_catalyst={col_catalyst} col_date={col_date}")
+
         # Try the main data table — rows have: Ticker | Company | Catalyst | Date | Notes
         rows = (soup.select("table tbody tr")
                 or soup.select("tbody tr")
@@ -322,15 +337,15 @@ def _scrape_biopharma_catalyst() -> List[Dict]:
 
         for row in rows:
             cells = row.find_all("td")
-            if len(cells) < 4:
+            if len(cells) < max(col_ticker, col_catalyst, col_date) + 1:
                 continue
 
-            ticker_raw = cells[0].get_text(strip=True).upper()
+            ticker_raw = cells[col_ticker].get_text(strip=True).upper()
             if not ticker_raw or len(ticker_raw) > 7 or not ticker_raw.replace(".", "").isalpha():
                 continue
 
-            cat_type = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-            date_raw = cells[3].get_text(strip=True) if len(cells) > 3 else ""
+            cat_type = cells[col_catalyst].get_text(strip=True)
+            date_raw = cells[col_date].get_text(strip=True)
 
             ts = None
             date_disp = date_raw
@@ -529,6 +544,8 @@ def fetch_sec_8k_events(tickers: List[str], days: int = 7) -> List[Dict]:
 
     def _fetch_one(ticker: str) -> Optional[Dict]:
         try:
+            import time as _t
+            _t.sleep(0.15)   # ≤10 req/sec SEC policy (4 workers × 0.15s = ~27 req/sec max without sleep)
             r = requests.get(
                 f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
                 f"&dateRange=custom&startdt={start}&enddt={end}&forms=8-K",
@@ -565,7 +582,7 @@ def fetch_sec_8k_events(tickers: List[str], days: int = 7) -> List[Dict]:
         return None
 
     events: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         for ev in pool.map(_fetch_one, tickers):
             if ev:
                 events.append(ev)

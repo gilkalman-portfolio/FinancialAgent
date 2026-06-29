@@ -57,25 +57,28 @@ class TestCalculateDcf:
         assert result_zero is not None
         assert result_zero["growth_rate_used"] < result_normal["growth_rate_used"]
 
-    def test_both_zero_growth_clamps_to_minimum(self):
+    def test_both_zero_growth_stays_at_zero(self):
+        # Floor changed from +3% to -10% to allow mild negative growth — 0% stays 0%.
         result = calculate_dcf(_base_info(revenueGrowth=0.0, earningsGrowth=0.0))
         assert result is not None
-        assert result["growth_rate_used"] == 3.0  # clamped to minimum 3%
+        assert result["growth_rate_used"] == 0.0
 
     def test_none_revenue_growth_falls_back_to_earnings(self):
         result = calculate_dcf(_base_info(revenueGrowth=None, earningsGrowth=0.15))
         assert result is not None
         assert result["growth_rate_used"] == pytest.approx(15.0, abs=0.1)
 
-    def test_both_none_growth_clamps_to_minimum(self):
+    def test_both_none_growth_stays_at_zero(self):
+        # Floor changed to -10% — None growth stays at 0% (no artificial floor up).
         result = calculate_dcf(_base_info(revenueGrowth=None, earningsGrowth=None))
         assert result is not None
-        assert result["growth_rate_used"] == 3.0
+        assert result["growth_rate_used"] == 0.0
 
-    def test_negative_growth_clamps_to_minimum(self):
+    def test_negative_growth_clamps_to_new_floor(self):
+        # avg(-0.20, -0.10) = -0.15, clamped to -10% floor.
         result = calculate_dcf(_base_info(revenueGrowth=-0.20, earningsGrowth=-0.10))
         assert result is not None
-        assert result["growth_rate_used"] == 3.0
+        assert result["growth_rate_used"] == pytest.approx(-10.0, abs=0.1)
 
     def test_no_fcf_returns_none(self):
         info = _base_info(freeCashflow=0, operatingCashflow=0, capitalExpenditures=0)
@@ -84,12 +87,16 @@ class TestCalculateDcf:
     def test_no_shares_returns_none(self):
         assert calculate_dcf(_base_info(sharesOutstanding=0)) is None
 
-    def test_high_de_raises_wacc(self):
-        """LOGIC-03 fix: D/E=150 should meaningfully raise WACC."""
-        result_low_de  = calculate_dcf(_base_info(debtToEquity=0))
-        result_high_de = calculate_dcf(_base_info(debtToEquity=150))
+    def test_high_de_lowers_wacc_raises_net_debt(self):
+        """Proper WACC: debt is cheaper than equity after tax shield → high D/E lowers WACC.
+        The equity-value impact is captured via net_debt_m subtraction."""
+        result_low_de  = calculate_dcf(_base_info(debtToEquity=0,   totalDebt=0))
+        result_high_de = calculate_dcf(_base_info(debtToEquity=150, totalDebt=5_000_000_000))
         assert result_low_de is not None and result_high_de is not None
-        assert result_high_de["wacc_used"] > result_low_de["wacc_used"]
+        # Correct WACC behaviour: debt cheaper than equity → high-leverage lowers WACC
+        assert result_high_de["wacc_used"] <= result_low_de["wacc_used"]
+        # High leverage means far more net debt deducted from enterprise value
+        assert result_high_de["net_debt_m"] > result_low_de["net_debt_m"]
 
     def test_dcf_score_range(self):
         result = calculate_dcf(_base_info())
@@ -183,19 +190,22 @@ class TestScoreFundamentals:
         assert _score_fundamentals({"profitMargins": 0.25}) > 0
 
     def test_low_debt_scores(self):
-        assert _score_fundamentals({"debtToEquity": 0.3}) > 0
+        # yfinance D/E: 30 = 0.30 ratio (divided by 100 internally) → <= 0.5 → +2
+        assert _score_fundamentals({"debtToEquity": 30}) > 0
 
     def test_high_debt_scores_less(self):
-        s_low  = _score_fundamentals({"debtToEquity": 0.3})
-        s_high = _score_fundamentals({"debtToEquity": 5.0})
+        # yfinance D/E: 30 = 0.30 ratio (safe), 500 = 5.0 ratio (risky)
+        s_low  = _score_fundamentals({"debtToEquity": 30})
+        s_high = _score_fundamentals({"debtToEquity": 500})
         assert s_low > s_high
 
     def test_perfect_info_capped_at_weight(self):
-        info = {"trailingPE": 10, "revenueGrowth": 0.5, "profitMargins": 0.3, "debtToEquity": 0.1}
+        # yfinance D/E 10 = 0.10 ratio (safe)
+        info = {"trailingPE": 10, "revenueGrowth": 0.5, "profitMargins": 0.3, "debtToEquity": 10}
         assert _score_fundamentals(info) <= WEIGHTS["fundamentals"]
 
     def test_never_negative(self):
-        info = {"trailingPE": -5, "revenueGrowth": -0.5, "profitMargins": -0.1, "debtToEquity": 10}
+        info = {"trailingPE": -5, "revenueGrowth": -0.5, "profitMargins": -0.1, "debtToEquity": 1000}
         assert _score_fundamentals(info) >= 0
 
 
