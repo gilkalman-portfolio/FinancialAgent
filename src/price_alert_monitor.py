@@ -644,17 +644,41 @@ def check_price_surge():
         try:
             # Find last known price from price_change or any recent alert
             last_price = None
-            # Baseline price sources — intentionally excludes supertrend_triple_bull
-            # and supertrend_1h_flip: those fire at momentum peaks, so using them as
-            # baseline makes a normal retracement look like a large % drop.
+            last_price_age: datetime | None = None
+            # Baseline price sources — intentionally excludes supertrend_triple_bull,
+            # supertrend_1h_flip (fire at momentum peaks → normal retracements look huge),
+            # and score_threshold (written once on watchlist-add, months-stale by design).
             # combined_buy is a real entry signal and a valid baseline reference.
-            _BASELINE_TYPES = {"price_change", "score_threshold", "combined_buy", "price_surge_rescore"}
+            _BASELINE_TYPES = {"price_change", "combined_buy", "price_surge_rescore"}
             for a in watchlist_get_alerts(ticker=ticker, limit=30):
                 if a.get("price") and a["alert_type"] in _BASELINE_TYPES:
                     last_price = float(a["price"])
+                    try:
+                        last_price_age = datetime.fromisoformat(a["sent_at"])
+                    except Exception:
+                        pass
                     break
 
             if not last_price:
+                continue
+
+            # Stale baseline guard: if the last price reference is older than 14 days,
+            # the comparison is meaningless (long-term drift, not a sudden move).
+            # Refresh the baseline silently so future cycles measure from today.
+            _MAX_BASELINE_AGE_DAYS = 14
+            if last_price_age and (datetime.now() - last_price_age).days > _MAX_BASELINE_AGE_DAYS:
+                price = _get_price(ticker)
+                if price and price > 0:
+                    watchlist_save_alert(
+                        ticker, "price_surge_rescore",
+                        f"[baseline refresh] {ticker} @ ${price:.2f}",
+                        score=None, price=price,
+                    )
+                    logger.info(
+                        f"price_surge_rescore: {ticker} baseline too stale "
+                        f"({(datetime.now() - last_price_age).days}d old, was ${last_price:.2f}) "
+                        f"— refreshed to ${price:.2f}, skipping alert this cycle"
+                    )
                 continue
 
             price = _get_price(ticker)
