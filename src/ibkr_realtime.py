@@ -132,6 +132,7 @@ class IBKRConnection:
         parent = LimitOrder(action, shares, entry_price)
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False
+        parent.tif = "DAY"  # explicit TIF avoids IB Error 10349 noise
 
         stop_action = "SELL" if action == "BUY" else "BUY"
 
@@ -139,11 +140,13 @@ class IBKRConnection:
         stop_order.orderId = self.ib.client.getReqId()
         stop_order.parentId = parent.orderId
         stop_order.transmit = False
+        stop_order.tif = "DAY"
 
         target_order = LimitOrder(stop_action, shares, target_price)
         target_order.orderId = self.ib.client.getReqId()
         target_order.parentId = parent.orderId
         target_order.transmit = True  # transmit the whole bracket
+        target_order.tif = "DAY"
 
         placed = []
         try:
