@@ -18,7 +18,14 @@ from contextlib import contextmanager
 from typing import Iterator, Literal
 
 import pandas as pd
-from ib_async import IB, Stock, LimitOrder, StopOrder, util
+
+try:
+    from ib_async import IB, Stock, LimitOrder, StopOrder, util
+except ImportError:
+    # ib_async is only available in .venv313 (Python 3.13).
+    # Stub out just enough for the module to import in Python 3.14 (tests, dashboard).
+    IB = None  # type: ignore[assignment,misc]
+    Stock = LimitOrder = StopOrder = util = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 

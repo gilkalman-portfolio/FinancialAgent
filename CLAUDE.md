@@ -6,7 +6,7 @@ AI-powered stock scanner & financial analysis dashboard.
 - **Stack:** Python 3.14, Streamlit 1.52.2, SQLite, yfinance, Finnhub, Alpha Vantage, SEC EDGAR
 - **LLMs:** Gemini 2.0 Flash (primary) → Groq Llama 3.3 70B (fallback) via `src/llm_client.py`
 - **Run:** `streamlit run dashboard.py` → http://localhost:8501
-- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → 269 passed, 4 pre-existing failures (bars_ago × 3, fill_callback × 1)
+- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **273 passed, 0 failures**
 
 ---
 

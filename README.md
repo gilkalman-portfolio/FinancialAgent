@@ -58,7 +58,7 @@ IBKR_LIVE=              # leave unset for paper mode (port 4002); set to "true" 
 
 ```bash
 streamlit run dashboard.py                     # → http://localhost:8501
-python -m pytest tests/ --ignore=tests/test_new_apis.py   # 269 tests, 0 failures
+python -m pytest tests/ --ignore=tests/test_new_apis.py   # 273 tests, 0 failures
 ```
 
 ---
@@ -289,7 +289,7 @@ FinancialAgent/
 │   ├── llm_client.py               # Gemini → Groq fallback
 │   ├── database.py                 # SQLite CRUD + WAL + retry_on_busy
 │   └── scan_worker.py              # Background scan thread
-├── tests/                          # 269 tests, 0 failures
+├── tests/                          # 273 tests, 0 failures
 ├── logs/
 └── data/
     ├── financial_agent.db
