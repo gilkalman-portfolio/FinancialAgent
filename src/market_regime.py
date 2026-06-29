@@ -15,7 +15,7 @@ Walk-forward calibration should validate these per strategy before live use.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import TypedDict
 
@@ -53,7 +53,7 @@ def get_regime(force_refresh: bool = False) -> RegimeResult:
     Falls back to CAUTION on any data failure — conservative default.
     """
     cache_key = "regime"
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     if not force_refresh and cache_key in _cache:
         age = now - _cache_ts.get(cache_key, datetime.min)
@@ -94,7 +94,7 @@ def _fetch_regime() -> RegimeResult:
         spy_sma200=round(spy_sma200, 2),
         spy_vs_sma200_pct=round(spy_vs_pct, 2),
         multiplier=multiplier,
-        cached_at=datetime.utcnow().isoformat(),
+        cached_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -125,7 +125,7 @@ def _caution_fallback() -> RegimeResult:
         spy_sma200=0.0,
         spy_vs_sma200_pct=0.0,
         multiplier=0.5,
-        cached_at=datetime.utcnow().isoformat(),
+        cached_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
