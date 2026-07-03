@@ -110,6 +110,28 @@ class PositionTracker:
         Gated to after 09:30 ET — IB paper DailyPnL resets to 0 at midnight ET and
         doesn't start accumulating until the market opens. Recording before 09:30
         would persist 0 and the INSERT OR IGNORE would block all subsequent updates.
+
+        Root cause of day_pnl always being 0.0 (audited 2026-07-03): ``DailyPnL`` is
+        NOT reliably populated by ``ib.accountSummary()`` / ``ib.accountValues()`` —
+        those snapshot APIs commonly return the tag as missing or "0" for paper
+        accounts; the value only updates in real time via a dedicated ``ib.reqPnL()``
+        subscription (see ``src/ibkr_realtime.py get_account_summary()``, which reads
+        the tag as part of ``accountSummary()``). Evidence: 32/32 daily_pnl rows had
+        day_pnl==0.0 while net_liquidation moved $100-$2600/day and order_log shows
+        real fills (CALM, YORW, SPSC, EXPE, UBSI, EXC) across the same period.
+
+        Fixable from this module: when the IBKR-reported day_pnl is 0/None/unavailable,
+        fall back to computing it as the delta of today's net_liquidation vs. the most
+        recent prior day's stored net_liquidation. This is an approximation (it
+        includes the effect of any cash deposits/withdrawals, which paper accounts
+        don't have) but is far more informative than a hardcoded 0 and keeps the
+        Layer-0 daily-loss-limit veto from being permanently blind.
+
+        NOT fixable here — flagged for src/ibkr_realtime.py: IBKRConnection should
+        subscribe via ``ib.reqPnL(account)`` (once, at connect time) and expose the
+        live ``PnL.dailyPnL`` value, e.g. a ``get_live_daily_pnl()`` method or by
+        populating ``day_pnl`` in ``get_account_summary()`` from the PnL subscription
+        object instead of (or in addition to) the ``DailyPnL`` accountSummary tag.
         """
         from datetime import time as _dtime
         from zoneinfo import ZoneInfo
@@ -126,6 +148,16 @@ class PositionTracker:
             logger.error(f"[position_tracker] record_daily_pnl failed: {e}")
             return False
 
+        day_pnl = summary.get("day_pnl") or 0.0
+        net_liq = summary["net_liquidation"]
+        source = "ibkr"
+
+        if not day_pnl:
+            fallback = self._compute_fallback_day_pnl(today, net_liq)
+            if fallback is not None:
+                day_pnl = fallback
+                source = "fallback_delta"
+
         now_iso = datetime.now().isoformat()
         with get_connection() as conn:
             conn.execute(
@@ -133,11 +165,33 @@ class PositionTracker:
                 INSERT OR REPLACE INTO daily_pnl (date, day_pnl, net_liquidation, recorded_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (today, summary["day_pnl"], summary["net_liquidation"], now_iso),
+                (today, day_pnl, net_liq, now_iso),
             )
 
         logger.info(
             f"[position_tracker] daily_pnl updated: date={today} "
-            f"pnl={summary['day_pnl']:.2f} nlv={summary['net_liquidation']:.2f}"
+            f"pnl={day_pnl:.2f} nlv={net_liq:.2f} source={source}"
         )
         return True
+
+    @staticmethod
+    def _compute_fallback_day_pnl(today: str, net_liq: float) -> float | None:
+        """Return net_liq - previous day's net_liquidation, or None if no prior row.
+
+        Used when the IBKR-reported DailyPnL is 0/missing (see record_daily_pnl
+        docstring for root cause). Looks up the most recent daily_pnl row with a
+        date strictly before *today*.
+        """
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT net_liquidation FROM daily_pnl WHERE date < ? "
+                    "ORDER BY date DESC LIMIT 1",
+                    (today,),
+                ).fetchone()
+        except Exception as e:
+            logger.warning(f"[position_tracker] fallback day_pnl lookup failed: {e}")
+            return None
+        if not row or row["net_liquidation"] is None:
+            return None
+        return net_liq - float(row["net_liquidation"])

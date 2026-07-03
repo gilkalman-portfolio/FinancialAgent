@@ -242,9 +242,17 @@ def get_market_mood(articles: List[Dict]) -> Dict:
     neutral = len(articles) - bullish - bearish
     total   = len(articles)
     score   = int((bullish / total) * 100)
-    if score >= 60:   label = "Bullish"
-    elif score >= 45: label = "Neutral"
-    else:             label = "Bearish"
+    # Compare bullish vs bearish share directly (not bullish share vs a fixed
+    # cutoff) — a neutral-heavy day (e.g. 40% bullish / 10% bearish) is still
+    # net-bullish and should not be labeled Bearish just because bullish < 45%.
+    bullish_share = bullish / total
+    bearish_share = bearish / total
+    if bullish_share - bearish_share >= 0.15:
+        label = "Bullish"
+    elif bearish_share - bullish_share >= 0.15:
+        label = "Bearish"
+    else:
+        label = "Neutral"
     return {"label": label, "bullish": bullish, "bearish": bearish, "neutral": neutral, "score": score}
 
 

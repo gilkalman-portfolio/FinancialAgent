@@ -164,11 +164,17 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
 
 
 def _fetch_price_at(ticker: str, target_dt: datetime) -> Optional[float]:
-    """Closing price on target_dt (or the next available trading day)."""
+    """Closing price on target_dt (or the next available trading day).
+
+    Uses auto_adjust=True — same basis as entry_price (a live/real-time price at
+    signal time). A split/dividend within the 7/14/30d horizon would otherwise
+    corrupt the computed return by comparing a raw historical close to a live
+    price (same bug class fixed in src/backtester.py's _get_price_at_date()).
+    """
     start = target_dt.date()
     end = (target_dt + timedelta(days=7)).date()
     try:
-        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
+        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
         if hist is None or hist.empty:
             return None
         return float(hist["Close"].iloc[0])
@@ -269,15 +275,27 @@ def weekly_digest(days: int = 7) -> dict:
     returns_7d, returns_14d, returns_30d = [], [], []
     winners_7d = 0
     measured_7d = 0
+    # Direction-aware win counts, broken out by signal type (BUY win: return > 0;
+    # SELL win: return < 0 — a SELL is correct when price subsequently falls).
+    winners_7d_buy = measured_7d_buy = 0
+    winners_7d_sell = measured_7d_sell = 0
 
     for r in rows:
         t = r["signal_type"]
         by_type[t] = by_type.get(t, 0) + 1
         if r["return_7d_pct"] is not None:
-            returns_7d.append(r["return_7d_pct"])
+            ret = r["return_7d_pct"]
+            returns_7d.append(ret)
             measured_7d += 1
-            if r["return_7d_pct"] > 0:
+            is_win = (ret < 0) if t == "SELL" else (ret > 0)
+            if is_win:
                 winners_7d += 1
+            if t == "SELL":
+                measured_7d_sell += 1
+                winners_7d_sell += 1 if is_win else 0
+            else:
+                measured_7d_buy += 1
+                winners_7d_buy += 1 if is_win else 0
         if r["return_14d_pct"] is not None:
             returns_14d.append(r["return_14d_pct"])
         if r["return_30d_pct"] is not None:
@@ -286,6 +304,9 @@ def weekly_digest(days: int = 7) -> dict:
     def _avg(xs):
         return sum(xs) / len(xs) if xs else None
 
+    def _rate(winners, measured):
+        return (winners / measured * 100.0) if measured else None
+
     return {
         "window_days": days,
         "total_signals": total,
@@ -293,8 +314,12 @@ def weekly_digest(days: int = 7) -> dict:
         "avg_return_7d_pct": _avg(returns_7d),
         "avg_return_14d_pct": _avg(returns_14d),
         "avg_return_30d_pct": _avg(returns_30d),
-        "win_rate_7d_pct": (winners_7d / measured_7d * 100.0) if measured_7d else None,
+        "win_rate_7d_pct": _rate(winners_7d, measured_7d),
         "measured_7d": measured_7d,
+        "win_rate_7d_buy_pct": _rate(winners_7d_buy, measured_7d_buy),
+        "measured_7d_buy": measured_7d_buy,
+        "win_rate_7d_sell_pct": _rate(winners_7d_sell, measured_7d_sell),
+        "measured_7d_sell": measured_7d_sell,
     }
 
 
@@ -315,4 +340,8 @@ def format_digest_message(d: dict) -> str:
         lines.append(f"Avg 30D return: {d['avg_return_30d_pct']:+.2f}%")
     if d["win_rate_7d_pct"] is not None:
         lines.append(f"Win rate 7D:    {d['win_rate_7d_pct']:.1f}%")
+    if d.get("win_rate_7d_buy_pct") is not None:
+        lines.append(f"  BUY win rate:  {d['win_rate_7d_buy_pct']:.1f}% ({d['measured_7d_buy']} measured)")
+    if d.get("win_rate_7d_sell_pct") is not None:
+        lines.append(f"  SELL win rate: {d['win_rate_7d_sell_pct']:.1f}% ({d['measured_7d_sell']} measured)")
     return "\n".join(lines)

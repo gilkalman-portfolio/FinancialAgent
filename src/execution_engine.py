@@ -179,6 +179,7 @@ def evaluate_trade(
     portfolio_value: float = 100_000.0,
     portfolio_tickers: list[str] | None = None,
     signal_type: str | None = None,
+    reasons_out: list[str] | None = None,
 ) -> TradeDecision | None:
     """
     Full execution evaluation for a ticker that has already passed screening.
@@ -198,46 +199,68 @@ def evaluate_trade(
         explosion_score    float   0-100 (catalyst scanner)
         price              float   current price
 
+    signal_type: "BUY" (default) or "SELL". SELL is treated as an exit of an
+        existing long — entry-quality gates (confluence, R:R) are skipped so a
+        legitimate exit is never blocked. See module docstring / report.
+
+    reasons_out: optional list; when provided, the veto reason string(s) are
+        appended to it before returning None. Existing callers that don't pass
+        it are unaffected (behavior unchanged: veto → None).
+
     Returns TradeDecision or None if hard-vetoed.
     """
     portfolio_tickers = portfolio_tickers or []
+    is_sell = signal_type == "SELL"
+
+    def _veto(reason: str) -> None:
+        """Record the veto reason (if a sink was provided) and log it."""
+        if reasons_out is not None:
+            reasons_out.append(reason)
+        logger.info("evaluate_trade(%s): VETOED — %s", ticker, reason)
+        return None
 
     regime = get_regime()
     price = float(score_data.get("price", 0) or 0)
 
     if price <= 0:
-        logger.warning("evaluate_trade(%s): price=0, skipping", ticker)
-        return None
+        return _veto("price unavailable (0)")
 
     # Layer -1: SELL requires an open position
-    if signal_type == "SELL" and _position_tracker is not None:
+    if is_sell and _position_tracker is not None:
         try:
             exposure = _position_tracker.get_current_exposure(ticker)
             if exposure == 0.0:
-                logger.info("evaluate_trade(%s): VETOED — No open position to sell", ticker)
-                return None
+                return _veto("No open position to sell")
         except Exception as e:
             logger.warning("evaluate_trade(%s): position check failed: %s — allowing", ticker, e)
 
-    # Layer 0: daily loss limit (runs before everything else)
+    # Layer 0: daily loss limit (runs before everything else — applies to SELL too
+    # as a circuit-breaker, though exits normally reduce risk)
     daily_veto = check_daily_loss_limit()
     if not daily_veto["passed"]:
-        logger.info("evaluate_trade(%s): VETOED — %s", ticker, daily_veto["reason"])
-        return None
+        return _veto(daily_veto["reason"])
 
     atr = _get_atr(ticker, price)
 
-    # Layer 2: hard vetos
+    # Layer 2: hard vetos (BEAR-regime already exempts SELL; liquidity/gap/RR
+    # checks inside are entry-oriented but harmless for exits — see report)
     veto = check_hard_vetos(ticker, price, atr, score_data, regime, signal_type=signal_type)
     if not veto["passed"]:
-        logger.info("evaluate_trade(%s): VETOED — %s", ticker, veto["reason"])
-        return None
+        return _veto(veto["reason"])
 
-    # Layer 3: confluence
-    confluence = evaluate_confluence(score_data)
-    if confluence["track"] is None:
-        logger.info("evaluate_trade(%s): confluence not met — %s", ticker, confluence["notes"])
-        return None
+    # Layer 3: confluence — ENTRY-QUALITY gate. Skipped for SELL: an exit must
+    # not be blocked because the setup is no longer a high-conviction buy.
+    if is_sell:
+        confluence = ConfluenceResult(
+            track="A",
+            pillars=PillarScores(technical=0.0, fundamental=0.0, catalyst=0.0, total=0.0),
+            catalyst_weight_boosted=False,
+            notes=["SELL exit — confluence skipped"],
+        )
+    else:
+        confluence = evaluate_confluence(score_data)
+        if confluence["track"] is None:
+            return _veto("confluence not met: " + "; ".join(confluence["notes"]))
 
     # Layer 4: position sizing
     sector = _get_sector(ticker)
@@ -252,9 +275,9 @@ def evaluate_trade(
         sector_concentration_pct=sector_concentration,
     )
 
-    if sizing["rr_ratio"] < _MIN_RR:
-        logger.info("evaluate_trade(%s): R:R %.2f < %.1f — vetoed post-sizing", ticker, sizing["rr_ratio"], _MIN_RR)
-        return None
+    # R:R veto is an ENTRY-QUALITY gate — skipped for SELL exits.
+    if not is_sell and sizing["rr_ratio"] < _MIN_RR:
+        return _veto(f"R:R {sizing['rr_ratio']:.2f} < {_MIN_RR} (post-sizing)")
 
     # Layer 5: time-of-day flag
     noise = is_noise_window()
@@ -288,21 +311,29 @@ def check_hard_vetos(
 ) -> VetoResult:
     """Check all hard vetos. Returns passed=False with reason on first failure."""
 
+    is_sell = signal_type == "SELL"
+
     # BEAR regime: no new longs — but SELL (exits) must be allowed
-    if regime["regime"] == "BEAR" and signal_type != "SELL":
+    if regime["regime"] == "BEAR" and not is_sell:
         return VetoResult(passed=False, reason="Regime BEAR — exits only, no new longs")
 
-    # Liquidity
-    try:
-        avg_vol = float(score_data.get("avg_volume", 0) or 0)
-        dollar_vol = avg_vol * price
-        if dollar_vol > 0 and dollar_vol < _MIN_DAILY_DOLLAR_VOL:
-            return VetoResult(
-                passed=False,
-                reason=f"Liquidity ${dollar_vol/1e6:.1f}M < ${_MIN_DAILY_DOLLAR_VOL/1e6:.0f}M daily"
-            )
-    except Exception:
-        pass  # skip liquidity check if data missing
+    # Liquidity — an entry-quality gate. Exits must never be blocked by a
+    # liquidity floor (we still want to be able to close a thin position).
+    if not is_sell:
+        try:
+            avg_vol = float(score_data.get("avg_volume", 0) or 0)
+            dollar_vol = avg_vol * price
+            if dollar_vol > 0 and dollar_vol < _MIN_DAILY_DOLLAR_VOL:
+                return VetoResult(
+                    passed=False,
+                    reason=f"Liquidity ${dollar_vol/1e6:.1f}M < ${_MIN_DAILY_DOLLAR_VOL/1e6:.0f}M daily"
+                )
+        except Exception:
+            pass  # skip liquidity check if data missing
+
+    # Gap-down / R:R checks below are entry-quality — skip entirely for SELL exits.
+    if is_sell:
+        return VetoResult(passed=True, reason="")
 
     # Gap-down on earnings bounce
     if _is_gap_down_bounce(ticker, score_data):

@@ -69,6 +69,21 @@ class CombinedAlert:
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 
+def _escape_md(text: str) -> str:
+    """Escape Telegram Markdown v1 special chars to prevent parse errors.
+
+    A lone underscore in dynamic text (e.g. a 'sec_8k' catalyst string) breaks
+    the Markdown parser → Telegram returns HTTP 400 → the send fails silently
+    and the signal is lost for 24h (the dedup row was already claimed). Escaping
+    the interpolated ticker/catalyst/recommendation strings prevents this.
+    """
+    if text is None:
+        return text
+    for ch in ("*", "_", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _alerts_sent_today() -> int:
     cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     with get_connection() as conn:
@@ -115,12 +130,46 @@ def _try_claim_dedup(ticker: str, alert_type: str, message: str, price: float, s
     return True
 
 
+def release_dedup(ticker: str, alert_type: str, hours: int = DEDUP_HOURS) -> None:
+    """Roll back a dedup claim so the signal can retry on the next cycle.
+
+    Called by the sender layer (ibkr_worker) when the Telegram send genuinely
+    FAILS after evaluate() already claimed the dedup slot. Without this, a failed
+    send (e.g. transient network error, or a malformed message that Telegram
+    rejects with HTTP 400) would suppress the signal for the full DEDUP_HOURS
+    window even though the user never saw it. Deletes only the most recent
+    matching row inside the dedup window to avoid clobbering older legitimate
+    claims.
+    """
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM watchlist_alerts WHERE id = ("
+            "  SELECT id FROM watchlist_alerts "
+            "  WHERE ticker = ? AND alert_type = ? AND sent_at >= ? "
+            "  ORDER BY sent_at DESC LIMIT 1"
+            ")",
+            (ticker, alert_type, cutoff),
+        )
+
+
 def _latest_scan_context(ticker: str) -> dict:
-    """Pull the most recent scan_results row for this ticker."""
+    """Pull the most recent scheduled-scan row for this ticker.
+
+    scan_results.explosion_score is a shared column: scheduler/scan_worker write
+    the stock_scorer composite score there, but automated_scanner.py writes the
+    catalyst *explosion* score under the same name. Filtering to
+    scan_runs.scan_type = 'scheduled' (via run_id join) guarantees we surface the
+    composite score in the BUY/SELL message — not a catalyst metric. Same fix the
+    backtester already carries (see src/backtester.py).
+    """
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT explosion_score, catalyst, raw_data, recommendation "
-            "FROM scan_results WHERE ticker = ? ORDER BY scanned_at DESC LIMIT 1",
+            "SELECT sr.explosion_score, sr.catalyst, sr.raw_data, sr.recommendation "
+            "FROM scan_results sr "
+            "INNER JOIN scan_runs run ON sr.run_id = run.id "
+            "WHERE sr.ticker = ? AND run.scan_type = 'scheduled' "
+            "ORDER BY sr.scanned_at DESC LIMIT 1",
             (ticker,),
         ).fetchone()
     if row is None:
@@ -141,13 +190,14 @@ def _latest_scan_context(ticker: str) -> dict:
 
 def _format_buy_message(ev: SupertrendEvent, ctx: dict) -> str:
     score = ctx.get("composite_score")
-    catalyst = ctx.get("catalyst") or "—"
-    rec = ctx.get("recommendation") or "—"
+    ticker = _escape_md(ev.ticker)
+    catalyst = _escape_md(ctx.get("catalyst") or "—")
+    rec = _escape_md(ctx.get("recommendation") or "—")
     stop = ev.level
     risk_pct = ((ev.last_price - stop) / ev.last_price) * 100.0 if ev.last_price else None
 
     parts = [
-        f"🟢 BUY — {ev.ticker}",
+        f"🟢 BUY — {ticker}",
         f"Supertrend flipped BULLISH (1H)",
         f"Price:  ${ev.last_price:.2f}",
         f"Stop:   ${stop:.2f}" + (f"  (risk {risk_pct:.1f}%)" if risk_pct else ""),
@@ -169,7 +219,7 @@ def _format_buy_message(ev: SupertrendEvent, ctx: dict) -> str:
 
 def _format_sell_message(ev: SupertrendEvent, ctx: dict) -> str:
     parts = [
-        f"🔴 SELL — {ev.ticker}",
+        f"🔴 SELL — {_escape_md(ev.ticker)}",
         f"Supertrend flipped BEARISH (1H)",
         f"Price: ${ev.last_price:.2f}",
         f"Level: ${ev.level:.2f}",
@@ -179,7 +229,7 @@ def _format_sell_message(ev: SupertrendEvent, ctx: dict) -> str:
         parts.append(f"Score:  {score:.0f}")
     rec = ctx.get("recommendation")
     if rec:
-        parts.append(f"Recommendation: {rec}")
+        parts.append(f"Recommendation: {_escape_md(rec)}")
     parts.append("🎯 Action: exit longs / consider partial.")
     return "\n".join(parts)
 

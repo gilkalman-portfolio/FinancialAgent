@@ -106,11 +106,21 @@ def _build_action_block(price: float, hist, hold_days: str, note: str = "") -> s
         return f"\n🎯 כניסה: ${price:.2f} | החזק: {hold_days}"
 
 
+# In-process cache of the last polled price per ticker, used only by
+# check_price_targets() to detect a target gapped-through between two 5-min
+# polls (delayed/5-min-sampled yfinance data means the target price itself may
+# never be sampled). Not persisted — resets on process restart, at which point
+# the first poll falls back to the proximity check below.
+_last_seen_price: dict[str, float] = {}
+
+
 def check_price_targets():
     """
     Main check — called every N minutes.
     Only runs during US market hours (Mon-Fri 09:30-16:00 ET).
-    Fires alert when price reaches or crosses price_target exactly (not % based).
+    Fires when price crosses price_target: either the target lies between the
+    previously-observed price and the current price (gap-through), or price is
+    within a $0.05 buffer of the target (handles the first poll / tick noise).
     """
     if not _is_market_hours():
         now_et = datetime.now(_ET)
@@ -138,9 +148,19 @@ def check_price_targets():
 
         logger.info(f"Price alert monitor: {ticker} price=${price:.2f} target=${target:.2f}")
 
-        # Fire when price crosses the target (direction matters)
-        # Use a tiny $0.05 buffer only to handle tick gaps — not a % threshold
-        reached = abs(price - target) <= 0.05
+        prev_price = _last_seen_price.get(ticker)
+        # Crossing: target lies within [prev_price, price] (either direction).
+        gapped_through = (
+            prev_price is not None
+            and prev_price != price
+            and min(prev_price, price) <= target <= max(prev_price, price)
+        )
+        # Proximity: handles the first poll (no prev_price yet) and tick noise.
+        near_target = abs(price - target) <= 0.05
+        reached = gapped_through or near_target
+
+        _last_seen_price[ticker] = price
+
         if reached and _cooldown_ok(ticker):
             hit_above = price >= target
             direction_emoji = "⬆️" if hit_above else "⬇️"
@@ -648,7 +668,11 @@ def check_price_surge():
             # and supertrend_1h_flip: those fire at momentum peaks, so using them as
             # baseline makes a normal retracement look like a large % drop.
             # combined_buy is a real entry signal and a valid baseline reference.
-            _BASELINE_TYPES = {"price_change", "score_threshold", "combined_buy", "price_surge_rescore"}
+            # score_threshold is EXCLUDED — watchlist_manager.py writes that row with
+            # the composite SCORE stored in the price column (see watchlist_manager.py
+            # ~line 149), not an actual price. Using it as a baseline here produced
+            # nonsensical "moved -58% from $72.00" alerts where 72 was a score.
+            _BASELINE_TYPES = {"price_change", "combined_buy", "price_surge_rescore"}
             for a in watchlist_get_alerts(ticker=ticker, limit=30):
                 if a.get("price") and a["alert_type"] in _BASELINE_TYPES:
                     last_price = float(a["price"])

@@ -173,6 +173,34 @@ class IBKRConnection:
         )
         return parent.orderId
 
+    def place_limit_order(
+        self,
+        ticker: str,
+        action: str,
+        shares: int,
+        limit_price: float,
+    ) -> int:
+        """Place a single plain LMT order (no bracket children).
+
+        Used for SELL exits: a SELL closes an existing long, so there is no
+        stop/target bracket to attach — that geometry only makes sense for a
+        BUY entry. Returns the order_id.
+        """
+        contract = Stock(ticker, "SMART", "USD")
+        self.ib.qualifyContracts(contract)
+
+        order = LimitOrder(action, shares, limit_price)
+        order.orderId = self.ib.client.getReqId()
+        order.transmit = True
+        order.tif = "DAY"  # explicit TIF avoids IB Error 10349 noise
+
+        self.ib.placeOrder(contract, order)
+        logger.info(
+            f"[ibkr] limit order placed: {action} {shares} {ticker} "
+            f"limit=${limit_price:.2f} order_id={order.orderId}"
+        )
+        return order.orderId
+
     def cancel_order(self, order_id: int) -> bool:
         """Cancel an order by order_id."""
         for trade in self.ib.openTrades():

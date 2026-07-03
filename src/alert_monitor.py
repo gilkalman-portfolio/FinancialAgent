@@ -35,6 +35,18 @@ THREAD_TYPES = [
     "news_catalyst",
 ]
 
+# All THREAD_TYPES above only fire on market-dependent activity (Supertrend
+# flips need market data; news_catalyst only runs during market hours per
+# _is_market_hours() in news_catalyst_monitor.py). A fixed 48h window
+# guarantees a false "dead thread" report every Monday (last fire Friday,
+# checked Monday morning = ~57-72h gap) and after any holiday weekend. Treat
+# all THREAD_TYPES as market-dependent and use a market-day-aware window
+# instead of stretching the wall-clock window (simpler + robust: still catches
+# a thread that's been dead across N consecutive calendar days, just skips
+# weekends when counting "how long since last fire").
+MARKET_DEPENDENT_TYPES = set(THREAD_TYPES)
+DEAD_THREAD_MARKET_DAYS = 2  # no alert in this many market (Mon-Fri) days → warn
+
 
 
 def _log(msg: str):
@@ -71,6 +83,11 @@ def check_breakout_noise(conn: sqlite3.Connection) -> tuple[list[str], list[str]
     try:
         today     = datetime.now().date().isoformat()
         yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+        # sent_at is written with datetime.now().isoformat() (naive local time,
+        # see database.py) — compare against a Python-computed local cutoff
+        # rather than SQLite's datetime('now', ...) which is UTC. Using UTC here
+        # skewed every window by the local UTC offset.
+        cutoff = (datetime.now() - timedelta(days=3)).isoformat()
 
         rows = conn.execute(
             """SELECT ticker,
@@ -78,9 +95,9 @@ def check_breakout_noise(conn: sqlite3.Connection) -> tuple[list[str], list[str]
                       MAX(CASE WHEN DATE(sent_at) = ? THEN 1 ELSE 0 END) as yest_fired
                FROM watchlist_alerts
                WHERE alert_type = 'breakout_alert'
-                 AND sent_at >= datetime('now', '-3 days')
+                 AND sent_at >= ?
                GROUP BY ticker""",
-            (today, yesterday)
+            (today, yesterday, cutoff)
         ).fetchall()
 
         for r in rows:
@@ -108,6 +125,8 @@ def check_score_drop_noise(conn: sqlite3.Connection) -> tuple[list[str], list[st
     try:
         today     = datetime.now().date().isoformat()
         yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+        # See check_breakout_noise — local-time cutoff, not SQLite UTC datetime('now').
+        cutoff = (datetime.now() - timedelta(days=3)).isoformat()
 
         rows = conn.execute(
             """SELECT ticker,
@@ -115,9 +134,9 @@ def check_score_drop_noise(conn: sqlite3.Connection) -> tuple[list[str], list[st
                       MAX(CASE WHEN DATE(sent_at) = ? THEN score ELSE NULL END) as score_yest
                FROM watchlist_alerts
                WHERE alert_type = 'score_drop'
-                 AND sent_at >= datetime('now', '-3 days')
+                 AND sent_at >= ?
                GROUP BY ticker""",
-            (today, yesterday)
+            (today, yesterday, cutoff)
         ).fetchall()
 
         for r in rows:
@@ -139,25 +158,53 @@ def check_score_drop_noise(conn: sqlite3.Connection) -> tuple[list[str], list[st
 # Section 3: Dead thread detection
 # ─────────────────────────────────────────────
 
+def _market_days_ago_cutoff(now: datetime, market_days: int) -> datetime:
+    """Walk backward `market_days` Mon-Fri days from `now` and return that
+    timestamp. Weekend days are skipped so the window doesn't shrink across
+    a weekend — e.g. 2 market days checked on a Monday reaches back to the
+    prior Thursday, not just Saturday."""
+    cutoff = now
+    remaining = market_days
+    while remaining > 0:
+        cutoff -= timedelta(days=1)
+        if cutoff.weekday() < 5:  # Mon-Fri
+            remaining -= 1
+    return cutoff
+
+
 def check_dead_threads(conn: sqlite3.Connection) -> list[str]:
     """
-    Checks if key alert types fired at least once in the last 48h.
+    Checks if key alert types fired at least once within the lookback window.
+    THREAD_TYPES are all market-dependent (Supertrend flips need market data,
+    news_catalyst only runs during market hours) — a fixed 48h wall-clock
+    window guarantees a false-positive "dead thread" report every Monday
+    (last fire Friday -> ~57-72h gap by Monday morning) and after holiday
+    weekends. Use a market-day-aware cutoff instead (skips Sat/Sun when
+    counting how far back to look) so weekends don't manufacture false alarms.
     Returns list of suspected-dead types.
     """
     warnings = []
     try:
+        now = datetime.now()
         for atype in THREAD_TYPES:
+            if atype in MARKET_DEPENDENT_TYPES:
+                cutoff = _market_days_ago_cutoff(now, DEAD_THREAD_MARKET_DAYS)
+                window_desc = f"last {DEAD_THREAD_MARKET_DAYS} market days"
+            else:
+                cutoff = now - timedelta(hours=48)
+                window_desc = "last 48h"
+
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM watchlist_alerts "
-                "WHERE alert_type = ? AND sent_at >= datetime('now', '-48 hours')",
-                (atype,)
+                "WHERE alert_type = ? AND sent_at >= ?",
+                (atype, cutoff.isoformat())
             ).fetchone()
             if row["cnt"] == 0:
                 warnings.append(atype)
-                _log(f"WARNING: No '{atype}' alerts in last 48h — thread may be dead")
+                _log(f"WARNING: No '{atype}' alerts in {window_desc} — thread may be dead")
 
         if not warnings:
-            _log("All daemon thread alert types active in last 48h")
+            _log("All daemon thread alert types active in their lookback window")
     except Exception as e:
         _log(f"ERROR in check_dead_threads: {e}")
     return warnings
@@ -320,7 +367,7 @@ def run_alert_monitor():
     if dead_threads:
         lines.append(f"💀 Possible dead threads ({len(dead_threads)}):")
         for t in dead_threads:
-            lines.append(f"  • {t} — no alerts in 48h")
+            lines.append(f"  • {t} — no alerts in last {DEAD_THREAD_MARKET_DAYS} market days")
         lines.append("")
 
     if portfolio_flags:

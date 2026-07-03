@@ -29,9 +29,17 @@ _ET = ZoneInfo("America/New_York")
 
 
 def _is_signal_hours() -> bool:
-    """Only fire signals during extended US market hours (04:00–20:00 ET)."""
-    now_et = datetime.now(_ET).time()
-    return _dtime(4, 0) <= now_et <= _dtime(20, 0)
+    """Only fire signals during extended US market hours on a weekday.
+
+    Gate: Monday–Friday (ET), 04:00–20:00 ET. The weekday check prevents
+    weekend stale-flip duplicates — IBKR serves the same frozen Friday-close
+    bar on Sat/Sun, which otherwise re-fires the same combined_buy/sell every
+    poll (real incident: EPAM fired Fri/Sat/Sun/Mon on the same bar).
+    """
+    now = datetime.now(_ET)
+    if now.weekday() >= 5:   # 5 = Saturday, 6 = Sunday
+        return False
+    return _dtime(4, 0) <= now.time() <= _dtime(20, 0)
 from typing import Optional
 
 from src.database import get_connection, init_db, retry_on_busy
@@ -57,13 +65,27 @@ CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "1"))
 PORT = int(os.environ.get("IBKR_PORT", str(PAPER_PORT)))
 
 
-def _send_telegram(message: str) -> None:
-    """Best-effort Telegram send — failures are logged, never block the loop."""
+def _send_telegram(message: str) -> Optional[bool]:
+    """Best-effort Telegram send — failures are logged, never block the loop.
+
+    Returns a tri-state so callers can distinguish a genuine send FAILURE from a
+    disabled channel:
+      - True  → message was sent successfully
+      - False → send was ATTEMPTED but failed (network error / HTTP 400 from a
+                malformed Markdown message) — the caller may roll back state
+      - None  → Telegram is disabled or the notifier could not init (no-op; do
+                NOT treat as a failure, otherwise a disabled channel would cause
+                infinite retries)
+    """
     try:
         from src.telegram_notifier import TelegramNotifier
-        TelegramNotifier().send_message(message)
+        notifier = TelegramNotifier()
+        if not getattr(notifier, "enabled", True):
+            return None
+        return notifier.send_message(message)
     except Exception as e:
         logger.warning(f"[worker] telegram send failed: {e}")
+        return False
 
 
 @retry_on_busy()
@@ -278,7 +300,19 @@ def _check_ticker(conn: IBKRConnection, ticker: str) -> Optional[SupertrendEvent
         logger.warning(f"[worker] {ticker}: historical_bars failed: {e}")
         return None
 
-    if df.empty or len(df) < ATR_PERIOD + 2:
+    if df.empty:
+        return None
+
+    # Drop the in-progress (unclosed) last bar. IBKR reqHistoricalData with
+    # endDateTime="" returns the forming bar as the last row; computing Supertrend
+    # on it would flip mid-bar and un-flip before close, firing premature/ghost
+    # signals. Match price_alert_monitor.py which does hist.iloc[:-1] for the same
+    # reason. After the drop, a flip on the last CLOSED bar has bars_ago == 1 and
+    # fires exactly once (guarded below); the 24h dedup in signal_combiner is the
+    # second line of defense against re-firing on subsequent polls.
+    df = df.iloc[:-1]
+
+    if len(df) < ATR_PERIOD + 2:
         return None
 
     result = supertrend(df, period=ATR_PERIOD, multiplier=ATR_MULTIPLIER)
@@ -336,7 +370,22 @@ def run_once(conn: IBKRConnection) -> int:
         if alert is None:
             continue
         logger.info(f"[worker] ALERT {alert.alert_type} {alert.ticker} @ ${alert.entry_price:.2f}")
-        _send_telegram(alert.message)
+
+        # evaluate() has already claimed the 24h dedup slot. If the Telegram send
+        # genuinely FAILS (returns False — e.g. HTTP 400 on a malformed message, or
+        # a transient network error), roll back the dedup claim so the signal can
+        # retry next cycle instead of being silently suppressed for 24h. A disabled
+        # channel (None) is NOT a failure — the signal is still recorded and we do
+        # not roll back.
+        send_result = _send_telegram(alert.message)
+        if send_result is False:
+            from src.signal_combiner import release_dedup
+            release_dedup(alert.ticker, alert.alert_type)
+            logger.warning(
+                f"[worker] {alert.ticker}: Telegram send failed — dedup claim rolled back, "
+                f"will retry next cycle"
+            )
+            continue
 
         # Order submission (Phase 1)
         try:

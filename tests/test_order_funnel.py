@@ -340,6 +340,11 @@ class TestSellMessage:
         conn.commit()
         conn.close()
 
+        # SELL now uses a plain LMT order (no bracket) — updated 2026-07 for the
+        # SELL-order-path fixes. Previously this asserted place_bracket_order /
+        # Order ID 12345; the SELL branch calls place_limit_order instead.
+        mock_ibkr.place_limit_order.return_value = 12345
+
         sell_alert = CombinedAlert(
             ticker="TEST", alert_type="combined_sell", entry_price=50.0,
             composite_score=30.0, catalyst_summary=None, supertrend_level=52.0,
@@ -356,6 +361,11 @@ class TestSellMessage:
                 result = mgr.submit(sell_alert)
 
         assert result["status"] == "SUBMITTED"
+        # Plain limit order, not a bracket
+        mock_ibkr.place_limit_order.assert_called_once_with(
+            ticker="TEST", action="SELL", shares=50, limit_price=50.0,
+        )
+        mock_ibkr.place_bracket_order.assert_not_called()
         msg = result["message"]
         assert "FinancialAgent — SELL TEST" in msg
         assert "Exit: $50.00" in msg

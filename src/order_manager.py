@@ -172,10 +172,18 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"[order_manager] could not fetch portfolio_tickers: {e}")
 
-        decision = self.engine.evaluate_trade(ticker, score_data, signal_type=action, portfolio_tickers=portfolio_tickers)
+        veto_reasons: list[str] = []
+        decision = self.engine.evaluate_trade(
+            ticker, score_data, signal_type=action,
+            portfolio_tickers=portfolio_tickers, reasons_out=veto_reasons,
+        )
 
         if decision is None:
-            reason = "execution engine vetoed (hard veto, confluence, or R:R)"
+            reason = (
+                "; ".join(veto_reasons)
+                if veto_reasons
+                else "execution engine vetoed (hard veto, confluence, or R:R)"
+            )
             _write_order_log(
                 ticker=ticker,
                 action=action,
@@ -202,34 +210,63 @@ class OrderManager:
         stop_price = sizing["stop_price"]
         target_price = sizing["target_price"]
 
+        # SELL closes a long: cap shares to what's actually held so we never
+        # over-sell into a short. Layer -1 already vetoes when held == 0.
+        if action == "SELL":
+            held = self._held_shares(ticker)
+            if held <= 0:
+                reason = "No open position to sell (held shares == 0)"
+                _write_order_log(
+                    ticker=ticker, action=action, shares=0,
+                    entry_price=price, stop_price=0, target_price=0,
+                    status="VETOED", notes=reason,
+                )
+                logger.info(f"[order_manager] {ticker} VETOED: {reason}")
+                return {"status": "VETOED", "reason": reason, "ticker": ticker}
+            shares = min(shares, held)
+
         try:
-            order_id = self.ibkr.place_bracket_order(
-                ticker=ticker,
-                action=action,
-                shares=shares,
-                entry_price=price,
-                stop_price=stop_price,
-                target_price=target_price,
-            )
+            if action == "SELL":
+                # Plain LMT SELL — no bracket. A SELL exits an existing long;
+                # there is no stop/target geometry (that is BUY-entry only).
+                order_id = self.ibkr.place_limit_order(
+                    ticker=ticker,
+                    action=action,
+                    shares=shares,
+                    limit_price=price,
+                )
+                log_stop = 0.0
+                log_target = 0.0
+            else:
+                order_id = self.ibkr.place_bracket_order(
+                    ticker=ticker,
+                    action=action,
+                    shares=shares,
+                    entry_price=price,
+                    stop_price=stop_price,
+                    target_price=target_price,
+                )
+                log_stop = stop_price
+                log_target = target_price
             _write_order_log(
                 ticker=ticker,
                 action=action,
                 shares=shares,
                 entry_price=price,
-                stop_price=stop_price,
-                target_price=target_price,
+                stop_price=log_stop,
+                target_price=log_target,
                 status="SUBMITTED",
                 ibkr_order_id=order_id,
             )
             logger.info(
                 f"[order_manager] {ticker} SUBMITTED: {action} {shares} shares "
-                f"entry=${price:.2f} stop=${stop_price:.2f} target=${target_price:.2f} "
+                f"entry=${price:.2f} stop=${log_stop:.2f} target=${log_target:.2f} "
                 f"order_id={order_id}"
             )
             message = _format_submitted_message(
                 action=action, ticker=ticker, shares=shares,
-                entry_price=price, stop_price=stop_price,
-                target_price=target_price, order_id=order_id,
+                entry_price=price, stop_price=log_stop,
+                target_price=log_target, order_id=order_id,
             )
             return {
                 "status": "SUBMITTED",
@@ -240,18 +277,41 @@ class OrderManager:
                 "message": message,
             }
         except Exception as e:
+            # SELL has no bracket geometry; BUY logs its intended stop/target.
+            err_stop = 0.0 if action == "SELL" else stop_price
+            err_target = 0.0 if action == "SELL" else target_price
             _write_order_log(
                 ticker=ticker,
                 action=action,
                 shares=shares,
                 entry_price=price,
-                stop_price=stop_price,
-                target_price=target_price,
+                stop_price=err_stop,
+                target_price=err_target,
                 status="ERROR",
                 notes=str(e),
             )
             logger.error(f"[order_manager] {ticker} ERROR: {e}")
             return {"status": "ERROR", "reason": str(e), "ticker": ticker}
+
+    def _held_shares(self, ticker: str) -> int:
+        """Currently-held share count for a ticker from the ibkr_positions DB.
+
+        position_tracker.sync_positions() refreshes this table at the start of
+        each worker cycle, so it reflects fresh IBKR positions. Reuses the same
+        ibkr_positions read pattern already used for portfolio_tickers above.
+        Returns 0 on any error (Layer -1 veto is the primary no-position guard).
+        """
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT shares FROM ibkr_positions WHERE ticker = ?",
+                    (ticker,),
+                ).fetchone()
+            if row and row["shares"] is not None:
+                return max(0, int(float(row["shares"])))
+        except Exception as e:
+            logger.warning(f"[order_manager] _held_shares({ticker}) failed: {e}")
+        return 0
 
     def _build_score_data(
         self, ticker: str, price: float, composite_score: float | None

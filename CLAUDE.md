@@ -466,7 +466,7 @@ Auto-added tickers (notes prefix: `"Auto:"`) with **score ≤ 40** are removed f
 
 ### Squeeze Scan (`run_squeeze_scan`) — **1 combined message**
 Sends a **single** Telegram per run with two sections:
-1. `🚨 High SI+DTC Alert` — tickers with SI > 15% AND DTC > 10 (cooldown 24h, saved as `squeeze_si_alert`)
+1. `🚨 High SI+DTC Alert` — tickers with SI > 20% AND DTC > 15 (cooldown 24h, saved as `squeeze_si_alert`)
 2. `🔥 Top Squeeze Candidates` — top 10 by score from full scan
 - If no High SI alerts, only the Top Candidates section is shown
 
@@ -549,7 +549,7 @@ All alerts include a `🎯 Action:` line with actionable guidance.
 | `stop_loss` | portfolio: price ≤ stop_loss | 24h | `watchlist_manager.py` |
 | `target_hit` | portfolio: price ≥ target_price | 24h | `watchlist_manager.py` |
 | `score_drop` | portfolio: score < 35 | 24h | `watchlist_manager.py` |
-| `squeeze_si_alert` | SI > 15% AND DTC > 10 | 24h | `scheduler.py` |
+| `squeeze_si_alert` | SI > 20% AND DTC > 15 | 24h | `scheduler.py` |
 | `catalyst_si_alert` | SI ≥ 10% + catalyst ≤ 7 days + explosion_score ≥ 40 | 24h | `scheduler.py` |
 | `breakout_alert` | score ≥ 65 + 52w high OR Bollinger upper break | 24h | `scheduler.py` |
 | `supertrend_intraday_flip` | Supertrend flip on 15m bars | 1h | `price_alert_monitor.py` |
@@ -621,6 +621,7 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 | 08:30 | Breakout alerts (DB-only, silenced from Telegram — superseded by `combined_buy`) | `run_scan` | — |
 | 08:30 | Score jump/drop (DB-only, silenced from Telegram — superseded by `combined_buy`) | `score_alert.py` | — |
 | 08:30 | Auto-added tickers summary | `run_scan` | 0–1 |
+| 08:30 | Scheduled Scan Top 10 (top 10 of all scanned above `min_score`) | `run_scan` | 0–1 |
 | 09:15 | Portfolio scan alerts (stop_loss, target_hit, score_drop) | `run_portfolio_scan` | 0–N |
 | 09:30 | Market Digest (indices + headlines) | `run_market_digest` | 1 |
 | 09:30 | Alert Monitor health report (noisy alerts / drawdown) | `run_alert_monitor` | 0–1 |
@@ -630,9 +631,9 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 | every 5m | Supertrend flip 15m / 1h / daily (DB-only, silenced from Telegram) | `price_alert_monitor.py` | 0–N |
 | every 15m | News catalyst (LLM analysis) | `catalyst_monitor_thread` | 0–N |
 | every 30m | Momentum scanner alerts (auto-add candidates) | `_momentum_monitor_thread` | 0–N |
-| 12:00 | Squeeze Scan (High SI+DTC + Top 10 candidates) | `run_squeeze_scan` | 1 |
+| 12:00 | Squeeze Scan (High SI+DTC + Top 10 candidates) — DB-only, silenced from Telegram (`scheduler.py` builds the message into `_`, never sends) | `run_squeeze_scan` | — |
 | 12:00 | Watchlist scan alerts (score_threshold, price_change, price levels, score_delta) | `run_watchlist_scan` | 0–N |
-| 15:00 | Same as 08:30 (second daily scan — 09:00 ET, before US market open 09:30 ET) | `run_scan` | 0–N |
+| 15:00 | Same as 08:30 incl. Scheduled Scan Top 10 (second daily scan — 09:00 ET, before US market open 09:30 ET) | `run_scan` | 0–N |
 | 18:00 | (no Telegram) Forward + Opportunity outcomes backfill | scheduler | — |
 | Friday 20:00 | Forward Signals Digest (win-rate 7/14/30d) | `run_forward_digest` | 1 |
 | Friday 20:00 | Opportunity Digest (T1/stop hit rates) | `run_opportunity_digest` | 1 |

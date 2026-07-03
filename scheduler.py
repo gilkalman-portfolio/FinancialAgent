@@ -79,6 +79,16 @@ def load_config() -> dict:
     return {"enabled": False}
 
 
+def _escape_md(text: str) -> str:
+    """Escape Telegram Markdown v1 special chars to prevent parse errors.
+    Local copy — see src/news_catalyst_monitor.py for the canonical pattern."""
+    if not text:
+        return text
+    for ch in ("*", "_", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _is_trading_day() -> bool:
     """Returns True only on US market trading days (Mon-Fri, excluding federal holidays)."""
     from zoneinfo import ZoneInfo
@@ -759,9 +769,10 @@ def run_catalyst_alert():
             return
 
         blocks = []
+        cooldown_rows = []  # (ticker, block, score, price) — written only after a successful send
         for r in top:
             ticker        = r["ticker"]
-            event_label   = r.get("catalyst_detail") or r.get("catalyst", "Event")
+            event_label   = _escape_md(str(r.get("catalyst_detail") or r.get("catalyst", "Event")))
             event_date    = r.get("catalyst_date", "?")
             days_to_event = r.get("days_to_event", "?")
             si_pct        = r.get("si_pct", 0)
@@ -795,16 +806,25 @@ def run_catalyst_alert():
                 + f"\n  🎯 {action}"
             )
             blocks.append(block)
-            watchlist_save_alert(ticker, "catalyst_si_alert", block,
-                                 score=score, price=price)
-            logger.info(f"Catalyst+SI: {ticker} | score={score:.0f} | {event_label}")
+            cooldown_rows.append((ticker, block, score, price, event_label))
 
         msg = (
             f"🔥 Catalyst + High SI — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             f"{len(top)} tickers | SI ≥10% + event ≤7d\n\n"
             + "\n\n".join(blocks)
         )
-        TelegramNotifier().send_message(msg)
+        sent = TelegramNotifier().send_message(msg)
+
+        if sent:
+            # Cooldown rows are only written on a confirmed send — otherwise a
+            # failed send (e.g. Markdown parse error) would silently drop all
+            # candidates for 24h with no alert ever reaching Telegram.
+            for ticker, block, score, price, event_label in cooldown_rows:
+                watchlist_save_alert(ticker, "catalyst_si_alert", block,
+                                     score=score, price=price)
+                logger.info(f"Catalyst+SI: {ticker} | score={score:.0f} | {event_label}")
+        else:
+            logger.warning("Catalyst+SI alert: Telegram send failed — cooldown NOT written, will retry next run")
 
     except Exception as e:
         logger.error(f"Catalyst alert failed: {e}")

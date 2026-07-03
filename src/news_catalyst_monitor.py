@@ -189,7 +189,8 @@ def _build_telegram_message(
 
     # Direct impact on this ticker
     if impact.get("reason"):
-        lines += [f"💥 *השפעה על {ticker}:* {impact['reason']}", ""]
+        safe_reason = _escape_md(str(impact["reason"]))
+        lines += [f"💥 *השפעה על {ticker}:* {safe_reason}", ""]
 
     # Portfolio context
     ctx = _portfolio_context(ticker, tracker_info, current_price)
@@ -210,7 +211,7 @@ def _build_telegram_message(
     if other_affected:
         lines.append("")
         lines.append("*גם מושפעים:* " + " | ".join(
-            f"{a['ticker']} ({'↑' if a['impact'] == 'positive' else '↓'})"
+            f"{_escape_md(str(a.get('ticker', '')))} ({'↑' if a.get('impact') == 'positive' else '↓'})"
             for a in other_affected
         ))
 
@@ -260,9 +261,18 @@ def run_catalyst_check(
                 if not headline:
                     continue
 
-                # Freshness gate — skip stale articles (already priced in)
+                # Freshness gate — skip stale articles (already priced in).
+                # A missing/zero timestamp is treated as NOT fresh (safer default
+                # for an alert whose whole purpose is catching fresh catalysts) —
+                # previously `if article_ts and ...` let undated articles bypass
+                # the age check entirely.
                 article_ts = article.get("ts", 0)
-                if article_ts and article_ts < freshness_cutoff_ts:
+                if not article_ts:
+                    logger.debug(
+                        f"[CatalystMonitor] {ticker}: skipping article with missing timestamp — '{headline[:60]}'"
+                    )
+                    continue
+                if article_ts < freshness_cutoff_ts:
                     logger.debug(
                         f"[CatalystMonitor] {ticker}: skipping stale article "
                         f"({int((datetime.now().timestamp() - article_ts) / 60)}m old) — '{headline[:60]}'"
