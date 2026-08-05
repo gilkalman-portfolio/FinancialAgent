@@ -394,6 +394,245 @@ def report(events: pd.DataFrame, benchmark: str = "IWM",
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Exit-regime simulation
+# ─────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ExitConfig:
+    """One exit regime. Distances are in ATR(14) units.
+
+    stop_timeframe MUST match what production actually uses or the comparison is
+    meaningless. `execution_engine._get_atr()` calls `history(period="30d")` with
+    yfinance's default daily interval, so live stops are 2 x ATR(14, DAILY) — a
+    multiple of the hourly ATR. Sizing a stop off hourly ATR produces a stop so
+    tight that ordinary intraday noise takes it out within days, which looks like
+    a strategy result but is a simulation artifact.
+    """
+    name: str
+    stop_atr: float | None = 2.0        # initial stop = entry − stop_atr × ATR
+    trail_atr: float | None = None      # trail from high-water once armed
+    trail_arm_pct: float = 0.0          # only start trailing after +this %
+    target_atr: float | None = None     # take profit at entry + target_atr × ATR
+    max_hold_days: int | None = 30      # time exit
+    supertrend_exit: bool = False       # exit on the next bearish 1H flip
+    friction_pct: float = 0.20          # round-trip commission + slippage
+    stop_timeframe: str = "daily"       # "daily" (matches production) | "hourly"
+
+
+def _atr_at(hist: pd.DataFrame, i: int, period: int = 14) -> float:
+    """ATR(14) using only bars up to and including i."""
+    lo = max(0, i - period * 3)
+    w = hist.iloc[lo:i + 1]
+    if len(w) < period + 1:
+        return float(w["Close"].iloc[-1]) * 0.02
+    h, l, c = w["High"], w["Low"], w["Close"].shift(1)
+    tr = pd.concat([h - l, (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
+    v = tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
+    return float(v) if v > 0 else float(w["Close"].iloc[-1]) * 0.02
+
+
+def _daily_atr_at(daily: pd.DataFrame, when: pd.Timestamp, period: int = 14) -> float | None:
+    """ATR(14) on daily bars, using only sessions closed BEFORE `when`.
+
+    Mirrors execution_engine._get_atr(), which is what sets the live stop distance.
+    """
+    i = daily.index.searchsorted(when.normalize()) - 1
+    if i < period:
+        return None
+    w = daily.iloc[max(0, i - period * 3):i + 1]
+    h, l, c = w["High"], w["Low"], w["Close"].shift(1)
+    tr = pd.concat([h - l, (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
+    v = tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
+    return float(v) if v > 0 else None
+
+
+def simulate_exits(
+    events: pd.DataFrame,
+    hourly: dict[str, pd.DataFrame],
+    bench_daily: dict[str, pd.DataFrame],
+    cfg: ExitConfig,
+    benchmark: str = "IWM",
+    daily: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """Walk each signal forward bar by bar and apply a real exit policy.
+
+    The horizon study measures a fixed holding period, which no live system
+    actually trades — it has stops. This replays the path.
+
+    Fill assumptions are deliberately pessimistic: a bar that gaps through the
+    stop exits at the OPEN, not the stop price; when a bar touches both the stop
+    and the target, the stop is assumed first. Benchmark return is measured over
+    the REALISED holding window so the comparison stays apples-to-apples.
+    """
+    bench_close = bench_daily[benchmark]["Close"]
+    trend_cache: dict[str, pd.Series] = {}
+    rows: list[dict] = []
+
+    for ev in events.itertuples():
+        hist = hourly.get(ev.ticker)
+        if hist is None:
+            continue
+        try:
+            i0 = hist.index.get_loc(ev.ts)
+        except KeyError:
+            continue
+        if i0 + 1 >= len(hist):
+            continue
+
+        entry = float(ev.entry)
+        if cfg.stop_timeframe == "daily":
+            ddf = (daily or {}).get(ev.ticker)
+            atr = _daily_atr_at(ddf, ev.ts) if ddf is not None else None
+            if atr is None:
+                # Without a daily ATR the stop would silently fall back to a much
+                # tighter hourly one, which is the exact artifact this guards
+                # against. Skip the signal instead of simulating a wrong stop.
+                continue
+        else:
+            atr = _atr_at(hist, i0)
+        stop = entry - cfg.stop_atr * atr if cfg.stop_atr else None
+        target = entry + cfg.target_atr * atr if cfg.target_atr else None
+        deadline = ev.ts + pd.Timedelta(days=cfg.max_hold_days) if cfg.max_hold_days else None
+
+        if cfg.supertrend_exit and ev.ticker not in trend_cache:
+            trend_cache[ev.ticker], _, _ = trend_series(hist)
+        trend = trend_cache.get(ev.ticker)
+
+        high_water = entry
+        exit_px, exit_ts, reason = None, None, None
+
+        for i in range(i0 + 1, len(hist)):
+            bar = hist.iloc[i]
+            ts = hist.index[i]
+            o, h, l = float(bar["Open"]), float(bar["High"]), float(bar["Low"])
+
+            if stop is not None and l <= stop:
+                # Gap through the stop fills at the open, not the stop price.
+                exit_px, exit_ts, reason = (min(o, stop), ts, "stop")
+                break
+            if target is not None and h >= target:
+                exit_px, exit_ts, reason = (target, ts, "target")
+                break
+
+            if h > high_water:
+                high_water = h
+            if cfg.trail_atr and high_water >= entry * (1 + cfg.trail_arm_pct / 100.0):
+                cand = high_water - cfg.trail_atr * atr
+                stop = cand if stop is None else max(stop, cand)
+
+            if trend is not None and trend.iloc[i] == -1 and trend.iloc[i - 1] == 1:
+                exit_px, exit_ts, reason = (float(bar["Close"]), ts, "supertrend")
+                break
+            if deadline is not None and ts >= deadline:
+                exit_px, exit_ts, reason = (float(bar["Close"]), ts, "time")
+                break
+
+        if exit_px is None:
+            exit_px = float(hist["Close"].iloc[-1])
+            exit_ts = hist.index[-1]
+            reason = "eod"
+            if deadline is not None and exit_ts < deadline:
+                continue  # not yet matured — must not be counted as a closed trade
+
+        gross = (exit_px / entry - 1.0) * 100.0
+        net = gross - cfg.friction_pct
+
+        b0 = bench_close.index.searchsorted(ev.ts.normalize())
+        b1 = bench_close.index.searchsorted(exit_ts.normalize())
+        bench_ret = None
+        if b0 < len(bench_close) and b1 < len(bench_close) and b1 > b0:
+            bench_ret = (float(bench_close.iloc[b1]) / float(bench_close.iloc[b0]) - 1.0) * 100.0
+
+        rows.append({
+            "ticker": ev.ticker, "ts": ev.ts, "exit_ts": exit_ts,
+            "entry": entry, "exit": exit_px, "reason": reason,
+            "hold_days": (exit_ts - ev.ts).total_seconds() / 86400.0,
+            "gross_pct": gross, "net_pct": net,
+            "bench_pct": bench_ret,
+            "excess_pct": (net - bench_ret) if bench_ret is not None else None,
+            "spy_bull": getattr(ev, "spy_bull", True),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def clustered_stats(trades: pd.DataFrame, col: str = "excess_pct") -> dict:
+    """Mean and t-stat with monthly clustering and non-overlapping windows.
+
+    Naive per-trade t-stats are inflated: overlapping holding periods share market
+    noise, so correlated observations get counted as independent evidence.
+
+    Non-overlap is defined by the PREVIOUS kept trade's exit, not by the current
+    trade's own holding period. Spacing by the current trade's duration looks
+    equivalent and is not: a trade that stopped out in 3 days then only needs 3
+    days of clearance to be admitted, while a 30-day winner needs 30. That
+    preferentially admits fast losers and drops slow winners, which made every
+    stopped regime look far worse than its own raw mean (regime A: raw +0.00%
+    excess reported as -1.03%). Selection on the outcome is exactly what this
+    function exists to avoid.
+    """
+    if trades.empty or col not in trades:
+        return {"n": 0, "mean": np.nan, "t": np.nan, "months": 0}
+    d = trades[trades[col].notna()].sort_values("ts").copy()
+    has_exit = "exit_ts" in d.columns
+    keep, free_at = [], {}
+    for r in d.itertuples():
+        busy_until = free_at.get(r.ticker)
+        if busy_until is None or r.ts >= busy_until:
+            keep.append(r.Index)
+            free_at[r.ticker] = (
+                r.exit_ts if has_exit
+                else r.ts + pd.Timedelta(days=float(getattr(r, "hold_days", 0) or 0))
+            )
+    d = d.loc[keep]
+    if d.empty:
+        return {"n": 0, "mean": np.nan, "t": np.nan, "months": 0}
+    monthly = d.groupby(d.ts.dt.to_period("M"))[col].mean()
+    s = stats(monthly)
+    return {"n": len(d), "mean": s["mean"], "t": s["t"], "months": s["n"]}
+
+
+def exit_report(results: dict[str, pd.DataFrame]) -> str:
+    """Compare exit regimes. Excess vs benchmark, net of friction, month-clustered."""
+    lines = [
+        f"{'exit regime':<34}{'trades':>7}{'hold':>7}{'net':>8}{'bench':>8}"
+        f"{'excess':>9}{'t':>7}{'indep':>7}{'win%':>7}",
+        "-" * 96,
+    ]
+    for name, tr in results.items():
+        if tr.empty:
+            lines.append(f"{name:<34}{0:>7}   (no trades)")
+            continue
+        d = tr[tr.excess_pct.notna()]
+        cs = clustered_stats(tr)
+        lines.append(
+            f"{name:<34}{len(d):>7}{d.hold_days.mean():>6.1f}d"
+            f"{d.net_pct.mean():>+7.2f}%{d.bench_pct.mean():>+7.2f}%"
+            f"{cs['mean']:>+8.2f}%{cs['t']:>+7.2f}{cs['n']:>7}"
+            f"{(d.net_pct > 0).mean() * 100:>6.1f}%"
+            + ("  SIGNIFICANT" if abs(cs["t"]) > 2 else "")
+        )
+    lines.append("")
+    lines.append("net    = after friction.  bench = benchmark over the REALISED holding window.")
+    lines.append("excess = net - bench, on outcome-blind non-overlapping trades, month-clustered.")
+    lines.append("indep  = trades surviving the non-overlap filter (the real sample size).")
+    lines.append("A high 'net' with zero 'excess' means the regime earned market beta, not alpha.")
+    return "\n".join(lines)
+
+
+def exit_reason_breakdown(trades: pd.DataFrame) -> str:
+    if trades.empty:
+        return "no trades"
+    lines = [f"{'reason':<14}{'n':>7}{'share':>8}{'avg net':>10}{'avg hold':>10}", "-" * 50]
+    for reason, grp in trades.groupby("reason"):
+        lines.append(
+            f"{reason:<14}{len(grp):>7}{len(grp) / len(trades) * 100:>7.1f}%"
+            f"{grp.net_pct.mean():>+9.2f}%{grp.hold_days.mean():>9.1f}d"
+        )
+    return "\n".join(lines)
+
+
 def regime_report(events: pd.DataFrame, benchmark: str = "IWM", horizon: int = 30) -> str:
     """Does the trigger hold up when the market is NOT rising?
 

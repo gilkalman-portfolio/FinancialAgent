@@ -904,6 +904,49 @@ a falling tape. Net of 0.2–0.3% round-trip friction the edge is +0.2% to +0.4%
 collapsed names are structurally absent. Correcting this needs point-in-time index membership,
 which the project does not store. Treat +0.70% as an upper bound, not an estimate.
 
+### Exit Simulation — 2026-08-05 (supersedes the horizon result above)
+
+`run_exit_simulation.py` + `simulate_exits()` replay each signal **bar by bar** under
+competing exit policies, with pessimistic fills (a bar that gaps through the stop fills at
+the OPEN; when one bar touches both stop and target, the stop is assumed first) and the
+benchmark measured over the **realised** holding window.
+
+**The +0.70% horizon edge does not survive contact with a stop.** The horizon study measured
+unmanaged close-to-close returns. Once a real exit policy is applied:
+
+| exit regime | hold | net | bench | excess | t |
+|---|---|---|---|---|---|
+| **A — live: Supertrend flip exit** | 7.1d | +0.32% | +0.32% | **+0.00%** | +0.04 |
+| B — stop 2ATR + 30d time | 21.1d | +1.22% | +1.16% | −0.11% | −0.35 |
+| C — stop 3ATR + 30d time | 25.4d | +1.59% | +1.45% | −0.11% | −0.32 |
+| D — 3ATR stop, trail 3ATR after +5% | 21.6d | +1.05% | +1.22% | −0.14% | −0.56 |
+| E — stop 3ATR + 60d time | 43.0d | +3.13% | +2.55% | −0.12% | −0.22 |
+| F — stop 2ATR, target 4ATR, 30d | 17.5d | +0.71% | +1.00% | −0.27% | −1.51 |
+| G — **no stop**, 30d time (reference only) | 30.7d | +2.20% | +1.83% | +0.50% | +1.63 |
+
+Every regime carrying a stop lands at zero or negative excess. The only positive variant
+holds for 30 days with **no stop at all**, is not statistically significant (t=1.63), and is
+not tradeable — it accepts unbounded single-name loss. The 30-day edge comes from a fat right
+tail (win rate 47.6% with a positive mean), and a stop truncates future winners faster than it
+saves losers.
+
+**Regime A reproduces live behaviour and lands at exactly +0.00% excess (t=0.04)** — the same
+near-zero expectancy three months of paper trading produced. The simulator independently
+arrives at the observed live result, which is the strongest calibration evidence available.
+A +0.32% net against a +0.32% benchmark is uncompensated single-name risk.
+
+Two methodology bugs were found and fixed while producing this; both had inverted the answer:
+- **Stop ATR timeframe.** Stops were sized from *hourly* ATR while production uses *daily*
+  (`execution_engine._get_atr()` → `history(period="30d")`, yfinance daily default). The
+  hourly stop is several times tighter, so ordinary intraday noise took it out within ~2 days
+  and produced a false "stops destroy the edge" signal. `ExitConfig.stop_timeframe` now
+  defaults to `"daily"` and **skips** a signal rather than silently falling back.
+- **Outcome-selected clustering.** `clustered_stats()` spaced non-overlapping trades by the
+  *current* trade's holding period, so a 3-day stop-out needed only 3 days of clearance while
+  a 30-day winner needed 30 — preferentially admitting fast losers. Regime A's true +0.00%
+  excess was being reported as −1.03%. Non-overlap is now defined by the previous kept
+  trade's **exit**, which is outcome-blind. `tests/test_exit_simulation.py` pins both.
+
 ### DCF & Data Quality Hardening — 2026-06-26
 
 - [x] **Backtester corporate action fix** — `src/backtester.py`: `price_at_signal` now fetched from yfinance on same `auto_adjust=True` basis as `price_after`. Existing corrupted rows refreshed via `UPDATE` (was `INSERT OR IGNORE` which silently kept the bad value). **One-time DB cleanup**: deleted 3 `backtest_results` rows for DD (pct_change >100%, reverse split artifact, 7d/14d) and 1 row for POWL (pct_change <-50%, forward split artifact, 7d).
