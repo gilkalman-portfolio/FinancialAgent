@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 # Throttle for the short-position alarm. The pause itself is never throttled.
 SHORT_ALARM_COOLDOWN_HOURS = 6
 
+# How stale a stored net_liquidation may be before it is refused as a sizing
+# input. Position size scales linearly with this number, so an out-of-date value
+# is not conservative — it is wrong in an unbounded direction.
+PORTFOLIO_VALUE_MAX_AGE_DAYS = 5
+
 
 class PositionTracker:
     def __init__(self, ibkr_client, db_module=None):
@@ -175,13 +180,27 @@ class PositionTracker:
                 return value
         except Exception:
             pass
+        # DB fallback, but only from a RECENT row. An old net_liquidation is not a
+        # conservative estimate — it is an arbitrary one, and it scales every
+        # position size. When the paper account was reset from $853k to $250k the
+        # newest stored row was 3.4x the real account, which would have sized
+        # every trade 3.4x too large during the window before the first fresh
+        # write. Returning 0.0 instead is safe: check_daily_loss_limit() treats
+        # portfolio_value <= 0 as "cannot evaluate" and vetoes.
         try:
+            cutoff = (datetime.now() - timedelta(days=PORTFOLIO_VALUE_MAX_AGE_DAYS)).strftime("%Y-%m-%d")
             with get_connection() as conn:
                 row = conn.execute(
-                    "SELECT net_liquidation FROM daily_pnl ORDER BY date DESC LIMIT 1"
+                    "SELECT date, net_liquidation FROM daily_pnl "
+                    "WHERE date >= ? ORDER BY date DESC LIMIT 1",
+                    (cutoff,),
                 ).fetchone()
-                if row:
+                if row and row["net_liquidation"]:
                     return float(row["net_liquidation"])
+            logger.warning(
+                f"[position_tracker] no daily_pnl row newer than {cutoff} — "
+                f"refusing to size from a stale portfolio value"
+            )
         except Exception as e:
             logger.error(f"[position_tracker] get_portfolio_value failed: {e}")
         return 0.0

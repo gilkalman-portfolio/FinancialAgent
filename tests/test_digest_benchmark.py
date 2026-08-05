@@ -181,6 +181,39 @@ class TestAccountEventGuard:
                             (yesterday,)).fetchone()
         assert row["day_pnl"] == pytest.approx(-10_000.0)
 
+    def test_stale_nlv_is_refused_as_a_sizing_input(self, _db):
+        """The $853k -> $250k reset: a stale stored NLV is 3.4x the truth and
+        would size every trade 3.4x too large."""
+        from src.position_tracker import PositionTracker
+        old = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        with _db() as c:
+            c.execute("INSERT INTO daily_pnl VALUES (?,0,853301,?)",
+                      (old, datetime.now().isoformat()))
+        ib = MagicMock()
+        ib.get_account_summary.return_value = {"net_liquidation": 0.0}  # IBKR gap
+        assert PositionTracker(ib).get_portfolio_value() == 0.0, \
+            "must refuse a stale value, not size from it"
+
+    def test_recent_nlv_is_used(self, _db):
+        from src.position_tracker import PositionTracker
+        today = datetime.now().strftime("%Y-%m-%d")
+        with _db() as c:
+            c.execute("INSERT INTO daily_pnl VALUES (?,0,250000,?)",
+                      (today, datetime.now().isoformat()))
+        ib = MagicMock()
+        ib.get_account_summary.return_value = {"net_liquidation": 0.0}
+        assert PositionTracker(ib).get_portfolio_value() == pytest.approx(250_000.0)
+
+    def test_live_ibkr_value_wins_over_db(self, _db):
+        from src.position_tracker import PositionTracker
+        today = datetime.now().strftime("%Y-%m-%d")
+        with _db() as c:
+            c.execute("INSERT INTO daily_pnl VALUES (?,0,999999,?)",
+                      (today, datetime.now().isoformat()))
+        ib = MagicMock()
+        ib.get_account_summary.return_value = {"net_liquidation": 250_000.0}
+        assert PositionTracker(ib).get_portfolio_value() == pytest.approx(250_000.0)
+
     def test_gross_exposure_counts_shorts_by_absolute_value(self, _db):
         from src.position_tracker import PositionTracker
         with _db() as c:
