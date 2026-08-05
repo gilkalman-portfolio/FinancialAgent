@@ -1078,11 +1078,43 @@ def _release_singleton_lock() -> None:
         pass
 
 
+def _quiet_third_party_logs() -> None:
+    """Stop third-party chatter from burying our own log lines.
+
+    Measured on the 1.16 GB log accumulated 2026-05-19 .. 2026-08-05
+    (3.32M lines):
+
+        ib_async.wrapper   2,134,900 lines   1,046 MB   90.0%
+        src.supertrend       884,740 lines     116 MB   10.0%
+        ALL our own code     ~300,000 lines    ~14 MB    1.2%
+
+    ib_async logs every portfolio item at INFO on every account update, and
+    src.supertrend logs one loguru DEBUG line per ticker per 5-minute cycle. The
+    result was a file too large to grep during an incident — which is the only
+    time anyone reads it. Everything at WARNING and above is still kept, so real
+    problems (order rejections, disconnects, API warnings) survive.
+    """
+    for name in ("ib_async", "ib_async.wrapper", "ib_async.client",
+                 "ib_async.ib", "ib_insync"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # src.supertrend uses loguru, which has its own sink and ignores the stdlib
+    # level above. Raising the threshold to INFO drops the per-ticker DEBUG line
+    # while keeping its warnings.
+    try:
+        from loguru import logger as _loguru
+        _loguru.remove()
+        _loguru.add(sys.stderr, level="INFO")
+    except Exception as e:  # loguru absent or already configured
+        logging.getLogger(__name__).debug(f"loguru not reconfigured: {e}")
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    _quiet_third_party_logs()
     if not _acquire_singleton_lock():
         return 1
     try:

@@ -18,6 +18,7 @@ import logging
 import urllib.request
 import urllib.parse
 import json
+from datetime import datetime
 from pathlib import Path
 
 CREATE_NO_WINDOW = 0x08000000  # subprocess flag: hide console window on Windows
@@ -25,6 +26,41 @@ CREATE_NO_WINDOW = 0x08000000  # subprocess flag: hide console window on Windows
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# Worker log rotation. ib_async logs every portfolio item at INFO and the
+# Supertrend pass logs one DEBUG line per ticker per 5-minute cycle, so this file
+# grows ~15 MB/day unattended. It reached 1.16 GB (3.3M lines, 2026-05-19 ..
+# 2026-08-05) before anyone noticed, which makes it useless to grep in an
+# incident — exactly when it matters.
+WORKER_LOG_MAX_BYTES = 200 * 1024 * 1024   # rotate past 200 MB
+WORKER_LOG_KEEP = 3                        # keep this many rotated files
+
+
+def _rotate_worker_log(path) -> None:
+    """Rename an oversized worker log aside and prune old rotations.
+
+    Safe only between worker launches: the watchdog holds the log handle open
+    for the entire life of the worker process.
+    """
+    try:
+        if not path.exists() or path.stat().st_size < WORKER_LOG_MAX_BYTES:
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        rotated = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+        path.rename(rotated)
+        logging.info(f"Rotated worker log ({rotated.stat().st_size / 1e6:.0f} MB) -> {rotated.name}")
+
+        old = sorted(
+            path.parent.glob(f"{path.stem}.*{path.suffix}"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in old[WORKER_LOG_KEEP:]:
+            stale.unlink(missing_ok=True)
+            logging.info(f"Pruned old worker log {stale.name}")
+    except Exception as e:
+        # Never let housekeeping stop the worker from starting.
+        logging.warning(f"Worker log rotation failed: {e}")
 
 logging.basicConfig(
     filename=LOG_DIR / "ibkr_worker_watchdog.log",
@@ -144,6 +180,9 @@ def main():
 
     while True:
         attempt += 1
+        # Between launches is the only safe moment: the log handle below is held
+        # open for the whole life of the worker process.
+        _rotate_worker_log(worker_log_path)
         logging.info(f"Launching ibkr_worker (attempt #{attempt}) — output: {worker_log_path}")
         if attempt > 1:
             _send_telegram(f"🔄 <b>IBKR Worker</b> — restarting (attempt #{attempt})")
