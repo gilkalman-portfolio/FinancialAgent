@@ -15,7 +15,7 @@ Architecture (agreed after multi-model review):
 
 The combiner takes a freshly-detected Supertrend 1H flip event for a ticker
 that is in the monitoring queue and fires a BUY or SELL alert.
-Supertrend flip is the sole trigger — no composite score gate.
+Supertrend flip is the trigger. BUY: no score gate. SELL: no score gate — gated only on open position (ibkr_positions WHERE shares > 0).
 
 It enforces:
     - Daily cap (10 alerts/day)
@@ -34,7 +34,6 @@ from typing import Optional
 from src.database import get_connection
 from src.forward_signals import SignalRecord, record_signal
 from src.monitoring_queue import build_queue
-from src.execution_engine import format_trade_plan_block
 
 logger = logging.getLogger(__name__)
 
@@ -207,14 +206,7 @@ def _format_buy_message(ev: SupertrendEvent, ctx: dict) -> str:
     parts.append(f"Catalyst: {catalyst}")
     parts.append(f"Recommendation: {rec}")
     parts.append("🎯 Action: trail stop below Supertrend level; size to 1% risk.")
-    msg = "\n".join(parts)
-    try:
-        plan_block = format_trade_plan_block(ev.ticker, ev.last_price)
-        if plan_block:
-            msg += plan_block
-    except Exception as _e:
-        logger.warning(f"[combiner] trade plan block failed for {ev.ticker}: {_e}")
-    return msg
+    return "\n".join(parts)
 
 
 def _format_sell_message(ev: SupertrendEvent, ctx: dict) -> str:
@@ -241,8 +233,9 @@ def evaluate(event: SupertrendEvent) -> Optional[CombinedAlert]:
     """
     Decide whether a Supertrend flip should fire a combined alert.
 
-    Signal logic: Supertrend 1H flip is the sole trigger for both BUY and SELL.
-    No composite score gate — any watchlist ticker gets alerted on flip.
+    Signal logic: Supertrend 1H flip is the trigger.
+    BUY: no score gate — any watchlist ticker gets alerted on bullish flip.
+    SELL: no score gate — gated only on open position (ibkr_positions WHERE shares > 0).
 
     Returns the CombinedAlert (already persisted + deduped) if fired,
     or None if suppressed (cap reached, deduped, queue-miss).

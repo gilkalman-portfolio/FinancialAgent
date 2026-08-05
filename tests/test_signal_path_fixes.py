@@ -425,8 +425,7 @@ class TestMarkdownEscaping:
         ev = SupertrendEvent(ticker="ABC", direction="Bullish", signal="BUY",
                              level=48.0, last_price=50.0)
         ctx = {"composite_score": 70.0, "catalyst": "sec_8k", "recommendation": "STRONG_BUY"}
-        with patch("src.signal_combiner.format_trade_plan_block", return_value=""):
-            msg = _format_buy_message(ev, ctx)
+        msg = _format_buy_message(ev, ctx)
         # Lone underscores from catalyst/recommendation are escaped.
         assert "sec\\_8k" in msg
         assert "STRONG\\_BUY" in msg

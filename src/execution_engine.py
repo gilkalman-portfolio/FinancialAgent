@@ -25,6 +25,7 @@ import json
 import yfinance as yf
 
 from src.market_regime import RegimeResult, get_regime, regime_label_emoji
+from src.database import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ _MAX_DAILY_LOSS_PCT   = 0.02         # 2% daily loss limit — overridden by sch
 _GAP_DOWN_THRESHOLD   = 0.05        # 5% gap-down on earnings = veto bounce trade
 _ATR_STOP_MULT        = 2.0         # stop = entry − ATR_MULT × ATR(14)
 _ATR_TARGET_MULT      = 3.0         # initial target = entry + TARGET_MULT × ATR(14) if no DCF
+_MAX_POSITIONS        = 10          # max open positions — overridden by scheduler_config.json
 
 # ── Confluence thresholds ─────────────────────────────────────────────────
 _TRACK_A_MIN_TOTAL    = 60          # minimum weighted sum across all pillars
@@ -133,6 +135,20 @@ def _get_max_daily_loss_pct() -> float:
     return _MAX_DAILY_LOSS_PCT
 
 
+def _get_max_positions() -> int:
+    """Read max_positions from scheduler_config.json, default 10."""
+    try:
+        from pathlib import Path
+        cfg_path = Path(__file__).parent.parent / "scheduler_config.json"
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            return int(cfg.get("max_positions", _MAX_POSITIONS))
+    except Exception:
+        pass
+    return _MAX_POSITIONS
+
+
 def check_daily_loss_limit() -> VetoResult:
     """Veto if today's P&L exceeds the daily loss limit.
 
@@ -223,22 +239,50 @@ def evaluate_trade(
     price = float(score_data.get("price", 0) or 0)
 
     if price <= 0:
-        return _veto("price unavailable (0)")
+        return _veto("L0: price unavailable (0)")
 
     # Layer -1: SELL requires an open position
     if is_sell and _position_tracker is not None:
         try:
             exposure = _position_tracker.get_current_exposure(ticker)
             if exposure == 0.0:
-                return _veto("No open position to sell")
+                return _veto("L-1: No open position to sell")
         except Exception as e:
             logger.warning("evaluate_trade(%s): position check failed: %s — allowing", ticker, e)
+
+    # Layer -1.5: BUY veto if already holding a long position (no pyramiding)
+    if signal_type == "BUY":
+        try:
+            with get_connection() as _conn:
+                _existing = _conn.execute(
+                    "SELECT shares FROM ibkr_positions WHERE ticker = ? AND shares > 0",
+                    (ticker,)
+                ).fetchone()
+            if _existing:
+                logger.info(f"[engine] {ticker}: BUY vetoed — already long {_existing['shares']:.0f}sh")
+                return _veto(f"L-1.5: Already long {ticker} ({_existing['shares']:.0f}sh) — no pyramiding")
+        except Exception as _e:
+            logger.warning(f"[engine] existing-long check failed for {ticker}: {_e} — allowing trade")
+
+    # Layer -1.2: BUY veto if max open positions reached
+    if signal_type == "BUY":
+        try:
+            with get_connection() as _conn:
+                _pos_count = _conn.execute(
+                    "SELECT COUNT(*) AS n FROM ibkr_positions WHERE shares > 0"
+                ).fetchone()["n"]
+            _max_pos = _get_max_positions()
+            if _pos_count >= _max_pos:
+                logger.info(f"[engine] {ticker}: BUY vetoed — {_pos_count}/{_max_pos} positions open")
+                return _veto(f"L-1.2: Max positions reached ({_pos_count}/{_max_pos})")
+        except Exception as _e:
+            logger.warning(f"[engine] max-positions check failed for {ticker}: {_e} — allowing trade")
 
     # Layer 0: daily loss limit (runs before everything else — applies to SELL too
     # as a circuit-breaker, though exits normally reduce risk)
     daily_veto = check_daily_loss_limit()
     if not daily_veto["passed"]:
-        return _veto(daily_veto["reason"])
+        return _veto("L0: " + daily_veto["reason"])
 
     atr = _get_atr(ticker, price)
 
@@ -246,7 +290,7 @@ def evaluate_trade(
     # checks inside are entry-oriented but harmless for exits — see report)
     veto = check_hard_vetos(ticker, price, atr, score_data, regime, signal_type=signal_type)
     if not veto["passed"]:
-        return _veto(veto["reason"])
+        return _veto("L2: " + veto["reason"])
 
     # Layer 3: confluence — ENTRY-QUALITY gate. Skipped for SELL: an exit must
     # not be blocked because the setup is no longer a high-conviction buy.
@@ -260,7 +304,7 @@ def evaluate_trade(
     else:
         confluence = evaluate_confluence(score_data)
         if confluence["track"] is None:
-            return _veto("confluence not met: " + "; ".join(confluence["notes"]))
+            return _veto("L3: confluence not met: " + "; ".join(confluence["notes"]))
 
     # Layer 4: position sizing
     sector = _get_sector(ticker)
@@ -277,7 +321,7 @@ def evaluate_trade(
 
     # R:R veto is an ENTRY-QUALITY gate — skipped for SELL exits.
     if not is_sell and sizing["rr_ratio"] < _MIN_RR:
-        return _veto(f"R:R {sizing['rr_ratio']:.2f} < {_MIN_RR} (post-sizing)")
+        return _veto(f"L4: R:R {sizing['rr_ratio']:.2f} < {_MIN_RR} (post-sizing)")
 
     # Layer 5: time-of-day flag
     noise = is_noise_window()

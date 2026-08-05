@@ -6,7 +6,7 @@ AI-powered stock scanner & financial analysis dashboard.
 - **Stack:** Python 3.14, Streamlit 1.52.2, SQLite, yfinance, Finnhub, Alpha Vantage, SEC EDGAR
 - **LLMs:** Gemini 2.0 Flash (primary) → Groq Llama 3.3 70B (fallback) via `src/llm_client.py`
 - **Run:** `streamlit run dashboard.py` → http://localhost:8501
-- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **273 passed, 0 failures**
+- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **348 passed, 5 pre-existing failures** (test_pnl_digest_fixes.py — unrelated to core logic)
 
 ---
 
@@ -52,11 +52,11 @@ AI-powered stock scanner & financial analysis dashboard.
 | `options_flow.py` | Options chain data, PCR, unusual call/put activity (yfinance). **OI=0 false positive fixed** — contracts with OI=0 and volume<500 are skipped; volume≥500 uses `volume/100` ratio instead of sentinel `9999`. |
 | `auto_watchlist_agent.py` | Auto-adds squeeze/catalyst/momentum candidates to watchlist with Telegram summary. **`alert_score` uses `AUTO_WL_SCORE_ENTRY` (70) from hysteresis.py** — consistent with all other auto-watchlist entry thresholds (was 60 from config). |
 | `ibkr_realtime.py` | IB Gateway connector via `ib_async` — historical bars + live snapshot + bracket order placement + position/account queries for US stocks |
-| `ibkr_worker.py` | Standalone daemon (Python 3.13, `.venv313`) — runs Supertrend(1H) every 5 min on the monitoring queue, fires combined alerts + submits orders via `order_manager` + syncs positions/daily P&L via `position_tracker`. **`sync_positions()` runs at the START of each cycle** (before ticker loop). **`bars_ago != 1` check** in `_check_ticker()` — only fires on the exact bar that flipped, preventing stale-flip duplicates. **`_is_signal_hours()` gate** — signals blocked outside 04:00–20:00 ET (`zoneinfo`), preventing pre-market/overnight order submission. Subscribes to `ib.orderStatusEvent` for fill/cancel callbacks. Startup reconciliation + periodic fill sweep (every 30 min). Hosts `TelegramCommandHandler` thread. **Windows named mutex singleton** (`Global\FinancialAgent_IBKRWorker_Singleton`) — `_acquire_singleton_lock()` in `main()` prevents two worker instances; second instance exits with code 1 immediately. `multiprocessing.freeze_support()` called in `__main__` to prevent Windows spawn-mode double-execution. **`_update_order_log()` race fix** — FILLED status uses `NOT IN ('FILLED','ERROR')` guard; CANCELLED uses `= 'SUBMITTED'` guard; prevents bracket-order child-leg cancel from overwriting a FILLED status. |
+| `ibkr_worker.py` | Standalone daemon (Python 3.13, `.venv313`) — runs Supertrend(1H) every 5 min on the monitoring queue, fires combined alerts + submits orders via `order_manager` + syncs positions/daily P&L via `position_tracker`. **`sync_positions()` runs at the START of each cycle** (before ticker loop). **`bars_ago != 1` check** in `_check_ticker()` — only fires on the exact bar that flipped, preventing stale-flip duplicates. **`_is_signal_hours()` gate** — signals blocked outside 04:00–20:00 ET (`zoneinfo`), preventing pre-market/overnight order submission. Subscribes to `ib.orderStatusEvent` for fill/cancel callbacks. Startup reconciliation + periodic fill sweep (every 30 min). Hosts `TelegramCommandHandler` thread. **Windows named mutex singleton** (`Global\FinancialAgent_IBKRWorker_Singleton`) — `_acquire_singleton_lock()` in `main()` prevents two worker instances; second instance exits with code 1 immediately. `multiprocessing.freeze_support()` called in `__main__` to prevent Windows spawn-mode double-execution. **`_update_order_log()` race fix** — FILLED status uses `NOT IN ('FILLED','ERROR')` guard; CANCELLED uses `= 'SUBMITTED'` guard; prevents bracket-order child-leg cancel from overwriting a FILLED status. **`PER_CYCLE_BUY_CAP = 3`** — max 3 `combined_buy` per `run_once()` cycle; excess signals release their dedup claim (`release_dedup()`) for retry next cycle — prevents alert floods when many tickers flip simultaneously. **SUBMITTED Telegram condensed** — 1-liner `✅ {ticker} {shares}sh @ ${price:.2f} | #{order_id}` (full detail already in signal message; was duplicating it). |
 | `monitoring_queue.py` | Source of truth for "which tickers get real-time IBKR monitoring" — scanner score ≥ 65 + manual watchlist + recent BUY alerts (72h) + liquidity gate (hysteresis: enter $5M / exit $3M ADV). Queue state persisted to `monitoring_queue_snapshot` DB table. **`_persist_queue()` only called when `apply_liquidity_gate=True`** — prevents `signal_combiner.evaluate()` calls (gate=False) from corrupting the snapshot with unfiltered tickers. |
 | `order_manager.py` | Wraps IBKR order calls; runs execution_engine veto checks before submission; logs every attempt to `order_log` DB table. Injects `position_tracker` into execution engine for daily loss limit. **Fetches `portfolio_tickers` from `ibkr_positions` DB before `evaluate_trade()`** — enables sector concentration veto (Layer 6). paper_mode=True default; live requires `IBKR_LIVE=true` env var. Module-level `_trading_paused` flag — when True, `submit()` returns PAUSED without evaluating. Passes `signal_type` ("BUY"/"SELL") to `evaluate_trade()`. |
 | `position_tracker.py` | Syncs IBKR positions to `ibkr_positions` DB table every 5 min; records `daily_pnl` once per day; exposes `get_current_exposure()`, `get_portfolio_value()`, `get_daily_pnl()` for execution engine. `get_portfolio_value()` DB fallback uses `ORDER BY date DESC LIMIT 1` (most recent row, not just today) — prevents returning 0.0 early morning before `record_daily_pnl()` runs. **`record_daily_pnl()` 09:30 ET gate** — skips before 09:30 ET (market open) to avoid writing a $0 row from pre-market account summary; uses `INSERT OR REPLACE` (was `INSERT OR IGNORE`) so the row is updated if re-run after the first write. |
-| `signal_combiner.py` | Supertrend 1H flip → BUY/SELL alert; enforces daily cap (10), 24h dedup. **No composite score gate** — Supertrend flip is the sole trigger for both BUY and SELL (symmetric behavior, user preference 2026-06-03). Score pulled for message enrichment only. **`_try_claim_dedup()` performs SELECT+INSERT atomically in a single DB connection** — eliminates the race window of the old split check+write. `_record_dedup()` removed (was dead code). **SELL gate** — before firing a SELL alert, checks `ibkr_positions WHERE ticker = ? AND shares > 0`; suppresses SELL (no Telegram, no order) when no open position exists. |
+| `signal_combiner.py` | Supertrend 1H flip → BUY/SELL alert; enforces daily cap (10), 24h dedup. **BUY: no score gate** — any monitoring-queue ticker gets alerted on bullish flip. **SELL: no score gate** — gated only on open position (`ibkr_positions WHERE shares > 0`); `SELL_MAX_SCORE=55` was added 2026-07-15 and removed 2026-08-02 — blocked 100% of exits since all positions score ≥ 70. Score pulled for message enrichment (BUY) only. **`_try_claim_dedup()` performs SELECT+INSERT atomically in a single DB connection** — eliminates the race window of the old split check+write. `_record_dedup()` removed (was dead code). **SELL position gate** — before firing a SELL alert, checks `ibkr_positions WHERE ticker = ? AND shares > 0`; suppresses SELL (no Telegram, no order) when no open position exists. |
 | `forward_signals.py` | Records every fired alert with entry price + data quality check; `record_fill()` updates `fill_price`/`fill_source` from IBKR callback — **guards against CANCELLED orders** (cross-checks `order_log.status` before writing, skips if CANCELLED to prevent bracket-order race from corrupting win-rate); daily 18:00 job fills `price_after_{7,14,30}d`; weekly Friday 20:00 Telegram digest with win-rate metrics |
 | `earnings_sentiment.py` | Tier 1 = Finnhub EPS surprise history (free), Tier 2 = LLM transcript analysis (paid). Score 0–5 added to `stock_scorer.py` bonus band. **EDGAR fallback**: when Finnhub returns empty, uses `edgar_fcf.get_eps_yoy_growth()` (YoY EPS% proxy, `source='edgar_eps_yoy'`) instead of returning score=0. |
 | `hysteresis.py` | Central helper `passes_hysteresis(current, in_set, entry, exit)` + threshold constants (composite, SI, liquidity, watchlist score) |
@@ -66,7 +66,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `run_tunnel_watchdog.py` | Watchdog for `run_dashboard_tunnel.py` — auto-restarts on crash or clean exit, sends Telegram on startup/restart/crash. Registered as `FinancialAgentTunnelWatchdog` Windows Task. Stop with `stop_tunnel.flag` sentinel |
 | `supertrend.py` | Supertrend calculation (ATR-based, Wilder EMA) — used by `ibkr_worker.py` and `price_alert_monitor.py` |
 | `market_regime.py` | BULL / CAUTION / BEAR regime based on VIX thresholds (20/28) + SPY vs SMA200; used by `execution_engine.py` for position sizing and stop adjustments. **`_SPY_HISTORY = "1y"`** (~252 trading days) — computes actual SMA200, not SMA126 (was `"6mo"`, now fixed). |
-| `execution_engine.py` | Trade decision engine (Layers 0–6): daily loss limit (Layer 0), hard veto, confluence check, position sizing scaled by market regime, time-of-day flag, sector exposure guard. `evaluate_trade()` accepts optional `signal_type` param — SELL with no open position is vetoed (Layer -1). **`check_hard_vetos()` accepts `signal_type`** — BEAR regime veto applies to BUY only (`signal_type != "SELL"`), allowing exits in BEAR market. |
+| `execution_engine.py` | Trade decision engine (Layers -1.5 through 6): daily loss limit (Layer 0), hard veto, confluence check, position sizing scaled by market regime, time-of-day flag, sector exposure guard. `evaluate_trade()` accepts optional `signal_type` param — SELL with no open position is vetoed (Layer -1). **Layer -1.5: already-long BUY veto** (added 2026-08-03) — checks `ibkr_positions WHERE shares > 0` before Layer 0; BUY vetoed if ticker already held long (no pyramiding). Short positions (shares < 0) NOT vetoed — BUY to cover a short is legitimate. Fail-open on DB error. **`check_hard_vetos()` accepts `signal_type`** — BEAR regime veto applies to BUY only (`signal_type != "SELL"`), allowing exits in BEAR market. |
 | `momentum_scanner.py` | 5-factor momentum score: Price ROC, Relative Strength vs SPY, MA Stack, RSI zone, Volume Surge; batch yfinance download; runs every 30 min as daemon thread |
 | `long_setup_scanner.py` | 5-factor long setup scanner (RSI zone, MACD crossover, Volume surge, MA alignment, Momentum); daily 09:30; auto-adds top candidates to watchlist |
 | `opportunity_tracker.py` | Records every BUY signal as opportunity with T1/stop targets; daily 18:00 fills outcomes; weekly Friday 20:00 Telegram digest with win-rate |
@@ -115,7 +115,8 @@ Returns True if the value should be considered "in the set" given prior membersh
 | Threshold | Entry | Exit | Source |
 |---|---|---|---|
 | Auto-watchlist score | 70 | 40 | + min-hold 3 days; + 7-day re-entry cooldown unless ≥ 75 |
-| Composite-for-BUY | 60 | — | **gate intentionally removed 2026-06-03** — Supertrend flip is sole trigger (symmetric BUY/SELL) |
+| Composite-for-BUY | 60 | — | **gate intentionally removed 2026-06-03** — Supertrend flip is sole trigger for BUY |
+| Composite-for-SELL | — | — | **gate removed 2026-08-02** — SELL gated only on open position (ibkr_positions WHERE shares > 0); SELL_MAX_SCORE=55 was reverted because it blocked 100% of exits (all positions score ≥ 70) |
 | Squeeze SI% | 15 | 10 | filter for squeeze pool |
 | Catalyst SI% | 10 | 5 | filter for catalyst pool |
 | Liquidity ADV ($) | $5M | $3M | monitoring_queue gate |
@@ -755,6 +756,109 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 - [x] **SELL gate in signal_combiner** — `src/signal_combiner.py`: SELL signal suppressed when `ibkr_positions` has no row with `shares > 0` for the ticker. Prevents spurious SELL alerts + phantom orders when Supertrend flips bearish but position was already closed. Complementary to the existing Layer -1 veto in `execution_engine` (defense-in-depth at the signal layer before order submission).
 - [x] **`record_daily_pnl()` 09:30 ET gate** — `src/position_tracker.py`: skips before 09:30 ET to avoid writing a $0 / $0 row from pre-market account summary (IBKR returns 0 net liquidation before market open). Changed `INSERT OR IGNORE` → `INSERT OR REPLACE` so a corrected re-run overwrites the early row rather than silently discarding it.
 - [x] **`_update_order_log()` race condition** — `src/ibkr_worker.py`: FILLED update uses `WHERE status NOT IN ('FILLED','ERROR')` — prevents CANCELLED child leg from overwriting a parent FILLED status. CANCELLED update uses `WHERE status = 'SUBMITTED'` — only demotes rows that are still pending; FILLED rows are never touched. Previously used a single `WHERE ibkr_order_id = ?` with no status guard, allowing bracket-order async callbacks to corrupt terminal statuses.
+
+### Exit Strategy Implementation — 2026-08-02
+
+Root cause analysis: forward-signal data showed BUY win rate 55.8% but avg win +5.03% vs avg loss −6.38% → near-zero expectancy. All 42 open positions had 0 active bracket legs (TIF=DAY expired every night). SELL_MAX_SCORE=55 gate removed (added 2026-07-15) — it blocked 100% of exits since all positions score ≥ 70.
+
+- [x] **TIF=DAY → GTC** — `src/ibkr_realtime.py`: bracket order legs (parent LMT, STP stop, LMT target) changed from `tif="DAY"` to `tif="GTC"`. Standalone SELL limit order (line 195) remains `DAY` — appropriate for intraday exit signals. Prevents stops/targets from expiring at each market close.
+- [x] **`modify_stop_order(ticker, new_stop)`** — new method on `IBKRConnection` in `src/ibkr_realtime.py`. Finds the active STP SELL order for a ticker in `ib.openTrades()` and updates `auxPrice` via `placeOrder()` (IBKR's modify-in-place mechanism).
+- [x] **`get_open_orders()` extended** — now returns `lmt_price` and `aux_price` fields; `aux_price` is the stop trigger price for STP orders.
+- [x] **`_atr(df, period)` helper** — `src/ibkr_worker.py`: Wilder's ATR using `ewm(alpha=1/period)` — matches `supertrend.py` convention.
+- [x] **`_update_trailing_stops(conn)`** — `src/ibkr_worker.py`: every 15 min, for each active STP SELL order, computes `price - 2.5 * ATR_1h` and raises the stop if result is higher than current stop. Never lowers. Sends Telegram on each move. Called at end of `run_once()`.
+- [x] **`_trading_days_since(date_str)`** — counts Mon-Fri trading days between entry date and today; used by time stop.
+- [x] **`_check_time_stops(conn)`** — `src/ibkr_worker.py`: every 4 hours, checks positions held > 15 trading days with abs(pnl_pct) < 3% (zombies). Submits SELL at market-price limit (0.1% below last), logs to `order_log` with note "TIME STOP: Nd zombie", sends Telegram.
+- [x] **`exit_tier` column** — `src/database.py` migration adds `exit_tier INTEGER DEFAULT 0` to `ibkr_positions`. Values: 0=no partial exit, 1=T1 taken (40% sold), 2=T2 taken (30% more sold).
+- [x] **`_check_tiered_exits(conn)`** — `src/ibkr_worker.py`: T1 at +7%: sell 40%, move stop to breakeven; T2 at +14%: sell 50% of remaining; remainder trails via Supertrend + ATR trailing stop. Sends Telegram on each tier.
+- [x] **`_check_score_deterioration(conn)`** — `src/ibkr_worker.py`: if score drops ≥15pts from entry signal score AND current score <55 AND pnl >-3%, submits full SELL. 24h dedup via `watchlist_alerts` (`alert_type='score_deterioration_exit'`).
+- [x] **`run_once()` wiring** — all 4 exit functions called at end of each 5-min cycle, each in separate `try/except` so a failure in one never blocks others.
+- [x] **SELL gate removed from docstring** — `src/signal_combiner.py` docstrings updated to reflect current behavior: "SELL: no score gate — gated only on open position."
+- [x] **Scheduled task updated** — `sell-gate-evaluation-2026-08-05` prompt rewritten to evaluate exit strategy activation instead of the removed SELL gate.
+
+**Test baseline after sprint:** 348 passed, 5 pre-existing failures (test_pnl_digest_fixes.py — unrelated to this sprint).
+
+### Anti-Pyramiding & Alert Flood Hardening — 2026-08-03
+
+Root cause: live trading produced 9 `combined_buy` signals for different tickers within 4 minutes (multi-ticker simultaneous Supertrend flip), generating 27 Telegram messages (3 per trade: signal + SUBMITTED duplicate + fill). Additionally, existing long positions were receiving new BUY orders on subsequent Supertrend flips — pure pyramiding with no portfolio-level cap.
+
+- [x] **Layer -1.5: already-long BUY veto** — `src/execution_engine.py`: `evaluate_trade()` now checks `ibkr_positions WHERE ticker = ? AND shares > 0` before Layer 0 (daily loss limit). BUY vetoed with "L-1.5: Already long {ticker} ({shares}sh) — no pyramiding" if position exists. Short positions (shares < 0) are NOT vetoed — BUY to cover a short is legitimate. Fail-open on DB error (warning logged, trade allowed) so DB unavailability never permanently blocks all BUYs. Root cause confirmed: CALM 4×, PNW 3×, FUBO 2×, NTST 2×, ONB 2× duplicate BUY orders in `order_log`.
+- [x] **`PER_CYCLE_BUY_CAP = 3`** — `src/ibkr_worker.py`: max 3 `combined_buy` signals per `run_once()` cycle. Counter increments after `fired += 1`; excess signals call `release_dedup()` (rolls back the daily cap claim) and skip via `continue` — ticker retries on the next 5-min cycle. Prevents the "9 signals in 4 minutes" flood pattern while still allowing recovery next cycle.
+- [x] **SUBMITTED Telegram condensed** — `src/ibkr_worker.py`: `result["message"]` from `order_manager._format_submitted_message()` replaced with a 1-liner `✅ {ticker} {shares}sh @ ${price:.2f} | #{order_id}`. The signal message already carries entry/stop/target/cost basis — the SUBMITTED echo was duplicating everything. VETOED orders still send their full veto reason.
+
+**Test baseline:** 348 passed, 5 pre-existing failures — identical to Exit Strategy sprint baseline.
+
+### Pre-Live Safety Hardening — 2026-08-04
+
+3-agent comprehensive audit before switching to live IBKR trading. 10 fixes across order sizing, signal gates, crash safety, and DB integrity.
+
+- [x] **Portfolio value passed to sizing** — `src/order_manager.py`: `submit()` now fetches `self.position_tracker.get_portfolio_value()` and passes it to `evaluate_trade()`. Previously hardcoded at `$100,000` — position sizes were wrong for any other account size. Falls back to `$100k` if tracker unavailable.
+- [x] **SELL closes full position** — `src/order_manager.py`: `shares = held` (was `shares = min(engine_sizing, held)`). A Supertrend bearish flip means trend reversed — partial exit (risk-based sizing ≈10% of position) left 90% exposed with 24h dedup blocking re-entry. Now always closes the entire held position.
+- [x] **`get_portfolio_value()` zero fallthrough** — `src/position_tracker.py`: IBKR returns `net_liquidation=0` pre-market and briefly after reconnect with no exception. Now treats `value ≤ 0` as a miss and falls through to DB fallback (yesterday's NLV) — prevents all trades being vetoed by Layer 0 during pre-market signal window.
+- [x] **daily_pnl paper→live transition guard** — `src/position_tracker.py`: when fallback delta `> 50% of current NLV`, it is discarded with a WARNING (paper→live NLV jump, e.g. +$143k, disabled Layer 0 entirely on first live day). Live day_pnl now defaults to 0 until IBKR populates it.
+- [x] **BUY signal gate tightened to 09:30 ET** — `src/ibkr_worker.py`: `_is_signal_hours(signal_type)` now takes the signal type. BUY entries require 09:30–20:00 ET (regular session open). SELL exits remain 04:00–20:00 ET so exits are never suppressed in pre-market. Pre-market BUY orders had stale LMT prices from the prior session close and thin liquidity.
+- [x] **`_check_time_stops()` dedup** — `src/ibkr_worker.py`: before each zombie SELL, checks `order_log WHERE status='SUBMITTED' AND action='SELL'`. Prevents submitting a second full-position SELL every 4 hours (could create a short in live if IBKR accepts both).
+- [x] **`_check_time_stops()` order-before-place** — `src/ibkr_worker.py`: `order_log` INSERT with `ibkr_order_id=NULL` written BEFORE `place_limit_order()`. On crash between place and write, the order is now trackable and reconcilable. After successful place, row is updated with real `order_id`.
+- [x] **`_check_score_deterioration()` order-before-place** — `src/ibkr_worker.py`: same pattern — `order_log` INSERT before IBKR call, then UPDATE with real order_id.
+- [x] **T1/T2 tiered exits dedup** — `src/ibkr_worker.py`: before firing T1 or T2, checks for any SUBMITTED partial SELL in `order_log`. If T1 SELL is pending, T2 is skipped for this cycle — prevents computing T2 on a stale (pre-T1-fill) share count that would result in T1+T2 = 90% of original (potential short).
+- [x] **T1/T2 order-before-place + pre-update exit_tier** — `src/ibkr_worker.py`: `exit_tier` column and `order_log` row both written BEFORE `place_limit_order()`. Crash between place and DB write no longer leaves either an un-tracked order or a tier that re-fires.
+
+**Remaining known issues (not blocking live, mitigated by bracket STP):**
+- `modify_stop_order()` matches first STP SELL by ticker — ambiguous if multiple STPs exist. Requires `stop_order_id` column in `order_log` to fix fully (schema change).
+- `record_fill()` not idempotent on duplicate fill events — rare but can corrupt an older forward_signals row.
+- Sub-hour worker restart can replay `bars_ago==1` flip before dedup is established — narrow window, Layer -1.5 partially mitigates.
+- Bracket stop-leg rejection from IBKR is async (ib_async limitation) — rollback code is dead in practice.
+
+**Test baseline:** 348 passed, 5 pre-existing failures.
+
+### Live-Readiness Audit — 2026-08-05
+
+Pre-live forensic audit of paper trading. **Headline finding: the `combined_buy` signal has no
+statistically detectable alpha.** 145 matured BUY signals benchmarked against SPY over identical
+holding windows: 7d excess **−0.20%** (t=−0.26), 14d **+0.40%** (t=+0.41), 30d **+2.14%** (t=+1.15).
+No horizon reaches |t| > 2; beat-SPY rate 49.7% / 55.6% / 54.4%. The reported 55.9% win rate was
+never benchmarked — it was measuring market beta. `run_forward_digest` still reports raw win rate
+only; that is the metric that hid this for three months.
+
+Five execution defects found and fixed. All were silent — none produced an error anyone saw.
+
+- [x] **Startup reconciliation destroyed fill state** — `_reconcile_orders_on_startup()` marked every
+  SUBMITTED row missing from IBKR's open orders as ERROR, without checking whether it had filled.
+  The watchdog restarts the worker on every clean exit, so this ran constantly and was the main
+  producer of 30 bogus ERROR rows (14 for tickers still held). Now looks the order up in the broker's
+  execution history and marks it FILLED; anything unexplained is LEFT SUBMITTED. Never destroys state.
+- [x] **`ib.fills()` is session-scoped** — `IBKRConnection.get_executions()` added in
+  `src/ibkr_realtime.py`, using `reqExecutions()` (broker-side, survives reconnects) merged with
+  in-session `fills()`. `_periodic_fill_sweep()` now uses it. A missing order is no longer ERROR by
+  default: `FILL_SWEEP_UNKNOWN_GRACE_SECS = 24h` grace, and if execution data is unavailable entirely
+  the status is left untouched. A stuck SUBMITTED is cheaper than a false ERROR that erases a fill.
+- [x] **Time stop measured from the LAST fill** — `_check_time_stops()` used
+  `ORDER BY created_at DESC`, so every pyramid add restarted the clock and no scaled position could
+  ever age into a time stop. CALM (first buy 2026-06-26, last add 2026-07-22) read as 9 trading days
+  against the 15-day threshold. Now `ASC`, plus a fallback to the earliest BUY of any status for
+  positions whose FILLED rows were corrupted (RRR/TRS/LCII had none and were invisible).
+- [x] **Exit layer was gated behind the entry queue** — `run_once()` did `if not queue: return 0`
+  before the exit block, making trailing stops, time stops, tiered exits and the fill sweep
+  conditional on there being something new to buy. A quiet scan silently disarmed every stop.
+- [x] **Long-only invariant enforced** — `OrderManager._pending_sell_shares()` subtracts in-flight
+  SELLs: `sellable = held − pending`, veto at ≤ 0. `ibkr_worker._has_pending_sell()` added to tiered
+  exits (previously matched only `notes LIKE 'T% partial exit%'`) and to score-deterioration exits
+  (previously had no in-flight check at all while submitting a FULL-position SELL). Prevents two exit
+  paths from each sizing against the same stale `ibkr_positions` share count.
+
+**On the apparent oversell:** `order_log` showed KSS 287 bought / 309 sold, GTY 143/146, OMC 61/63,
+which reads as a naked short. It is NOT conclusive — the corrupted ERROR rows understate purchases in
+the same accounting (KSS has 559 shares of ERROR buys). The share ledger is unreliable in both
+directions until fill tracking has been correct for a full cycle. The guards above are justified as
+prevention, not as proof a short occurred.
+
+**Order-log repair:** only 7 of the 30 bogus ERROR rows can be proven to have filled (share
+reconciliation closes exactly with them and not without: CBT ×2, FUBO, LCII, RRR ×2, TRS). The other
+23 involve positions since closed and are unreconstructable — left as ERROR rather than guessed. Real
+fill prices are unrecoverable (IBKR serves ~24h of executions), so repair sets status only and leaves
+`fill_price` NULL rather than substituting limit prices.
+
+Tests: `tests/test_exit_and_longonly_fixes.py` — 13 tests. Baseline **361 passed, 5 pre-existing
+failures** (`test_pnl_digest_fixes.py`, unrelated).
 
 ### DCF & Data Quality Hardening — 2026-06-26
 

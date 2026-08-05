@@ -149,6 +149,12 @@ def _migrate(conn: sqlite3.Connection):
         )
     """)
 
+    # ibkr_positions — exit_tier tracks partial profit-taking state (0=none, 1=T1 done, 2=T2 done)
+    ip_cols = {row[1] for row in conn.execute("PRAGMA table_info(ibkr_positions)")}
+    if "exit_tier" not in ip_cols:
+        conn.execute("ALTER TABLE ibkr_positions ADD COLUMN exit_tier INTEGER DEFAULT 0")
+        logger.info("Migrated ibkr_positions: added column exit_tier")
+
 
 
 _PERSISTENT_PRAGMAS_DONE = False

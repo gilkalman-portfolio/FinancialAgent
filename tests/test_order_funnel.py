@@ -32,6 +32,7 @@ def _in_memory_db(monkeypatch, tmp_path):
 
     monkeypatch.setattr("src.database.get_connection", _get_conn)
     monkeypatch.setattr("src.order_manager.get_connection", _get_conn)
+    monkeypatch.setattr("src.execution_engine.get_connection", _get_conn)
     # Patch ibkr_worker too so _update_order_log uses the test DB
     try:
         import src.ibkr_worker  # noqa: F401 — ensure module is loaded before patching
@@ -361,18 +362,18 @@ class TestSellMessage:
                 result = mgr.submit(sell_alert)
 
         assert result["status"] == "SUBMITTED"
-        # Plain limit order, not a bracket
+        # SELL always closes the full position (held=100), not engine sizing (50)
         mock_ibkr.place_limit_order.assert_called_once_with(
-            ticker="TEST", action="SELL", shares=50, limit_price=50.0,
+            ticker="TEST", action="SELL", shares=100, limit_price=50.0,
         )
         mock_ibkr.place_bracket_order.assert_not_called()
         msg = result["message"]
         assert "FinancialAgent — SELL TEST" in msg
         assert "Exit: $50.00" in msg
-        assert "Shares: 50" in msg
-        assert "+$250.00" in msg
+        assert "Shares: 100" in msg
+        assert "+$500.00" in msg  # (50-45) * 100 shares
         assert "avg cost $45.00" in msg
-        assert "50 shares remaining" in msg
+        assert "0 shares remaining" in msg
         assert "Order ID: 12345" in msg
 
 

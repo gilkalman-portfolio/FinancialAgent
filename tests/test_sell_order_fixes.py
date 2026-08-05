@@ -37,6 +37,7 @@ def _in_memory_db(monkeypatch, tmp_path):
 
     monkeypatch.setattr("src.database.get_connection", _get_conn)
     monkeypatch.setattr("src.order_manager.get_connection", _get_conn)
+    monkeypatch.setattr("src.execution_engine.get_connection", _get_conn)
 
     conn = _get_conn()
     conn.executescript("""
@@ -171,9 +172,10 @@ class TestSellPlainOrder:
         assert result["action"] == "SELL"
         assert result["order_id"] == 67890
 
-        # Plain limit order path, NOT bracket
+        # SELL always closes the full held position (100), not engine sizing (40).
+        # Plain limit order path, NOT bracket.
         mock_ibkr.place_limit_order.assert_called_once_with(
-            ticker="TEST", action="SELL", shares=40, limit_price=50.0,
+            ticker="TEST", action="SELL", shares=100, limit_price=50.0,
         )
         mock_ibkr.place_bracket_order.assert_not_called()
 
@@ -211,11 +213,13 @@ class TestSellSharesCapped:
             ticker="TEST", action="SELL", shares=30, limit_price=50.0,
         )
 
-    def test_sell_does_not_upsize_when_held_exceeds_sizing(self, mock_ibkr, _in_memory_db):
+    def test_sell_closes_full_position_regardless_of_engine_sizing(self, mock_ibkr, _in_memory_db):
         import src.execution_engine as engine
         from src.order_manager import OrderManager
 
-        # Held = 1000, sizing wants 40 → keep 40 (min of the two)
+        # Held = 1000, sizing wants 40. SELL must close the full position (1000),
+        # not just 40 — a Supertrend flip means the trend reversed; partial exit
+        # leaves 96% of the position exposed with a 24h dedup blocking re-entry.
         _insert_position(_in_memory_db, "TEST", shares=1000, avg_cost=45.0)
 
         with patch.object(engine, "evaluate_trade", return_value=_decision(shares=40)):
@@ -223,7 +227,7 @@ class TestSellSharesCapped:
                 mgr = OrderManager(mock_ibkr, engine, paper_mode=True)
                 result = mgr.submit(_sell_alert(price=50.0))
 
-        assert result["shares"] == 40
+        assert result["shares"] == 1000  # full close, not engine's 40
 
     def test_sell_vetoed_when_no_shares_held(self, mock_ibkr, _in_memory_db):
         import src.execution_engine as engine

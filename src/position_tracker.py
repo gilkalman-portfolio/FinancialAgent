@@ -29,6 +29,10 @@ class PositionTracker:
             logger.error(f"[position_tracker] get_positions failed: {e}")
             return
 
+        # Skip short/phantom positions — we never intentionally short;
+        # negative shares are paper-account artifacts from pre-position-gate era.
+        positions = {t: d for t, d in positions.items() if d.get("shares", 0) > 0}
+
         now = datetime.now().isoformat()
         with get_connection() as conn:
             for ticker, data in positions.items():
@@ -69,9 +73,17 @@ class PositionTracker:
         return float(row["market_value"]) if row else 0.0
 
     def get_portfolio_value(self) -> float:
-        """Return net_liquidation — live from IBKR, fallback to DB."""
+        """Return net_liquidation — live from IBKR, fallback to DB.
+
+        IBKR returns net_liquidation=0 pre-market or briefly after reconnect
+        (the tag is absent from accountSummary until the session initialises).
+        Treat 0 the same as an exception — fall through to the DB fallback so
+        the execution engine never vetoes all trades due to a stale 0.0 value.
+        """
         try:
-            return self.ibkr.get_account_summary()["net_liquidation"]
+            value = self.ibkr.get_account_summary()["net_liquidation"]
+            if value > 0:
+                return value
         except Exception:
             pass
         try:
@@ -155,8 +167,18 @@ class PositionTracker:
         if not day_pnl:
             fallback = self._compute_fallback_day_pnl(today, net_liq)
             if fallback is not None:
-                day_pnl = fallback
-                source = "fallback_delta"
+                # Sanity check: a very large fallback delta means the prior DB
+                # row is from a different account (paper → live transition).
+                # A delta > 50% of current NLV is almost certainly wrong.
+                if net_liq > 0 and abs(fallback) > net_liq * 0.50:
+                    logger.warning(
+                        f"[position_tracker] fallback day_pnl={fallback:.0f} "
+                        f"is >50% of NLV={net_liq:.0f} — prior DB row may be from "
+                        f"a different account (paper→live transition?). Using 0."
+                    )
+                else:
+                    day_pnl = fallback
+                    source = "fallback_delta"
 
         now_iso = datetime.now().isoformat()
         with get_connection() as conn:

@@ -172,9 +172,21 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"[order_manager] could not fetch portfolio_tickers: {e}")
 
+        # Fetch actual account value so sizing reflects the real portfolio, not
+        # the hardcoded $100k fallback in evaluate_trade().
+        portfolio_value = 100_000.0
+        if self.position_tracker is not None:
+            try:
+                v = self.position_tracker.get_portfolio_value()
+                if v > 0:
+                    portfolio_value = v
+            except Exception as _pv_e:
+                logger.warning(f"[order_manager] get_portfolio_value failed: {_pv_e}")
+
         veto_reasons: list[str] = []
         decision = self.engine.evaluate_trade(
             ticker, score_data, signal_type=action,
+            portfolio_value=portfolio_value,
             portfolio_tickers=portfolio_tickers, reasons_out=veto_reasons,
         )
 
@@ -210,8 +222,9 @@ class OrderManager:
         stop_price = sizing["stop_price"]
         target_price = sizing["target_price"]
 
-        # SELL closes a long: cap shares to what's actually held so we never
-        # over-sell into a short. Layer -1 already vetoes when held == 0.
+        # SELL closes the full long position. Risk-based sizing (shares from
+        # evaluate_trade) is a BUY-entry concept — for exits we always close
+        # the entire held position. Layer -1 already vetoes when held == 0.
         if action == "SELL":
             held = self._held_shares(ticker)
             if held <= 0:
@@ -223,7 +236,34 @@ class OrderManager:
                 )
                 logger.info(f"[order_manager] {ticker} VETOED: {reason}")
                 return {"status": "VETOED", "reason": reason, "ticker": ticker}
-            shares = min(shares, held)
+
+            # LONG-ONLY INVARIANT. ibkr_positions is up to 5 min stale and does not
+            # know about SELLs already working, so "sell everything held" can stack:
+            # a signal SELL on top of a pending time-stop/tier SELL, or a bracket
+            # child leg. Observed in paper — KSS sold 309 shares against 287 bought,
+            # GTY 146/143, OMC 63/61. On a live margin account that opens a short.
+            # Never send more than (held - already working).
+            pending = self._pending_sell_shares(ticker)
+            sellable = held - pending
+            if sellable <= 0:
+                reason = (
+                    f"Long-only guard: {pending}sh SELL already working vs {held}sh held "
+                    f"— refusing to sell more (would short)"
+                )
+                _write_order_log(
+                    ticker=ticker, action=action, shares=0,
+                    entry_price=price, stop_price=0, target_price=0,
+                    status="VETOED", notes=reason,
+                )
+                logger.warning(f"[order_manager] {ticker} VETOED: {reason}")
+                return {"status": "VETOED", "reason": reason, "ticker": ticker}
+
+            if pending:
+                logger.info(
+                    f"[order_manager] {ticker}: {pending}sh SELL already working — "
+                    f"reducing this exit from {held}sh to {sellable}sh"
+                )
+            shares = sellable  # close what is left, never more
 
         try:
             if action == "SELL":
@@ -311,6 +351,28 @@ class OrderManager:
                 return max(0, int(float(row["shares"])))
         except Exception as e:
             logger.warning(f"[order_manager] _held_shares({ticker}) failed: {e}")
+        return 0
+
+    def _pending_sell_shares(self, ticker: str) -> int:
+        """Shares already committed to in-flight SELL orders for this ticker.
+
+        Counts SUBMITTED rows in order_log — signal exits, time stops, tier
+        exits and score-deterioration exits all write one before calling IBKR,
+        so this covers every path that can reduce the position. Returns 0 on
+        error, which degrades to the previous (unclamped) behaviour rather than
+        blocking a legitimate exit.
+        """
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(shares), 0) AS n FROM order_log "
+                    "WHERE ticker = ? AND action = 'SELL' AND status = 'SUBMITTED'",
+                    (ticker,),
+                ).fetchone()
+            if row and row["n"] is not None:
+                return max(0, int(row["n"]))
+        except Exception as e:
+            logger.warning(f"[order_manager] _pending_sell_shares({ticker}) failed: {e}")
         return 0
 
     def _build_score_data(
