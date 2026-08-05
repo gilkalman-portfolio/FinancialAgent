@@ -233,7 +233,7 @@ class IBKRConnection:
             })
         return result
 
-    def get_executions(self, lookback_days: int = 2) -> dict[int, float]:
+    def get_executions(self, lookback_days: int = 2, timeout: float = 15.0) -> dict[int, float]:
         """Return {ibkr_order_id: avg_fill_price} for recent executions.
 
         ``ib.fills()`` only holds executions received during the CURRENT API
@@ -247,17 +247,33 @@ class IBKRConnection:
         lookback_days is a best-effort hint, not a guarantee. Merges the
         in-session ``fills()`` on top since those are always authoritative.
         """
-        from ib_async import ExecutionFilter
+        import asyncio
+
+        from ib_async import ExecutionFilter, util
 
         result: dict[int, float] = {}
         try:
             cutoff = datetime.now() - timedelta(days=lookback_days)
             efilter = ExecutionFilter(time=cutoff.strftime("%Y%m%d-%H:%M:%S"))
-            for fill in self.ib.reqExecutions(efilter):
+            # MUST have a timeout. IB.reqExecutions() has none, and after a paper
+            # account reset the Gateway accepts the connection but answers data
+            # requests with "Positions info is not available yet" (warning 2151)
+            # and never replies. On 2026-08-05 that hung the worker for 25 minutes
+            # inside startup reconciliation — connected, silent, and doing nothing.
+            # A missed execution sweep is recoverable; a hung worker is not.
+            fills = util.run(
+                asyncio.wait_for(self.ib.reqExecutionsAsync(efilter), timeout=timeout)
+            )
+            for fill in fills:
                 try:
                     result[fill.execution.orderId] = float(fill.execution.avgPrice)
                 except Exception:
                     continue
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[ibkr] reqExecutions timed out after {timeout}s — account data "
+                f"may not be ready (post-reset/reconnect). Using session fills only."
+            )
         except Exception as e:
             logger.warning(f"[ibkr] reqExecutions failed: {e} — falling back to session fills")
 
