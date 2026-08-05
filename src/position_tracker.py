@@ -22,6 +22,12 @@ SHORT_ALARM_COOLDOWN_HOURS = 6
 # is not conservative — it is wrong in an unbounded direction.
 PORTFOLIO_VALUE_MAX_AGE_DAYS = 5
 
+# Bounds on the inferred daily P&L, as a fraction of net liquidation. Asymmetric
+# by design: a big "gain" is nearly always an account event, while a big loss can
+# be a real crash and discarding it would disable the Layer 0 daily-loss veto.
+DAY_PNL_MAX_GAIN_PCT = 0.10
+DAY_PNL_MAX_LOSS_PCT = 0.25
+
 
 class PositionTracker:
     def __init__(self, ibkr_client, db_module=None):
@@ -298,21 +304,27 @@ class PositionTracker:
                 # The old test (>50% of NLV) was tied to NLV rather than to
                 # positions, so it passed a -17% day on a 21%-invested book and
                 # would pass tomorrow's paper-reset rebound just as happily.
-                # Ceiling is the larger of two bounds so neither can produce a
-                # false positive on its own:
-                #   1.5x gross exposure — the physical limit, but reads 0 when the
-                #     positions table is empty or stale, which would reject real P&L
-                #   10% of NLV — a floor for that case; a diversified long-only book
-                #     moving more than a tenth of the whole account in one session
-                #     is an account event, not a market day
-                gross = self._gross_exposure()
-                ceiling = max(gross * 1.5, net_liq * 0.10)
+                # The bound is a fraction of NLV, and it is ASYMMETRIC on purpose.
+                #
+                # A large positive jump is almost always an account event — a
+                # reset, a deposit, a different account — so it is held to a tight
+                # limit. A large negative move can genuinely be a crash, and
+                # under-recording a real loss would silently disable the Layer 0
+                # daily-loss veto, so losses get more room before being discarded.
+                #
+                # An earlier version used 1.5x gross exposure, which sounds
+                # physical and is useless: with $2.88M gross against $1.35M NLV it
+                # permitted a $4.3M "day", and duly recorded a fabricated +$496k
+                # gain on 2026-08-05 against a stale prior NLV.
+                limit_pct = (DAY_PNL_MAX_GAIN_PCT if fallback > 0
+                             else DAY_PNL_MAX_LOSS_PCT)
+                ceiling = net_liq * limit_pct
                 if ceiling > 0 and abs(fallback) > ceiling:
                     logger.warning(
                         f"[position_tracker] fallback day_pnl={fallback:,.0f} exceeds "
-                        f"ceiling ${ceiling:,.0f} (gross exposure ${gross:,.0f}, "
-                        f"NLV ${net_liq:,.0f}) — this is an account event "
-                        f"(reset/transfer/account switch), not a market move. Using 0."
+                        f"{limit_pct:.0%} of NLV ${net_liq:,.0f} (ceiling ${ceiling:,.0f}) "
+                        f"— this is an account event (reset/transfer/account switch), "
+                        f"not a market move. Using 0."
                     )
                 else:
                     day_pnl = fallback

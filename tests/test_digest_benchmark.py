@@ -164,6 +164,46 @@ class TestAccountEventGuard:
         assert row["day_pnl"] == 0.0, \
             f"a +$146k reset rebound must not book as P&L, got {row['day_pnl']}"
 
+    def test_fabricated_gain_against_a_stale_prior_nlv_is_rejected(self, _db):
+        """Observed live 2026-08-05: prior stored NLV 853,301 vs actual 1,349,564
+        produced a recorded +$496k 'profit'. 37% of NLV in a day is not a market
+        move."""
+        from src import position_tracker
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        self._prior(_db, yesterday, 853_301)
+        self._positions(_db, gross=2_884_074)     # the huge short book
+
+        t = self._tracker(nlv=1_349_564)
+        with patch.object(position_tracker, "datetime") as dt:
+            dt.now.return_value = datetime.now().replace(hour=20, minute=0)
+            dt.side_effect = datetime
+            t.record_daily_pnl()
+
+        with _db() as c:
+            row = c.execute("SELECT day_pnl FROM daily_pnl WHERE date != ?",
+                            (yesterday,)).fetchone()
+        assert row["day_pnl"] == 0.0, \
+            f"a +$496k jump must not be recorded as P&L, got {row['day_pnl']}"
+
+    def test_large_real_loss_is_still_recorded(self, _db):
+        """Losses get more room: discarding a real crash would zero day_pnl and
+        silently disable the Layer 0 veto."""
+        from src import position_tracker
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        self._prior(_db, yesterday, 1_000_000)
+        self._positions(_db, gross=900_000)
+
+        t = self._tracker(nlv=820_000)            # -18%: brutal, but a real day
+        with patch.object(position_tracker, "datetime") as dt:
+            dt.now.return_value = datetime.now().replace(hour=20, minute=0)
+            dt.side_effect = datetime
+            t.record_daily_pnl()
+
+        with _db() as c:
+            row = c.execute("SELECT day_pnl FROM daily_pnl WHERE date != ?",
+                            (yesterday,)).fetchone()
+        assert row["day_pnl"] == pytest.approx(-180_000.0)
+
     def test_real_move_within_gross_exposure_is_kept(self, _db):
         from src import position_tracker
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
