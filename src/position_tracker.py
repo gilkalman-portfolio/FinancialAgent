@@ -256,14 +256,31 @@ class PositionTracker:
         if not day_pnl:
             fallback = self._compute_fallback_day_pnl(today, net_liq)
             if fallback is not None:
-                # Sanity check: a very large fallback delta means the prior DB
-                # row is from a different account (paper → live transition).
-                # A delta > 50% of current NLV is almost certainly wrong.
-                if net_liq > 0 and abs(fallback) > net_liq * 0.50:
+                # The fallback is an NLV delta, so ANY change in the account that
+                # is not a market move — a paper reset, a deposit, a withdrawal,
+                # a transition to a different account — lands in it as fake P&L.
+                #
+                # The bound is physical: a day's mark-to-market P&L cannot exceed
+                # the value of what you actually hold. Gross exposure is the
+                # honest ceiling; 1.5x allows for intraday range beyond the marks.
+                # The old test (>50% of NLV) was tied to NLV rather than to
+                # positions, so it passed a -17% day on a 21%-invested book and
+                # would pass tomorrow's paper-reset rebound just as happily.
+                # Ceiling is the larger of two bounds so neither can produce a
+                # false positive on its own:
+                #   1.5x gross exposure — the physical limit, but reads 0 when the
+                #     positions table is empty or stale, which would reject real P&L
+                #   10% of NLV — a floor for that case; a diversified long-only book
+                #     moving more than a tenth of the whole account in one session
+                #     is an account event, not a market day
+                gross = self._gross_exposure()
+                ceiling = max(gross * 1.5, net_liq * 0.10)
+                if ceiling > 0 and abs(fallback) > ceiling:
                     logger.warning(
-                        f"[position_tracker] fallback day_pnl={fallback:.0f} "
-                        f"is >50% of NLV={net_liq:.0f} — prior DB row may be from "
-                        f"a different account (paper→live transition?). Using 0."
+                        f"[position_tracker] fallback day_pnl={fallback:,.0f} exceeds "
+                        f"ceiling ${ceiling:,.0f} (gross exposure ${gross:,.0f}, "
+                        f"NLV ${net_liq:,.0f}) — this is an account event "
+                        f"(reset/transfer/account switch), not a market move. Using 0."
                     )
                 else:
                     day_pnl = fallback
@@ -284,6 +301,23 @@ class PositionTracker:
             f"pnl={day_pnl:.2f} nlv={net_liq:.2f} source={source}"
         )
         return True
+
+    def _gross_exposure(self) -> float:
+        """Sum of |market_value| across all positions, longs and shorts.
+
+        Uses abs() deliberately: a short can lose money just as fast as a long,
+        and netting them would understate the ceiling. Returns 0.0 on error,
+        which makes the caller's bound maximally strict rather than permissive.
+        """
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(ABS(market_value)), 0) AS g FROM ibkr_positions"
+                ).fetchone()
+            return float(row["g"]) if row and row["g"] is not None else 0.0
+        except Exception as e:
+            logger.warning(f"[position_tracker] gross exposure lookup failed: {e}")
+            return 0.0
 
     @staticmethod
     def _compute_fallback_day_pnl(today: str, net_liq: float) -> float | None:
