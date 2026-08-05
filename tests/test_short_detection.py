@@ -90,6 +90,61 @@ class TestShortsAreRecorded:
         assert n == 1
 
 
+class TestEmptyResponseIsNotFlat:
+    """Regression: on 2026-08-05 a Gateway restart mid-login returned zero
+    positions, sync_positions wiped 15 shorts and 22 longs from the DB, and they
+    reappeared three minutes later. An empty answer from a not-ready broker is
+    not the same as an empty account."""
+
+    def _seeded(self, db):
+        with db() as c:
+            c.execute("INSERT INTO ibkr_positions (ticker, shares, avg_cost,"
+                      " unrealized_pnl, market_value, last_synced)"
+                      " VALUES ('KSS',-13247,19.78,-4195,-266264,'x')")
+            c.execute("INSERT INTO ibkr_positions (ticker, shares, avg_cost,"
+                      " unrealized_pnl, market_value, last_synced)"
+                      " VALUES ('AAA',100,50,10,5010,'x')")
+
+    def test_empty_positions_from_unready_account_keeps_rows(self, _db):
+        from src.position_tracker import PositionTracker
+        self._seeded(_db)
+        ib = MagicMock()
+        ib.get_positions.return_value = {}
+        ib.get_account_summary.return_value = {"net_liquidation": 0.0}  # mid-login
+
+        PositionTracker(ib).sync_positions()
+
+        with _db() as c:
+            n = c.execute("SELECT COUNT(*) n FROM ibkr_positions").fetchone()["n"]
+        assert n == 2, "must not assume flat while the account is still loading"
+
+    def test_empty_positions_from_ready_account_clears_rows(self, _db):
+        from src.position_tracker import PositionTracker
+        self._seeded(_db)
+        ib = MagicMock()
+        ib.get_positions.return_value = {}
+        ib.get_account_summary.return_value = {"net_liquidation": 250_000.0}
+
+        PositionTracker(ib).sync_positions()
+
+        with _db() as c:
+            n = c.execute("SELECT COUNT(*) n FROM ibkr_positions").fetchone()["n"]
+        assert n == 0, "a live account reporting no positions really is flat"
+
+    def test_readiness_check_failure_is_treated_as_not_ready(self, _db):
+        from src.position_tracker import PositionTracker
+        self._seeded(_db)
+        ib = MagicMock()
+        ib.get_positions.return_value = {}
+        ib.get_account_summary.side_effect = RuntimeError("not connected")
+
+        PositionTracker(ib).sync_positions()
+
+        with _db() as c:
+            n = c.execute("SELECT COUNT(*) n FROM ibkr_positions").fetchone()["n"]
+        assert n == 2
+
+
 class TestHaltOnShort:
     def test_trading_is_paused_when_a_short_appears(self, _db):
         from src import order_manager

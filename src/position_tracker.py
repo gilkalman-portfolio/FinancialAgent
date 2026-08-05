@@ -67,15 +67,28 @@ class PositionTracker:
                      data["unrealized_pnl"], data["market_value"], now),
                 )
 
-            # Remove positions that IBKR no longer reports (fully closed)
+            # Remove positions that IBKR no longer reports (fully closed).
             if positions:
                 placeholders = ",".join("?" for _ in positions)
                 conn.execute(
                     f"DELETE FROM ibkr_positions WHERE ticker NOT IN ({placeholders})",
                     list(positions.keys()),
                 )
-            else:
+            elif self._account_is_ready():
+                # Empty AND the account is demonstrably live: genuinely flat.
                 conn.execute("DELETE FROM ibkr_positions")
+            else:
+                # Empty because IBKR is not ready is NOT the same as flat. A
+                # Gateway mid-login returns zero positions and warning 2151
+                # ("Positions info is not available yet"); wiping the table there
+                # tells every downstream guard the book is empty. Observed
+                # 2026-08-05: a restart during login cleared 15 shorts and 22
+                # longs from the DB, and they reappeared three minutes later.
+                logger.error(
+                    "[position_tracker] IBKR reported ZERO positions but the account "
+                    "is not ready — keeping existing rows rather than assuming flat"
+                )
+                return
 
         logger.debug(f"[position_tracker] synced {len(positions)} position(s)")
 
@@ -320,6 +333,21 @@ class PositionTracker:
             f"pnl={day_pnl:.2f} nlv={net_liq:.2f} source={source}"
         )
         return True
+
+    def _account_is_ready(self) -> bool:
+        """True only if IBKR is answering with real account data.
+
+        A positive net_liquidation is the cheapest proof that the session has
+        finished loading. During login the Gateway accepts the connection, warns
+        2151 and returns zeros — indistinguishable from a flat account unless you
+        check something that cannot legitimately be zero.
+        """
+        try:
+            v = self.ibkr.get_account_summary().get("net_liquidation", 0) or 0
+            return float(v) > 0
+        except Exception as e:
+            logger.warning(f"[position_tracker] account readiness check failed: {e}")
+            return False
 
     def _gross_exposure(self) -> float:
         """Sum of |market_value| across all positions, longs and shorts.
