@@ -336,6 +336,55 @@ class TestLongOnlyInvariant:
 
 # ── 5. Exit layer runs even with an empty entry queue ───────────────────────
 
+class TestStalePositionsBlockEntries:
+    def test_failed_sync_blocks_entries_but_not_exits(self, _test_db):
+        """Every position-aware guard reads ibkr_positions. If the sync failed,
+        those guards evaluate against fiction — so no new entries. Exits still
+        run, because they protect capital already at risk."""
+        from src import ibkr_worker
+
+        conn = MagicMock()
+        entry = MagicMock()
+        entry.ticker = "AAA"
+        with patch.object(ibkr_worker, "build_queue", return_value=[entry]), \
+             patch.object(ibkr_worker, "PositionTracker") as tracker_cls, \
+             patch.object(ibkr_worker, "_check_ticker") as check, \
+             patch.object(ibkr_worker, "_periodic_fill_sweep"), \
+             patch.object(ibkr_worker, "_update_trailing_stops"), \
+             patch.object(ibkr_worker, "_check_tiered_exits") as tiers, \
+             patch.object(ibkr_worker, "_check_time_stops") as tstop, \
+             patch.object(ibkr_worker, "_check_score_deterioration"):
+            tracker = MagicMock()
+            tracker.sync_positions.side_effect = RuntimeError("gateway timeout")
+            tracker_cls.return_value = tracker
+
+            fired = ibkr_worker.run_once(conn)
+
+        assert fired == 0
+        check.assert_not_called(), "no ticker may be evaluated on stale positions"
+        tiers.assert_called_once()
+        tstop.assert_called_once()
+
+    def test_successful_sync_allows_entries(self, _test_db):
+        from src import ibkr_worker
+
+        conn = MagicMock()
+        entry = MagicMock()
+        entry.ticker = "AAA"
+        with patch.object(ibkr_worker, "build_queue", return_value=[entry]), \
+             patch.object(ibkr_worker, "PositionTracker") as tracker_cls, \
+             patch.object(ibkr_worker, "_check_ticker", return_value=None) as check, \
+             patch.object(ibkr_worker, "_periodic_fill_sweep"), \
+             patch.object(ibkr_worker, "_update_trailing_stops"), \
+             patch.object(ibkr_worker, "_check_tiered_exits"), \
+             patch.object(ibkr_worker, "_check_time_stops"), \
+             patch.object(ibkr_worker, "_check_score_deterioration"):
+            tracker_cls.return_value = MagicMock()
+            ibkr_worker.run_once(conn)
+
+        check.assert_called_once()
+
+
 class TestExitLayerRunsOnEmptyQueue:
     def test_empty_queue_still_runs_exit_functions(self, _test_db):
         """The early return made every stop conditional on having something to buy."""

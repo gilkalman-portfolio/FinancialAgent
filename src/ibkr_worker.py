@@ -895,13 +895,24 @@ def run_once(conn: IBKRConnection) -> int:
     # Without this, get_current_exposure() reads from the previous cycle (up to 5 min stale),
     # causing SELL orders to bypass the "no open position" veto when a position was closed
     # between cycles (e.g. stop hit, order cancelled by IBKR).
+    positions_fresh = True
     try:
         tracker.sync_positions()
     except Exception as e:
-        logger.warning(f"[worker] position pre-sync failed: {e}")
+        positions_fresh = False
+        logger.error(f"[worker] position pre-sync FAILED: {e} — entries blocked this cycle")
 
     fired = 0
     buy_signals_this_cycle = 0
+    # Every position-aware guard — the already-long veto, the long-only share
+    # arithmetic, the short alarm — reads ibkr_positions. If the sync failed, that
+    # table is stale or empty and those guards silently evaluate against fiction.
+    # On 2026-08-05 the Gateway held a stale session and answered every request
+    # with a timeout for 25 minutes; trading must not proceed blind through that.
+    # Exits below still run: they protect capital already at risk.
+    if not positions_fresh:
+        logger.error("[worker] skipping entry signals — position data is not fresh")
+        queue = []
     for entry in queue:
         event = _check_ticker(conn, entry.ticker)
         if event is None:
