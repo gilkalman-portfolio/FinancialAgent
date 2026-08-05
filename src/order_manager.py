@@ -124,6 +124,124 @@ def _format_submitted_message(
     return "\n".join(lines)
 
 
+def _pending_sell_shares_for(ticker: str) -> int:
+    """Shares already committed to in-flight SELL orders (module-level helper)."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(shares), 0) AS n FROM order_log "
+                "WHERE ticker = ? AND action = 'SELL' AND status = 'SUBMITTED'",
+                (ticker,),
+            ).fetchone()
+        if row and row["n"] is not None:
+            return max(0, int(row["n"]))
+    except Exception as e:
+        logger.warning(f"[order_manager] _pending_sell_shares_for({ticker}) failed: {e}")
+    return 0
+
+
+def _held_shares_for(ticker: str) -> int:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT shares FROM ibkr_positions WHERE ticker = ?", (ticker,)
+            ).fetchone()
+        if row and row["shares"] is not None:
+            return int(float(row["shares"]))
+    except Exception as e:
+        logger.warning(f"[order_manager] _held_shares_for({ticker}) failed: {e}")
+    return 0
+
+
+def submit_exit(
+    ibkr_client,
+    ticker: str,
+    shares: int,
+    limit_price: float,
+    reason: str,
+) -> dict[str, Any]:
+    """Guarded SELL for the worker's internal exit paths.
+
+    Time stops, tiered exits and score-deterioration exits used to call
+    ``place_limit_order()`` directly, bypassing both the trading pause and the
+    long-only share arithmetic. That bypass is what allowed the 2026-08-03
+    incident: ``_check_tiered_exits`` re-submitted the same 40% partial hundreds
+    of times (BMY 34sh x 224, IT 14sh x 242) and sold straight through zero into
+    a short, because nothing between it and the broker checked anything.
+
+    Every exit now goes through here, which enforces, in order:
+      1. the trading pause (a paused bot must not sell either — the broker-side
+         GTC bracket stop still protects the position, so blocking software exits
+         while halted costs nothing and stops runaway loops cold)
+      2. shares <= held - already-working, so an exit can never cross zero
+      3. order_log written BEFORE the broker call, so a crash mid-flight leaves a
+         trackable row rather than an invisible order
+
+    Returns {"status": PAUSED|VETOED|SUBMITTED|ERROR, ...}.
+    """
+    now = datetime.now().isoformat()
+
+    if _trading_paused:
+        _write_order_log(
+            ticker=ticker, action="SELL", shares=0, entry_price=limit_price,
+            stop_price=0, target_price=0, status="PAUSED",
+            notes=f"{reason} — blocked: trading paused",
+        )
+        logger.warning(f"[order_manager] exit {ticker} PAUSED ({reason})")
+        return {"status": "PAUSED", "ticker": ticker, "reason": "trading paused"}
+
+    held = _held_shares_for(ticker)
+    pending = _pending_sell_shares_for(ticker)
+    sellable = min(int(shares), held - pending)
+
+    if sellable <= 0:
+        note = (f"{reason} — blocked: long-only guard "
+                f"(held={held}, working={pending}, requested={shares})")
+        _write_order_log(
+            ticker=ticker, action="SELL", shares=0, entry_price=limit_price,
+            stop_price=0, target_price=0, status="VETOED", notes=note,
+        )
+        logger.warning(f"[order_manager] exit {ticker} VETOED: {note}")
+        return {"status": "VETOED", "ticker": ticker, "reason": note}
+
+    if sellable < shares:
+        logger.info(
+            f"[order_manager] exit {ticker}: reducing {shares} -> {sellable} "
+            f"(held={held}, working={pending})"
+        )
+
+    log_id = _write_order_log(
+        ticker=ticker, action="SELL", shares=sellable, entry_price=limit_price,
+        stop_price=0, target_price=0, status="SUBMITTED", notes=reason,
+    )
+
+    try:
+        order_id = ibkr_client.place_limit_order(
+            ticker=ticker, action="SELL", shares=sellable, limit_price=limit_price
+        )
+    except Exception as e:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE order_log SET status = 'ERROR', notes = ?, updated_at = ? WHERE id = ?",
+                (f"{reason} — place failed: {e}", now, log_id),
+            )
+        logger.error(f"[order_manager] exit {ticker} ERROR: {e}")
+        return {"status": "ERROR", "ticker": ticker, "reason": str(e)}
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE order_log SET ibkr_order_id = ?, updated_at = ? WHERE id = ?",
+            (order_id, now, log_id),
+        )
+
+    logger.info(
+        f"[order_manager] exit {ticker} SUBMITTED: SELL {sellable}sh "
+        f"@ ${limit_price:.2f} order_id={order_id} ({reason})"
+    )
+    return {"status": "SUBMITTED", "ticker": ticker, "shares": sellable,
+            "order_id": order_id, "reason": reason}
+
+
 class OrderManager:
     def __init__(
         self,

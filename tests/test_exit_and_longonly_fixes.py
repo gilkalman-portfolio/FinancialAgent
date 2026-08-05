@@ -225,8 +225,11 @@ class TestTimeStopEntryDate:
         with patch.object(ibkr_worker, "_send_telegram"):
             ibkr_worker._check_time_stops(conn)
 
+        # Exits now route through order_manager.submit_exit, which calls the
+        # broker with keyword args after clamping to the held size.
         conn.place_limit_order.assert_called_once()
-        assert conn.place_limit_order.call_args[0][0] == "CALM"
+        assert conn.place_limit_order.call_args.kwargs["ticker"] == "CALM"
+        assert conn.place_limit_order.call_args.kwargs["shares"] == 242
         with _test_db() as c:
             row = c.execute(
                 "SELECT notes, shares FROM order_log WHERE action='SELL'"
@@ -251,7 +254,7 @@ class TestTimeStopEntryDate:
             ibkr_worker._check_time_stops(conn)
 
         conn.place_limit_order.assert_called_once()
-        assert conn.place_limit_order.call_args[0][0] == "RRR"
+        assert conn.place_limit_order.call_args.kwargs["ticker"] == "RRR"
 
     def test_directional_position_is_not_time_stopped(self, _test_db):
         from src import ibkr_worker

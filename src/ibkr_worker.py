@@ -55,6 +55,7 @@ from src.database import get_connection, init_db, retry_on_busy
 from src.forward_signals import record_fill
 from src.ibkr_realtime import IBKRConnection, PAPER_PORT
 from src.monitoring_queue import build_queue
+from src.order_manager import submit_exit
 from src.position_tracker import PositionTracker
 from src.signal_combiner import SupertrendEvent, evaluate
 from src.supertrend import supertrend
@@ -630,37 +631,24 @@ def _check_time_stops(conn: IBKRConnection) -> None:
             exit_price = round(price * 0.999, 2)  # 0.1% below last for quick fill
             shares_to_exit = int(pos["shares"])
 
-            # Write order_log BEFORE calling IBKR so a crash after place_limit_order
-            # but before the DB write never leaves an orphan IBKR order.
-            with get_connection() as db:
-                cur = db.execute(
-                    "INSERT INTO order_log "
-                    "(ticker, action, shares, entry_price, stop_price, target_price, "
-                    " status, ibkr_order_id, notes, created_at, updated_at) "
-                    "VALUES (?, 'SELL', ?, ?, NULL, NULL, 'SUBMITTED', NULL, ?, ?, ?)",
-                    (ticker, shares_to_exit, exit_price,
-                     f"TIME STOP: {days_held}d zombie",
-                     now.isoformat(), now.isoformat()),
-                )
-                log_row_id = cur.lastrowid
-
-            order_id = conn.place_limit_order(ticker, "SELL", shares_to_exit, exit_price)
-
-            # Update with the real IBKR order_id now that the call succeeded
-            with get_connection() as db:
-                db.execute(
-                    "UPDATE order_log SET ibkr_order_id = ? WHERE id = ?",
-                    (order_id, log_row_id),
-                )
+            # Routed through order_manager.submit_exit — pause check, long-only
+            # clamp and order-log-before-place all live there now.
+            result = submit_exit(
+                conn, ticker, shares_to_exit, exit_price,
+                f"TIME STOP: {days_held}d zombie",
+            )
+            if result["status"] != "SUBMITTED":
+                logger.info(f"[worker] time stop {ticker}: {result['status']} — {result.get('reason')}")
+                continue
 
             logger.info(
                 f"[worker] TIME STOP: {ticker} held {days_held}d "
-                f"pnl={pnl_pct:+.1f}% — submitting SELL {shares_to_exit}sh @ ${exit_price:.2f}"
+                f"pnl={pnl_pct:+.1f}% — SELL {result['shares']}sh @ ${exit_price:.2f}"
             )
             _send_telegram(
                 f"⏱ TIME STOP — {ticker}\n"
                 f"Held {days_held} trading days, P&L={pnl_pct:+.1f}% (zombie)\n"
-                f"Exiting {shares_to_exit} shares @ ${exit_price:.2f}"
+                f"Exiting {result['shares']} shares @ ${exit_price:.2f}"
             )
         except Exception as e:
             logger.warning(f"[worker] time stop check failed for {ticker}: {e}")
@@ -712,39 +700,31 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                 exit_price = round(price * 0.999, 2)
                 breakeven = round(float(pos["avg_cost"]), 2)
 
-                # Write tier + order_log BEFORE IBKR call (crash-safe: orphan is
-                # trackable; exit_tier=1 prevents duplicate T1 on next cycle).
+                # exit_tier is advanced BEFORE the broker call so a re-entry on
+                # the next cycle cannot re-fire T1. On 2026-08-03 this ordering
+                # was reversed and T1 re-submitted 224 times on BMY alone.
                 with get_connection() as db:
                     db.execute(
                         "UPDATE ibkr_positions SET exit_tier = 1 WHERE ticker = ?",
                         (ticker,),
                     )
-                    cur = db.execute(
-                        "INSERT INTO order_log "
-                        "(ticker, action, shares, entry_price, stop_price, target_price, "
-                        " status, ibkr_order_id, notes, created_at, updated_at) "
-                        "VALUES (?, 'SELL', ?, ?, NULL, NULL, 'SUBMITTED', NULL, ?, ?, ?)",
-                        (ticker, shares_to_sell, exit_price,
-                         f"T1 partial exit ({pnl_pct:+.1f}%)",
-                         now.isoformat(), now.isoformat()),
-                    )
-                    log_row_id = cur.lastrowid
 
-                order_id = conn.place_limit_order(ticker, "SELL", shares_to_sell, exit_price)
+                result = submit_exit(
+                    conn, ticker, shares_to_sell, exit_price,
+                    f"T1 partial exit ({pnl_pct:+.1f}%)",
+                )
+                if result["status"] != "SUBMITTED":
+                    logger.info(f"[worker] T1 {ticker}: {result['status']} — {result.get('reason')}")
+                    continue
                 conn.modify_stop_order(ticker, breakeven)
 
-                with get_connection() as db:
-                    db.execute(
-                        "UPDATE order_log SET ibkr_order_id = ? WHERE id = ?",
-                        (order_id, log_row_id),
-                    )
                 logger.info(
-                    f"[worker] TIER-1 exit: {ticker} selling {shares_to_sell}sh "
+                    f"[worker] TIER-1 exit: {ticker} selling {result['shares']}sh "
                     f"@ ${exit_price:.2f} pnl={pnl_pct:+.1f}% stop→breakeven ${breakeven:.2f}"
                 )
                 _send_telegram(
                     f"🏦 T1 PARTIAL EXIT — {ticker}\n"
-                    f"Sold {shares_to_sell} shares (40%) @ ${exit_price:.2f}\n"
+                    f"Sold {result['shares']} shares (40%) @ ${exit_price:.2f}\n"
                     f"P&L={pnl_pct:+.1f}% | Stop moved to breakeven ${breakeven:.2f}"
                 )
 
@@ -758,31 +738,22 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                         "UPDATE ibkr_positions SET exit_tier = 2 WHERE ticker = ?",
                         (ticker,),
                     )
-                    cur = db.execute(
-                        "INSERT INTO order_log "
-                        "(ticker, action, shares, entry_price, stop_price, target_price, "
-                        " status, ibkr_order_id, notes, created_at, updated_at) "
-                        "VALUES (?, 'SELL', ?, ?, NULL, NULL, 'SUBMITTED', NULL, ?, ?, ?)",
-                        (ticker, shares_to_sell, exit_price,
-                         f"T2 partial exit ({pnl_pct:+.1f}%)",
-                         now.isoformat(), now.isoformat()),
-                    )
-                    log_row_id = cur.lastrowid
 
-                order_id = conn.place_limit_order(ticker, "SELL", shares_to_sell, exit_price)
+                result = submit_exit(
+                    conn, ticker, shares_to_sell, exit_price,
+                    f"T2 partial exit ({pnl_pct:+.1f}%)",
+                )
+                if result["status"] != "SUBMITTED":
+                    logger.info(f"[worker] T2 {ticker}: {result['status']} — {result.get('reason')}")
+                    continue
 
-                with get_connection() as db:
-                    db.execute(
-                        "UPDATE order_log SET ibkr_order_id = ? WHERE id = ?",
-                        (order_id, log_row_id),
-                    )
                 logger.info(
-                    f"[worker] TIER-2 exit: {ticker} selling {shares_to_sell}sh "
+                    f"[worker] TIER-2 exit: {ticker} selling {result['shares']}sh "
                     f"@ ${exit_price:.2f} pnl={pnl_pct:+.1f}%"
                 )
                 _send_telegram(
                     f"🏦 T2 PARTIAL EXIT — {ticker}\n"
-                    f"Sold {shares_to_sell} shares (50% of remaining) @ ${exit_price:.2f}\n"
+                    f"Sold {result['shares']} shares (50% of remaining) @ ${exit_price:.2f}\n"
                     f"P&L={pnl_pct:+.1f}% | Remainder trails Supertrend"
                 )
 
@@ -882,28 +853,15 @@ def _check_score_deterioration(conn: IBKRConnection) -> None:
             exit_price = round(price * 0.999, 2)
             shares_to_exit = int(pos["shares"])
 
-            # Write order_log BEFORE calling IBKR — dedup row was already inserted
-            # above (in the same DB block), so a crash between place and log-write
-            # never leaves an untracked live IBKR order.
-            with get_connection() as db:
-                cur = db.execute(
-                    "INSERT INTO order_log "
-                    "(ticker, action, shares, entry_price, stop_price, target_price, "
-                    " status, ibkr_order_id, notes, created_at, updated_at) "
-                    "VALUES (?, 'SELL', ?, ?, NULL, NULL, 'SUBMITTED', NULL, ?, ?, ?)",
-                    (ticker, shares_to_exit, exit_price,
-                     f"Score deterioration exit: {entry_score:.0f}->{current_score:.0f}",
-                     now.isoformat(), now.isoformat()),
+            result = submit_exit(
+                conn, ticker, shares_to_exit, exit_price,
+                f"Score deterioration exit: {entry_score:.0f}->{current_score:.0f}",
+            )
+            if result["status"] != "SUBMITTED":
+                logger.info(
+                    f"[worker] score exit {ticker}: {result['status']} — {result.get('reason')}"
                 )
-                log_row_id = cur.lastrowid
-
-            order_id = conn.place_limit_order(ticker, "SELL", shares_to_exit, exit_price)
-
-            with get_connection() as db:
-                db.execute(
-                    "UPDATE order_log SET ibkr_order_id = ? WHERE id = ?",
-                    (order_id, log_row_id),
-                )
+                continue
 
             logger.info(
                 f"[worker] SCORE DETERIORATION EXIT: {ticker} "
@@ -914,7 +872,7 @@ def _check_score_deterioration(conn: IBKRConnection) -> None:
                 f"📉 SCORE EXIT — {ticker}\n"
                 f"Score: {entry_score:.0f} -> {current_score:.0f} (drop={delta:.0f}pts)\n"
                 f"P&L={pnl_pct:+.1f}% | Exiting before further deterioration\n"
-                f"Selling {shares_to_exit} shares @ ${exit_price:.2f}"
+                f"Selling {result['shares']} shares @ ${exit_price:.2f}"
             )
         except Exception as e:
             logger.warning(f"[worker] score deterioration check failed for {ticker}: {e}")

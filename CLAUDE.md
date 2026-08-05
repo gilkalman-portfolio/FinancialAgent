@@ -860,6 +860,42 @@ fill prices are unrecoverable (IBKR serves ~24h of executions), so repair sets s
 Tests: `tests/test_exit_and_longonly_fixes.py` — 13 tests. Baseline **361 passed, 5 pre-existing
 failures** (`test_pnl_digest_fixes.py`, unrelated).
 
+### 🔴 Root Cause of the Shorts — 2026-08-03 runaway tiered exit
+
+The IBKR Activity Statement (`DUQ095696`, 2026-06-01 .. 2026-08-04) settles it. **No
+Transfers section exists — every short came from executed SELL orders**, 55,687 shares of
+them that `order_log` never recorded.
+
+The mechanism is exact:
+
+| ticker | held | each SELL execution | = | executions |
+|---|---|---|---|---|
+| BMY | 86 | −34 | `int(86 × 0.40)` | 224 |
+| IT | 35 | −14 | `int(35 × 0.40)` | 242 |
+
+0.40 is `TIER1_PCT` in `_check_tiered_exits`. All executions land within the same second
+(2026-08-03 09:30:47 for BMY) — a tight resubmission loop at the open, not fill
+fragmentation, which would produce varying lot sizes. The exit-strategy sprint landed
+**2026-08-02**; the loop ran **2026-08-03**.
+
+Why nothing stopped it: in the 08-02 code, `_check_tiered_exits` called `place_limit_order()`
+**before** advancing `exit_tier` and before writing `order_log`, so nothing suppressed a
+re-fire, nothing recorded it, and once the position crossed zero the short filter in
+`sync_positions()` erased it from view.
+
+- [x] **All three exit paths routed through `order_manager.submit_exit()`** — time stop,
+  tiered exits and score deterioration no longer touch `place_limit_order()` directly.
+  `submit_exit()` enforces, in order: the trading pause; `shares ≤ held − already-working`;
+  and the `order_log` row written **before** the broker call. A paused bot no longer sells
+  either — the broker-side GTC bracket stop still protects the position, so blocking
+  software exits during a halt costs nothing and stops a runaway loop cold.
+- [x] `tests/test_exit_routing.py` replays the incident: 224 identical T1 submissions on an
+  86-share position now produce **3 broker calls totalling exactly 86 shares**, with 221
+  vetoed. A source-level tripwire test fails if any exit function reintroduces a direct
+  `place_limit_order()` call.
+
+Baseline **425 passed**, 5 pre-existing failures.
+
 ### 🔴 Short-Position Blindness — 2026-08-05 (most severe defect found)
 
 **The account held 14 real short positions worth −$2.37M against an $853k NLV, and not one
