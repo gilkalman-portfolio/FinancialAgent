@@ -198,6 +198,42 @@ class TestStopTimeframeFidelity:
         assert out.empty
 
 
+class TestSignalPredatingTheSeries:
+    """Regression: a signal older than the price series used to map to bar 0 and
+    'hold' until the series began — 98-day average holds under a 30-day stop."""
+
+    def test_signal_before_the_hourly_window_is_skipped(self):
+        hidx = pd.date_range("2024-06-03 14:30", periods=400, freq="h")
+        hourly = {"AAA": _bars(np.full(400, 100.0), index=hidx)}
+        bd = _bench(pd.date_range("2024-01-01", periods=300, freq="D"))
+        ev = _events(pd.Timestamp("2023-01-05 15:30"))     # long before the bars
+        out = simulate_exits(ev, hourly, bd,
+                             ExitConfig("t", stop_timeframe="hourly", stop_atr=2.0,
+                                        max_hold_days=30))
+        assert out.empty
+
+    def test_daily_signal_is_walked_on_daily_bars(self):
+        """A daily signal must be managed on the daily series, which reaches back
+        further than the hourly one."""
+        didx = pd.date_range("2022-01-03", periods=600, freq="B")
+        d = _bars(100.0 * np.exp(np.arange(600) * 0.0002), index=didx, spread=0.005)
+        hidx = pd.date_range("2024-06-03 14:30", periods=400, freq="h")
+        h = _bars(np.full(400, 100.0), index=hidx)
+        bd = _bench(pd.date_range("2022-01-01", periods=1200, freq="D"))
+
+        ts = didx[300]                                    # 2023 — no hourly cover
+        ev = pd.DataFrame([{"ticker": "AAA", "ts": ts,
+                            "entry": float(d["Close"].iloc[300]), "spy_bull": True}])
+        out = simulate_exits(ev, {"AAA": h}, bd,
+                             ExitConfig("t", stop_atr=99.0, max_hold_days=30),
+                             daily={"AAA": d})
+        assert len(out) == 1
+        r = out.iloc[0]
+        assert r["reason"] == "time"
+        assert r["hold_days"] == pytest.approx(30, abs=4), \
+            "a 30-day time stop must exit near 30 days, not months later"
+
+
 class TestClusteredStats:
     def test_clustering_reduces_t_versus_naive(self):
         """The whole point: overlapping trades must not each count as evidence."""

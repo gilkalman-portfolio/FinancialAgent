@@ -947,6 +947,46 @@ Two methodology bugs were found and fixed while producing this; both had inverte
   excess was being reported as −1.03%. Non-overlap is now defined by the previous kept
   trade's **exit**, which is outcome-blind. `tests/test_exit_simulation.py` pins both.
 
+### Signal Panel — 2026-08-05
+
+`src/signal_library.py` + `run_signal_panel.py`. `run_backtest(signal_fn=...)` is now
+signal-agnostic, so a new idea is one function, not a new backtest. Six pre-committed
+candidates were tested against the production trigger as control.
+
+**Nothing survives.** Threshold for 7 tests is |t| > 3.07; the best candidate reaches +1.42.
+
+| signal | signals | 30d excess (naive t) | tradeable excess | t |
+|---|---|---|---|---|
+| supertrend_flip (control) | 17,810 | +0.57% (+4.89) | −0.11% | −0.32 |
+| golden_cross | 820 | +1.33% (+1.68) | +1.25% | +0.92 |
+| breakout_52w + volume | 2,526 | +2.41% (+4.58) | +0.68% | +1.25 |
+| donchian_20 | 11,479 | +0.70% (+4.70) | +0.01% | +0.05 |
+| momentum_12_1 | 3,957 | +1.16% (+4.19) | +0.12% | +0.25 |
+| rsi_dip_in_uptrend | 1,310 | +0.23% (+0.61) | +0.33% | +0.50 |
+| gap_up_continuation | 986 | +2.92% (+2.63) | +1.12% | +1.42 |
+
+The pattern is the finding: naive 30-day excess looks strong for several candidates
+(t = 4.19 … 4.70) and **every one collapses to ~0 under a real stop**. This is not a
+property of the Supertrend trigger — it is a property of this whole family of long-only
+momentum/breakout entries on this universe. Changing the trigger does not help.
+
+`tradeable` = stop 3ATR(daily) + 30d time, 0.20% round-trip friction, month-clustered on
+outcome-blind non-overlapping trades.
+
+**Three harness bugs were found by these tests, each of which had inverted a result:**
+- **Daily signals were gated out entirely.** The intraday 09:30–20:00 ET gate compares
+  `ts.hour`, and a daily bar is stamped at midnight — so all six candidates reported *zero*
+  signals rather than being evaluated. The gate now applies only when `ts != ts.normalize()`.
+- **Signals predating the price series produced fake year-long holds.** Daily signals reach
+  back 5y while hourly bars cover ~730d, so a 2022 signal mapped to hourly bar 0 and "held"
+  until the series began: 98-day average holds under a 30-day stop, and hugely inflated
+  returns. `simulate_exits()` now walks daily signals on daily bars and skips any signal
+  more than 5 days from the nearest bar. Before this fix `rsi_dip_in_uptrend` reported
+  +5.16% excess at t=+3.33 and appeared to survive the multiple-comparison threshold.
+- **Forward returns used the wrong timeframe for daily signals** — entry was a daily close
+  but the return was measured from a mid-session hourly bar. Now matched to the signal's own
+  timeframe.
+
 ### DCF & Data Quality Hardening — 2026-06-26
 
 - [x] **Backtester corporate action fix** — `src/backtester.py`: `price_at_signal` now fetched from yfinance on same `auto_adjust=True` basis as `price_after`. Existing corrupted rows refreshed via `UPDATE` (was `INSERT OR IGNORE` which silently kept the bad value). **One-time DB cleanup**: deleted 3 `backtest_results` rows for DD (pct_change >100%, reverse split artifact, 7d/14d) and 1 row for POWL (pct_change <-50%, forward split artifact, 7d).

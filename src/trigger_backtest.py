@@ -245,14 +245,28 @@ def _forward_return(close: pd.Series, ts: pd.Timestamp, days: int) -> float | No
     return (p1 / p0 - 1.0) * 100.0
 
 
+def _default_signal(hourly: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """The production trigger: bullish Supertrend(1H) flip."""
+    return find_flips(hourly, "BUY")
+
+
 def run_backtest(
     hourly: dict[str, pd.DataFrame],
     daily: dict[str, pd.DataFrame],
     bench_daily: dict[str, pd.DataFrame],
     config: BacktestConfig | None = None,
+    signal_fn=None,
 ) -> pd.DataFrame:
-    """One row per bullish Supertrend(1H) flip, with forward and excess returns."""
+    """One row per signal, with forward and benchmark-relative returns.
+
+    signal_fn(hourly_df, daily_df) -> DataFrame with columns ts, entry, and
+    optionally level. Defaults to the production Supertrend(1H) flip. Everything
+    downstream — point-in-time filters, benchmark alignment, maturity handling,
+    the exit simulator — is signal-agnostic, so a new idea is tested by writing
+    one function rather than a new backtest.
+    """
     cfg = config or BacktestConfig()
+    fn = signal_fn or _default_signal
     feats = {t: daily_features(df) for t, df in daily.items()}
     bench_close = {b: df["Close"] for b, df in bench_daily.items()}
 
@@ -261,11 +275,21 @@ def run_backtest(
 
     rows: list[dict] = []
     for ticker, hdf in hourly.items():
-        flips = find_flips(hdf, "BUY")
-        if flips.empty or ticker not in feats:
+        if ticker not in feats:
             continue
+        try:
+            flips = fn(hdf, daily[ticker])
+        except Exception as e:
+            logger.warning(f"[backtest] signal failed for {ticker}: {e}")
+            continue
+        if flips is None or flips.empty:
+            continue
+        if "level" not in flips.columns:
+            flips = flips.assign(level=np.nan)
         fdf = feats[ticker]
         hclose = hdf["Close"]
+        dclose = daily[ticker]["Close"]
+        daily_index = daily[ticker].index
 
         for _, flip in flips.iterrows():
             ts: pd.Timestamp = flip["ts"]
@@ -273,10 +297,16 @@ def run_backtest(
             if entry <= cfg.min_price:
                 continue
 
-            if cfg.signal_hours_only:
-                # Production blocks BUY outside 09:30-20:00 ET. Bars are UTC;
-                # 09:30 ET is 13:30 or 14:30 UTC depending on DST, so 13:30-20:00
-                # UTC is the conservative always-valid regular-session window.
+            # Production blocks BUY outside 09:30-20:00 ET. Bars are UTC; 09:30 ET
+            # is 13:30 or 14:30 UTC depending on DST, so 13:30-20:00 UTC is the
+            # conservative always-valid regular-session window.
+            #
+            # Only meaningful for INTRADAY signals. A daily bar is timestamped at
+            # midnight, so applying the gate to it rejects every daily signal —
+            # which silently reported six candidate strategies as producing zero
+            # signals rather than as being filtered out.
+            is_intraday = ts != ts.normalize()
+            if cfg.signal_hours_only and is_intraday:
                 if not (13 <= ts.hour < 20):
                     continue
 
@@ -312,9 +342,15 @@ def run_backtest(
             else:
                 row["spy_bull"] = True
 
+            # Measure the forward return on the timeframe the signal fired on.
+            # A daily signal's entry is a daily CLOSE; measuring it against the
+            # hourly series would start the return from a mid-session bar and
+            # silently disagree with `entry`. Hourly signals keep the hourly path.
+            fwd_close = dclose if ts in daily_index else hclose
+
             keep = False
             for h in cfg.horizons:
-                r = _forward_return(hclose, ts, h)
+                r = _forward_return(fwd_close, ts, h)
                 row[f"ret{h}"] = r
                 for b, bc in bench_close.items():
                     br = _forward_return(bc, sig_day, h)
@@ -470,14 +506,25 @@ def simulate_exits(
     rows: list[dict] = []
 
     for ev in events.itertuples():
-        hist = hourly.get(ev.ticker)
-        if hist is None:
+        # Manage the trade on the timeframe the signal fired on. A daily signal
+        # walked forward on hourly bars is limited to the ~730d hourly window,
+        # and any signal older than that maps to the FIRST hourly bar — turning a
+        # 2022 entry into a year-long hold that exits in 2023. That produced
+        # 98-day average holds under a 30-day time stop and inflated every daily
+        # candidate's return. Daily signals walk daily bars, which cover 5y.
+        ddf = (daily or {}).get(ev.ticker)
+        is_daily_signal = ddf is not None and ev.ts in ddf.index
+        hist = ddf if is_daily_signal else hourly.get(ev.ticker)
+        if hist is None or len(hist) < 2:
             continue
-        try:
-            i0 = hist.index.get_loc(ev.ts)
-        except KeyError:
+
+        i0 = int(hist.index.searchsorted(ev.ts))
+        if i0 >= len(hist) or i0 + 1 >= len(hist):
             continue
-        if i0 + 1 >= len(hist):
+        # The signal must actually land inside this price series. A large gap
+        # means the series starts after the signal, so there is no honest way to
+        # simulate the trade.
+        if abs((hist.index[i0] - ev.ts).total_seconds()) > 5 * 86400:
             continue
 
         entry = float(ev.entry)
@@ -495,9 +542,14 @@ def simulate_exits(
         target = entry + cfg.target_atr * atr if cfg.target_atr else None
         deadline = ev.ts + pd.Timedelta(days=cfg.max_hold_days) if cfg.max_hold_days else None
 
-        if cfg.supertrend_exit and ev.ticker not in trend_cache:
-            trend_cache[ev.ticker], _, _ = trend_series(hist)
-        trend = trend_cache.get(ev.ticker)
+        # The Supertrend exit is defined on the 1H series the trigger uses; it is
+        # not meaningful for a daily-bar signal.
+        if cfg.supertrend_exit and not is_daily_signal:
+            if ev.ticker not in trend_cache:
+                trend_cache[ev.ticker], _, _ = trend_series(hist)
+            trend = trend_cache.get(ev.ticker)
+        else:
+            trend = None
 
         high_water = entry
         exit_px, exit_ts, reason = None, None, None
