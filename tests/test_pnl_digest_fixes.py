@@ -14,6 +14,7 @@ the pattern in tests/test_order_funnel.py).
 
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -260,12 +261,18 @@ class TestDailyPnlFallback:
 
 class TestForwardSignalsWinRate:
     def _seed(self, conn, rows):
+        # Relative, not hardcoded. These tests used a fixed 2026-07-01 timestamp
+        # and weekly_digest() filters on `signal_ts >= now - days`, so they passed
+        # when written and silently began failing once the calendar moved more
+        # than 30 days past that date — then got recorded in CLAUDE.md as
+        # "pre-existing failures unrelated to core logic". They were test rot.
+        ts = (datetime.now() - timedelta(days=5)).isoformat()
         for ticker, signal_type, ret_7d in rows:
             conn.execute(
                 "INSERT INTO forward_signals "
                 "(ticker, signal_ts, signal_type, entry_price, status, return_7d_pct) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (ticker, "2026-07-01T10:00:00", signal_type, 100.0, "matured", ret_7d),
+                (ticker, ts, signal_type, 100.0, "matured", ret_7d),
             )
         conn.commit()
 
@@ -345,11 +352,15 @@ def _make_hist_mock(high, low, close):
 
 class TestOpportunityTouchDetection:
     def _seed_open(self, conn, ticker="XYZ", entry=100.0, stop=90.0, target1=110.0):
+        # Relative for the same reason as _seed above: a hardcoded 2026-06-25
+        # detection date eventually aged past the tracker's expiry window, so
+        # "still open" became "expired" through nothing but the passage of time.
+        detected = (datetime.now() - timedelta(days=3)).isoformat()
         conn.execute(
             "INSERT INTO opportunity_log "
             "(ticker, detected_at, signal_type, entry_price, stop_loss, target1, status) "
             "VALUES (?, ?, 'BUY', ?, ?, ?, 'open')",
-            (ticker, "2026-06-25T10:00:00", entry, stop, target1),
+            (ticker, detected, entry, stop, target1),
         )
         conn.commit()
 

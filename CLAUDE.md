@@ -6,7 +6,7 @@ AI-powered stock scanner & financial analysis dashboard.
 - **Stack:** Python 3.14, Streamlit 1.52.2, SQLite, yfinance, Finnhub, Alpha Vantage, SEC EDGAR
 - **LLMs:** Gemini 2.0 Flash (primary) → Groq Llama 3.3 70B (fallback) via `src/llm_client.py`
 - **Run:** `streamlit run dashboard.py` → http://localhost:8501
-- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **348 passed, 5 pre-existing failures** (test_pnl_digest_fixes.py — unrelated to core logic)
+- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **438 passed, 0 failed** (2026-08-05). The long-standing "5 pre-existing failures in test_pnl_digest_fixes.py" were **test rot, not product bugs**: `_seed` hardcoded `signal_ts = 2026-07-01` and `_seed_open` hardcoded `detected_at = 2026-06-25`, while `weekly_digest(days=N)` filters on `signal_ts >= now - N`. They passed when written and began failing once the calendar moved past the window. Both helpers now use relative dates. **Never seed a time-filtered query with a literal date.**
 
 ---
 
