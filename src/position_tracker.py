@@ -8,11 +8,14 @@ and daily_pnl tables current.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.database import get_connection, retry_on_busy
 
 logger = logging.getLogger(__name__)
+
+# Throttle for the short-position alarm. The pause itself is never throttled.
+SHORT_ALARM_COOLDOWN_HOURS = 6
 
 
 class PositionTracker:
@@ -29,9 +32,17 @@ class PositionTracker:
             logger.error(f"[position_tracker] get_positions failed: {e}")
             return
 
-        # Skip short/phantom positions — we never intentionally short;
-        # negative shares are paper-account artifacts from pre-position-gate era.
-        positions = {t: d for t, d in positions.items() if d.get("shares", 0) > 0}
+        # Short positions are RECORDED, not filtered. This used to drop every
+        # negative-share row on the assumption they were "paper-account artifacts".
+        # They were not: on 2026-08-05 the account held 14 real shorts worth
+        # -$2.37M against an $853k NLV, with -$121k unrealized, and not one of them
+        # appeared in ibkr_positions — so every veto, the /positions command, and
+        # alert_monitor were all blind to them, and the DELETE below treated them
+        # as closed. A long-only bot must be able to SEE a short in order to
+        # refuse to deepen it and to tell its operator.
+        shorts = {t: d for t, d in positions.items() if d.get("shares", 0) < 0}
+        if shorts:
+            self._raise_short_alarm(shorts)
 
         now = datetime.now().isoformat()
         with get_connection() as conn:
@@ -63,14 +74,92 @@ class PositionTracker:
 
         logger.debug(f"[position_tracker] synced {len(positions)} position(s)")
 
+    def _raise_short_alarm(self, shorts: dict) -> None:
+        """A short in a long-only bot is a stop-everything event.
+
+        Halts order submission and tells the operator. Deliberately does NOT try
+        to close the positions: unwinding is a sizing and timing decision a human
+        makes, and an automated cover here could just as easily make it worse.
+
+        Alerting is throttled to once per SHORT_ALARM_COOLDOWN_HOURS per ticker
+        set so a 5-minute sync loop cannot flood Telegram, but the pause is
+        re-applied every cycle regardless of throttling.
+        """
+        detail = ", ".join(
+            f"{t} {d['shares']:+.0f}sh (${d.get('market_value', 0):,.0f})"
+            for t, d in sorted(shorts.items(), key=lambda kv: kv[1].get("market_value", 0))
+        )
+        logger.error(f"[position_tracker] SHORT POSITIONS DETECTED — halting trading: {detail}")
+
+        # Pause first — do this every cycle, never throttled.
+        try:
+            from src import order_manager
+            if not order_manager.is_paused():
+                order_manager.set_paused(True)
+                logger.error("[position_tracker] trading PAUSED due to short exposure")
+        except Exception as e:
+            logger.error(f"[position_tracker] could not pause trading: {e}")
+
+        key = "|".join(sorted(shorts))
+        try:
+            cutoff = (datetime.now() - timedelta(hours=SHORT_ALARM_COOLDOWN_HOURS)).isoformat()
+            with get_connection() as conn:
+                recent = conn.execute(
+                    "SELECT 1 FROM watchlist_alerts WHERE alert_type = 'short_position_alarm' "
+                    "AND message = ? AND sent_at >= ? LIMIT 1",
+                    (key, cutoff),
+                ).fetchone()
+                if recent:
+                    return
+                conn.execute(
+                    "INSERT INTO watchlist_alerts (ticker, alert_type, message, sent_at, score, price) "
+                    "VALUES (?, 'short_position_alarm', ?, ?, NULL, NULL)",
+                    (sorted(shorts)[0], key, datetime.now().isoformat()),
+                )
+        except Exception as e:
+            logger.warning(f"[position_tracker] short-alarm dedup failed: {e}")
+
+        total_mv = sum(d.get("market_value", 0) for d in shorts.values())
+        total_pnl = sum(d.get("unrealized_pnl", 0) for d in shorts.values())
+        lines = [
+            "🔴 SHORT POSITIONS DETECTED — TRADING PAUSED",
+            f"This bot is long-only. {len(shorts)} short position(s) are open:",
+            "",
+        ]
+        for t, d in sorted(shorts.items(), key=lambda kv: kv[1].get("market_value", 0)):
+            lines.append(
+                f"  {t}: {d['shares']:+.0f}sh  ${d.get('market_value', 0):,.0f}  "
+                f"P&L ${d.get('unrealized_pnl', 0):,.0f}"
+            )
+        lines += [
+            "",
+            f"Total short exposure: ${total_mv:,.0f}",
+            f"Unrealized: ${total_pnl:,.0f}",
+            "",
+            "🎯 Action: close these manually in TWS. Orders stay paused until you /resume.",
+        ]
+        try:
+            from src.telegram_notifier import TelegramNotifier
+            TelegramNotifier().send_message("\n".join(lines))
+        except Exception as e:
+            logger.error(f"[position_tracker] short alarm Telegram failed: {e}")
+
     def get_current_exposure(self, ticker: str) -> float:
-        """Return market_value of open position for ticker, or 0.0."""
+        """Return market_value of the LONG position for ticker, or 0.0.
+
+        Long-only semantics on purpose. A short has a negative market_value, and
+        the Layer -1 SELL veto treats "exposure != 0" as "there is something to
+        sell" — so reporting a short here would let a SELL through and deepen it.
+        Callers that need the true signed value should read ibkr_positions.
+        """
         with get_connection() as conn:
             row = conn.execute(
-                "SELECT market_value FROM ibkr_positions WHERE ticker = ?",
+                "SELECT shares, market_value FROM ibkr_positions WHERE ticker = ?",
                 (ticker,),
             ).fetchone()
-        return float(row["market_value"]) if row else 0.0
+        if not row or (row["shares"] or 0) <= 0:
+            return 0.0
+        return float(row["market_value"])
 
     def get_portfolio_value(self) -> float:
         """Return net_liquidation — live from IBKR, fallback to DB.

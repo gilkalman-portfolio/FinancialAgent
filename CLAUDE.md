@@ -860,6 +860,46 @@ fill prices are unrecoverable (IBKR serves ~24h of executions), so repair sets s
 Tests: `tests/test_exit_and_longonly_fixes.py` — 13 tests. Baseline **361 passed, 5 pre-existing
 failures** (`test_pnl_digest_fixes.py`, unrelated).
 
+### 🔴 Short-Position Blindness — 2026-08-05 (most severe defect found)
+
+**The account held 14 real short positions worth −$2.37M against an $853k NLV, and not one
+of them existed in `ibkr_positions`.** Unrealized loss on them was ≈ −$121k (IT −$65k,
+EXPE −$31k, ITRI −$27k). This is a long-only bot.
+
+Root cause, one line — `position_tracker.sync_positions()`:
+
+```python
+# Skip short/phantom positions — we never intentionally short;
+# negative shares are paper-account artifacts from pre-position-gate era.
+positions = {t: d for t, d in positions.items() if d.get("shares", 0) > 0}
+```
+
+The comment's assumption was false. Because the rows were dropped before the upsert, and
+because the follow-up `DELETE ... WHERE ticker NOT IN (...)` then treated them as closed,
+the shorts were invisible to **everything**: every veto layer (all keyed on `shares > 0`),
+the `/positions` Telegram command, `alert_monitor`, and any audit that read the table.
+It also explains the daily P&L anomaly — NLV fell $1,035,074 → $853,301 in a day while the
+visible long book was only $178k, which is impossible from marks alone.
+
+It also settles an earlier question: `order_log` showed KSS 287 bought / 309 sold and that
+was walked back as "not conclusive". It was conclusive — KSS was short 13,247 shares.
+
+Fixes:
+- [x] **Shorts are recorded, not filtered.** `sync_positions()` persists negative-share rows.
+- [x] **`_raise_short_alarm()`** — a short in a long-only bot halts trading:
+  `order_manager.set_paused(True)` re-applied every cycle (never throttled), plus a Telegram
+  alarm listing each position, throttled to once per 6h per ticker-set so the 5-minute sync
+  loop cannot flood. It deliberately does **not** auto-cover: unwinding is a human decision.
+- [x] **`get_current_exposure()` is long-only by contract** — returns 0.0 for a short. It
+  feeds the Layer −1 SELL veto, which treated "exposure != 0" as "there is something to
+  sell"; reporting a short there would have let a SELL through and deepened it.
+- [x] **Layer −1 uses `exposure <= 0`** rather than `== 0` as belt-and-braces.
+
+`tests/test_short_detection.py` — 10 tests. Baseline **415 passed**, 5 pre-existing failures.
+
+**Operator action this does NOT cover:** the 14 existing shorts must be closed manually in
+TWS. The code prevents recurrence and forces a halt; it does not unwind an existing book.
+
 ### Trigger Backtest — 2026-08-05
 
 `src/trigger_backtest.py` + `run_trigger_backtest.py` added. This is the validation

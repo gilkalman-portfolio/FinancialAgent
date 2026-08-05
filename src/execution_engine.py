@@ -245,8 +245,11 @@ def evaluate_trade(
     if is_sell and _position_tracker is not None:
         try:
             exposure = _position_tracker.get_current_exposure(ticker)
-            if exposure == 0.0:
-                return _veto("L-1: No open position to sell")
+            # <= 0 rather than == 0: a short reports negative market value, and
+            # "not zero" would read as "there is something to sell" and deepen it.
+            # get_current_exposure() is long-only by contract; this is belt-and-braces.
+            if exposure <= 0.0:
+                return _veto("L-1: No open long position to sell")
         except Exception as e:
             logger.warning("evaluate_trade(%s): position check failed: %s — allowing", ticker, e)
 
