@@ -860,6 +860,50 @@ fill prices are unrecoverable (IBKR serves ~24h of executions), so repair sets s
 Tests: `tests/test_exit_and_longonly_fixes.py` — 13 tests. Baseline **361 passed, 5 pre-existing
 failures** (`test_pnl_digest_fixes.py`, unrelated).
 
+### Trigger Backtest — 2026-08-05
+
+`src/trigger_backtest.py` + `run_trigger_backtest.py` added. This is the validation
+capability the project never had — CLAUDE.md previously named forward paper trading as the
+source of truth, which at ~65 signals/month cannot resolve an edge below ~1%/trade in under
+a year. The backtest replays the **exact production trigger** (`trend_series()` mirrors
+`src/supertrend.py` line for line; `tests/test_trigger_backtest.py` walks every bar asserting
+the two agree) over ~3 years of hourly bars.
+
+```bash
+python run_trigger_backtest.py --tickers 250        # ~90s, writes data/backtest_cache/
+```
+
+**Result — 17,810 flips, 242 tickers, 2023-09 .. 2026-07, excess vs IWM:**
+
+| horizon | naive t | non-overlap + month-cluster | verdict |
+|---|---|---|---|
+| 7d | +1.65 | **+1.31** | no edge |
+| 14d | +3.04 | **+1.58** | no edge |
+| 30d | +4.89 | **+2.27** (mean +0.70%) | marginal edge |
+
+Naive t-stats are inflated: 30-day windows fired days apart share most of their holding
+period, so signals are not independent observations. Always report the clustered figure.
+
+**The actionable finding: the edge exists only at ~30 days, and the system exits in days.**
+It harvests at the horizon where there is nothing and exits before the horizon where there is
+something. This is the same shape as the forward data (30d was its best horizon too) and
+explains the near-zero realized expectancy.
+
+**Entry filters do not help.** `close > SMA50` looked best naively (30d t=+4.42) but under the
+strict treatment it *underperforms* the unfiltered trigger (t=+1.52 vs +2.27). Adding
+SMA200/RSI/regime/price/ADV filters costs sample without adding excess. Do not add them.
+
+Sensitivity: drop thinnest month t=+2.04 · drop best+worst t=+2.61 · 2024-onward t=+2.03 ·
+2025-onward t=+1.41 (n.s.) · 63% of months positive · median monthly excess +0.55%.
+Decay by year: 2023 +1.16% → 2024 +0.61% → 2025 +0.45% → 2026 +0.40%.
+Regime split: SPY above SMA200 +0.62% (t=5.02) · below SMA200 +0.13% (t=0.34) — no edge in
+a falling tape. Net of 0.2–0.3% round-trip friction the edge is +0.2% to +0.4% per 30-day hold.
+
+**⚠️ Survivorship bias — the largest unquantified weakness.** The universe comes from
+`scan_results`, i.e. tickers the bot scanned in 2026, replayed back to 2023. Delisted and
+collapsed names are structurally absent. Correcting this needs point-in-time index membership,
+which the project does not store. Treat +0.70% as an upper bound, not an estimate.
+
 ### DCF & Data Quality Hardening — 2026-06-26
 
 - [x] **Backtester corporate action fix** — `src/backtester.py`: `price_at_signal` now fetched from yfinance on same `auto_adjust=True` basis as `price_after`. Existing corrupted rows refreshed via `UPDATE` (was `INSERT OR IGNORE` which silently kept the bad value). **One-time DB cleanup**: deleted 3 `backtest_results` rows for DD (pct_change >100%, reverse split artifact, 7d/14d) and 1 row for POWL (pct_change <-50%, forward split artifact, 7d).
