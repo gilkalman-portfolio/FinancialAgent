@@ -161,6 +161,39 @@ Verified by `tests/test_db_wal_concurrency.py` — 4 writers + 1 reader, 1000 wr
 
 ---
 
+## ⚠️ Operational trap: logging into Client Portal kills the Gateway session
+
+IBKR permits one active session per username. **Logging into Client Portal (or TWS)
+displaces the IB Gateway session.** The failure is silent and easy to misread:
+
+- the TCP port stays open and `ib.connect()` still succeeds
+- every data request then times out — `positions request timed out`,
+  `account updates for <ACCT> request timed out`, `executions request timed out`
+- `Warning 2151, reqId -1: Positions info is not available yet`
+- **`ib.positions()` returns an EMPTY LIST rather than raising**
+
+That last point is the dangerous one. An empty response is indistinguishable from a
+flat account unless something that cannot legitimately be zero is checked too. On
+2026-08-05 this was misread as "the account reset succeeded and is clean" while 15
+shorts worth −$2.37M were still open, and `sync_positions()` deleted all 37 rows
+from `ibkr_positions` on the strength of it. Guarded since by
+`PositionTracker._account_is_ready()` (requires `net_liquidation > 0` before an
+empty list is allowed to clear the table).
+
+**Symptoms are identical to a post-reset Gateway that has not finished logging in**,
+which is how it was misdiagnosed twice on 2026-08-05/06 — including one unnecessary
+`docker restart` of the Gateway.
+
+**Before concluding anything about positions, check the sync age.** A reading is only
+trustworthy when `MAX(last_synced)` is within the last few minutes:
+
+```bash
+python -c "import sqlite3,datetime;c=sqlite3.connect('data/financial_agent.db');c.row_factory=sqlite3.Row;r=c.execute('SELECT COUNT(*) n,COALESCE(SUM(CASE WHEN shares<0 THEN 1 ELSE 0 END),0) s,MAX(last_synced) t FROM ibkr_positions').fetchone();print('rows',r[0],'shorts',r[1],'synced',r[2])"
+```
+
+Fix: log out of Client Portal. The Gateway recovers on the next cycle without a
+restart.
+
 ## IBKR Real-Time Architecture
 
 **Stack split (because `ib_async` is incompatible with Python 3.14):**
