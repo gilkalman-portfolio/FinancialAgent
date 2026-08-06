@@ -71,6 +71,12 @@ FILL_SWEEP_MIN_AGE_SECS = 5 * 60    # only sweep SUBMITTED rows older than 5 min
 FILL_SWEEP_UNKNOWN_GRACE_SECS = 24 * 60 * 60
 PER_CYCLE_BUY_CAP = 3               # max combined_buy signals per run_once() cycle
 
+# Stall guard. A cycle is ~30s; the poll interval is 5 min. Anything past this is
+# a hang, not a slow market. Two such hangs happened on 2026-08-05/06, both from
+# IBKR calls with no timeout reached only once the session was already displaced.
+STALL_TIMEOUT_SECS = 12 * 60
+STALL_CHECK_SECS = 30
+
 _last_fill_sweep_ts: datetime | None = None
 _last_trailing_stop_ts: datetime | None = None
 _last_time_stop_ts: datetime | None = None
@@ -1200,9 +1206,63 @@ def main() -> int:
         _release_singleton_lock()
 
 
+_last_heartbeat: float = 0.0
+
+
+def _start_stall_guard() -> None:
+    """Kill the process if a cycle stops making progress.
+
+    Two different IBKR calls have now hung the worker indefinitely — reqExecutions
+    on 2026-08-05 (25 min) and something inside the position sync on 2026-08-06
+    (26 min, silent). Both were reached only when the API session was already
+    unhealthy, which is precisely when a timeout is least likely to have been
+    considered. Patching each call site individually has not worked twice running.
+
+    ib_async is asyncio-based on a single thread, so a blocked request blocks
+    everything: the process stays alive, holds the singleton lock, logs nothing,
+    and the watchdog sees a healthy child. From the outside it is indistinguishable
+    from a quiet market.
+
+    This guard is deliberately blunt. It watches one timestamp and calls os._exit()
+    — not sys.exit(), which would raise on the blocked thread and be swallowed —
+    so the watchdog observes a crash and relaunches with a clean session. A restart
+    costs one cycle; a silent hang costs every cycle until a human notices.
+    """
+    import threading
+
+    def _watch() -> None:
+        while True:
+            time.sleep(STALL_CHECK_SECS)
+            if _last_heartbeat <= 0:
+                continue
+            stalled = time.monotonic() - _last_heartbeat
+            if stalled > STALL_TIMEOUT_SECS:
+                logger.error(
+                    f"[worker] STALLED — no cycle progress for {stalled:.0f}s "
+                    f"(limit {STALL_TIMEOUT_SECS}s). Exiting so the watchdog can "
+                    f"restart with a fresh IBKR session."
+                )
+                try:
+                    _send_telegram(
+                        f"🔴 IBKR Worker STALLED\n"
+                        f"No cycle progress for {stalled / 60:.0f} minutes — the IBKR "
+                        f"session is most likely displaced (Client Portal / TWS / "
+                        f"mobile login).\n\n🎯 Action: restarting automatically. If it "
+                        f"recurs, log out of other IBKR sessions."
+                    )
+                except Exception:
+                    pass
+                logging.shutdown()
+                os._exit(3)
+
+    threading.Thread(target=_watch, name="stall-guard", daemon=True).start()
+    logger.info(f"[worker] stall guard armed ({STALL_TIMEOUT_SECS}s)")
+
+
 def _main_body() -> int:
     init_db()
     logger.info(f"[worker] starting — port={PORT} clientId={CLIENT_ID} interval={POLL_INTERVAL_SECS}s")
+    _start_stall_guard()
 
     # Start Telegram command handler
     cmd_handler = None
@@ -1237,6 +1297,8 @@ def _main_body() -> int:
     try:
         while True:
             cycle_start = datetime.now()
+            global _last_heartbeat
+            _last_heartbeat = time.monotonic()
             try:
                 conn = IBKRConnection(port=PORT, client_id=CLIENT_ID)
                 conn.connect(timeout=15.0)
