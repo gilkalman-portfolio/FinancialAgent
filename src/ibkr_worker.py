@@ -500,6 +500,76 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
         logger.info(f"[worker] trailing stops updated: {updated} positions raised")
 
 
+def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
+    """Cancel resting SELL orders that have no long position behind them.
+
+    In a long-only bot such an order has exactly one possible outcome: if it
+    fills, it opens a short. There is no legitimate case for keeping it.
+
+    This is not theoretical. On 2026-08-06 an IBKR paper-account reset flattened
+    every position but left the GTC bracket legs resting at the broker. Those
+    SELL orders then executed against a zero position and created five shorts
+    (BOX 154, CARG 133, GEN 176 — each exactly the prior long size, i.e. the size
+    its bracket leg was written for). The reset clears positions; it does not
+    clear orders.
+
+    Only cancels when held <= 0, which is unambiguous. A SELL larger than the
+    remaining long is logged but left alone: that is the normal shape of a stop
+    leg after a partial exit, and cancelling it would strip the position of its
+    protection.
+    """
+    try:
+        orders = conn.get_open_orders()
+    except Exception as e:
+        logger.warning(f"[worker] unbacked-sell sweep: get_open_orders failed: {e}")
+        return 0
+
+    sells = [o for o in orders if o.get("action") == "SELL"]
+    if not sells:
+        return 0
+
+    held: dict[str, float] = {}
+    try:
+        with get_connection() as db:
+            for row in db.execute("SELECT ticker, shares FROM ibkr_positions"):
+                held[row["ticker"]] = float(row["shares"] or 0)
+    except Exception as e:
+        logger.warning(f"[worker] unbacked-sell sweep: position read failed: {e}")
+        return 0
+
+    cancelled = []
+    for o in sells:
+        t = o.get("ticker")
+        have = held.get(t, 0.0)
+        qty = int(o.get("qty") or 0)
+        if have > 0:
+            if qty > have:
+                logger.warning(
+                    f"[worker] {t}: resting SELL {qty}sh exceeds long {have:.0f}sh "
+                    f"— left in place (likely a stop leg after a partial exit)"
+                )
+            continue
+        try:
+            if conn.cancel_order(o["order_id"]):
+                cancelled.append(f"{t} {qty}sh (#{o['order_id']})")
+                logger.error(
+                    f"[worker] CANCELLED unbacked SELL: {t} {qty}sh — position is "
+                    f"{have:.0f}, this order could only have opened a short"
+                )
+        except Exception as e:
+            logger.error(f"[worker] failed to cancel unbacked SELL {t}: {e}")
+
+    if cancelled:
+        _send_telegram(
+            "🧹 CANCELLED UNBACKED SELL ORDERS\n"
+            "These had no long position behind them and could only have opened a short:\n"
+            + "\n".join(f"  {c}" for c in cancelled)
+            + "\n\n🎯 Action: none needed — they are gone. Usually caused by an "
+              "account reset, which clears positions but not resting orders."
+        )
+    return len(cancelled)
+
+
 def _has_pending_sell(ticker: str) -> bool:
     """True if any SELL order for this ticker is still SUBMITTED.
 
@@ -987,6 +1057,13 @@ def run_once(conn: IBKRConnection) -> int:
         _periodic_fill_sweep(conn)
     except Exception as e:
         logger.warning(f"[worker] fill sweep failed: {e}")
+
+    # Runs right after the position sync, while ibkr_positions is freshest: a
+    # resting SELL with no long behind it can only ever open a short.
+    try:
+        _cancel_unbacked_sell_orders(conn)
+    except Exception as e:
+        logger.warning(f"[worker] unbacked-sell sweep failed: {e}")
 
     # Exit strategy layer — runs after signals, never blocks the main loop
     try:
