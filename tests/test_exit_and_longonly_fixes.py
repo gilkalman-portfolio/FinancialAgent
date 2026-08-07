@@ -270,6 +270,29 @@ class TestTimeStopEntryDate:
             ibkr_worker._check_time_stops(conn)
         conn.place_limit_order.assert_not_called()
 
+    def test_reopened_position_ages_from_new_entry_not_old_history(self, _test_db):
+        """PTCT/YELP, 2026-08-07: each bought weeks ago, fully closed, then bought
+        fresh again today. Aging from the ticker's all-time earliest FILLED BUY
+        treated the brand-new position as a 19-24 trading-day zombie and exited it
+        within 30 minutes of entry — a fresh position's ~0% P&L sits squarely
+        inside the zombie band. The entry date must reset once shares round-tripped
+        back to flat between the old trade and the new one."""
+        from src import ibkr_worker
+        ibkr_worker._last_time_stop_ts = None
+
+        _insert_position(_test_db, "PTCT", 87, 71.89, -17.0)  # ~-0.3%, inside the zombie band
+        old_buy = (datetime.now() - timedelta(days=40)).isoformat()
+        old_sell = (datetime.now() - timedelta(days=39)).isoformat()
+        fresh_buy = (datetime.now() - timedelta(minutes=30)).isoformat()
+        _insert_order(_test_db, "PTCT", "BUY", 59, "FILLED", old_buy, ibkr_order_id=1)
+        _insert_order(_test_db, "PTCT", "SELL", 59, "FILLED", old_sell, ibkr_order_id=2)
+        _insert_order(_test_db, "PTCT", "BUY", 87, "FILLED", fresh_buy, ibkr_order_id=3)
+
+        conn = MagicMock()
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._check_time_stops(conn)
+        conn.place_limit_order.assert_not_called()
+
 
 # ── 4. Long-only invariant ──────────────────────────────────────────────────
 

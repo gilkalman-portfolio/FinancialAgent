@@ -534,6 +534,12 @@ def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
     if not sells:
         return 0
 
+    # A ticker with a still-open BUY is mid-entry: a bracket's stop/target legs
+    # are placed alongside the parent, before it fills, so a SELL here is waiting
+    # on its own parent — not orphaned by a reset. Cancelling it here permanently
+    # strips protection the moment the parent does fill.
+    pending_buys = {o.get("ticker") for o in orders if o.get("action") == "BUY"}
+
     held: dict[str, float] = {}
     try:
         with get_connection() as db:
@@ -546,6 +552,8 @@ def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
     cancelled = []
     for o in sells:
         t = o.get("ticker")
+        if t in pending_buys:
+            continue
         have = held.get(t, 0.0)
         qty = int(o.get("qty") or 0)
         if have > 0:
@@ -643,34 +651,56 @@ def _check_time_stops(conn: IBKRConnection) -> None:
     for pos in positions:
         ticker = pos["ticker"]
         try:
-            # Entry date = the EARLIEST filled BUY that opened this position.
+            # Entry date = the earliest FILLED BUY since this position was last
+            # flat (0 shares) — i.e. the start of the CURRENT holding period, not
+            # the ticker's all-time trading history.
+            #
             # Using the most recent BUY (the old behaviour) restarted the clock on
             # every add, so any pyramided position could never age into a time stop:
             # CALM first bought 2026-06-26 but last added 2026-07-22 read as 9
             # trading days against a 15-day threshold and was skipped forever.
+            #
+            # Using the all-time earliest BUY (that fix) broke the opposite way:
+            # PTCT and YELP were each bought, fully closed, and bought fresh again —
+            # on 2026-08-07 both were aged from a FILLED BUY weeks earlier and
+            # zombie-exited within 30 minutes of the new entry, because a brand-new
+            # position's ~0% P&L sits squarely inside the zombie band. The entry
+            # date must reset at the last point shares crossed back to flat.
             with get_connection() as db:
-                row = db.execute(
-                    "SELECT created_at FROM order_log "
-                    "WHERE ticker = ? AND action = 'BUY' AND status = 'FILLED' "
-                    "ORDER BY created_at ASC LIMIT 1",
+                history = db.execute(
+                    "SELECT action, shares, created_at FROM order_log "
+                    "WHERE ticker = ? AND action IN ('BUY', 'SELL') AND status = 'FILLED' "
+                    "ORDER BY created_at ASC",
                     (ticker,),
-                ).fetchone()
+                ).fetchall()
+                running = 0.0
+                entry_at = None
+                for h in history:
+                    if h["action"] == "BUY":
+                        if running <= 0:
+                            entry_at = h["created_at"]
+                        running += h["shares"] or 0
+                    else:
+                        running -= h["shares"] or 0
+                row = {"created_at": entry_at} if entry_at else None
+
                 if not row:
                     # No FILLED BUY row. This is usually corrupted history rather
                     # than a phantom position (the fill sweep used to mark real
                     # fills ERROR — RRR/TRS/LCII were all invisible here). Fall
                     # back to the earliest BUY attempt of any status so a genuinely
                     # held position still ages into its time stop.
-                    row = db.execute(
+                    fallback = db.execute(
                         "SELECT created_at FROM order_log "
                         "WHERE ticker = ? AND action = 'BUY' "
                         "ORDER BY created_at ASC LIMIT 1",
                         (ticker,),
                     ).fetchone()
-                    if row:
+                    if fallback:
+                        row = {"created_at": fallback["created_at"]}
                         logger.info(
                             f"[worker] time stop: {ticker} has no FILLED BUY row — "
-                            f"using earliest BUY attempt {row['created_at'][:10]} as entry date"
+                            f"using earliest BUY attempt {fallback['created_at'][:10]} as entry date"
                         )
             if not row:
                 continue
@@ -1064,8 +1094,15 @@ def run_once(conn: IBKRConnection) -> int:
     except Exception as e:
         logger.warning(f"[worker] fill sweep failed: {e}")
 
-    # Runs right after the position sync, while ibkr_positions is freshest: a
-    # resting SELL with no long behind it can only ever open a short.
+    # Runs right after a FRESH position sync: the sync at the top of this cycle
+    # predates any BUY this same cycle just placed, so re-checking against that
+    # snapshot would see 0 shares for a ticker that, e.g., filled two minutes ago
+    # and cancel its still-legitimate stop/target legs as "unbacked" (TMDX,
+    # 2026-08-07 — filled, then stripped of its stop within 3 minutes).
+    try:
+        tracker.sync_positions()
+    except Exception as e:
+        logger.warning(f"[worker] unbacked-sell sweep: pre-sync failed: {e}")
     try:
         _cancel_unbacked_sell_orders(conn)
     except Exception as e:
