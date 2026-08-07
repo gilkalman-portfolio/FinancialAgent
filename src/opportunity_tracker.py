@@ -135,14 +135,38 @@ def _fetch_current_price(ticker: str) -> Optional[float]:
         return None
 
 
+def _fetch_today_high_low(ticker: str) -> Optional[tuple[float, float, float]]:
+    """Return (high, low, close) for the most recent trading day, or None.
+
+    Used for intraday touch detection — a Close-only check misses an
+    intraday stop-hit-then-recover (scored as still open) and an intraday
+    T1 touch that closed back below target (also missed).
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="2d")
+        if hist is None or hist.empty:
+            return None
+        last = hist.iloc[-1]
+        return float(last["High"]), float(last["Low"]), float(last["Close"])
+    except Exception as e:
+        logger.warning(f"[opp_tracker] high/low fetch failed {ticker}: {e}")
+        return None
+
+
 @retry_on_busy()
 def update_outcomes() -> dict:
     """
-    For every open opportunity:
-      - fetch current price
-      - if price <= stop_loss  → hit_stop
-      - if price >= target1    → hit_target
-      - if elapsed > 30 days   → expired
+    For every open opportunity, using the most recent trading day's High/Low
+    (not just Close) for intraday touch detection:
+      - if High >= target1 AND Low <= stop_loss (both touched same day) → hit_stop
+        (conservative: we can't know which was touched first intraday, so the
+        worse outcome is assumed)
+      - elif Low <= stop_loss   → hit_stop
+      - elif High >= target1    → hit_target
+      - elif elapsed > 30 days  → expired
+    A Close-only check would miss an intraday stop-hit-then-recover (scored as
+    still open) and an intraday T1 touch that closed back below target (also
+    missed) — both are corrected by using High/Low.
     Returns summary stats dict.
     """
     stats = {"checked": 0, "hit_target": 0, "hit_stop": 0, "expired": 0}
@@ -167,28 +191,41 @@ def update_outcomes() -> dict:
             continue
 
         elapsed_days = (now - detected).days
-        price = _fetch_current_price(row["ticker"])
-        if price is None:
+        hl = _fetch_today_high_low(row["ticker"])
+        if hl is None:
             continue
+        high, low, close = hl
 
         entry = row["entry_price"]
         stop  = row["stop_loss"]
         t1    = row["target1"]
-        pct   = round((price - entry) / entry * 100, 2) if entry else 0.0
 
-        if price >= t1:
-            new_status = HIT_T1
-            stats["hit_target"] += 1
-        elif price <= stop:
+        hit_target_touch = high >= t1
+        hit_stop_touch = low <= stop
+
+        if hit_target_touch and hit_stop_touch:
+            # Both touched intraday — can't tell ordering from daily bars.
+            # Conservative assumption: count as stop hit.
             new_status = HIT_STOP
+            outcome_price = stop
             stats["hit_stop"] += 1
+        elif hit_stop_touch:
+            new_status = HIT_STOP
+            outcome_price = stop
+            stats["hit_stop"] += 1
+        elif hit_target_touch:
+            new_status = HIT_T1
+            outcome_price = t1
+            stats["hit_target"] += 1
         elif elapsed_days >= MAX_DAYS:
             new_status = EXPIRED
+            outcome_price = close
             stats["expired"] += 1
         else:
             continue  # still open, nothing to update
 
-        pending.append((row["id"], new_status, price, pct))
+        pct = round((outcome_price - entry) / entry * 100, 2) if entry else 0.0
+        pending.append((row["id"], new_status, outcome_price, pct))
 
     if pending:
         now_iso = now.isoformat()

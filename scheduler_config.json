@@ -36,6 +36,7 @@
   "telegram": true,
   "auto_watchlist_scan": true,
   "max_daily_loss_pct": 0.02,
+  "max_positions": 10,
   "news_catalyst_max_article_age_minutes": 45,
   "long_setups_enabled": true,
   "long_setups_time": "09:30",

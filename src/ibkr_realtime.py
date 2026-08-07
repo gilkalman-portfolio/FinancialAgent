@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Iterator, Literal
 
 import pandas as pd
@@ -132,7 +133,7 @@ class IBKRConnection:
         parent = LimitOrder(action, shares, entry_price)
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False
-        parent.tif = "DAY"  # explicit TIF avoids IB Error 10349 noise
+        parent.tif = "GTC"  # GTC so entry/stop/target persist across sessions
 
         stop_action = "SELL" if action == "BUY" else "BUY"
 
@@ -140,13 +141,13 @@ class IBKRConnection:
         stop_order.orderId = self.ib.client.getReqId()
         stop_order.parentId = parent.orderId
         stop_order.transmit = False
-        stop_order.tif = "DAY"
+        stop_order.tif = "GTC"
 
         target_order = LimitOrder(stop_action, shares, target_price)
         target_order.orderId = self.ib.client.getReqId()
         target_order.parentId = parent.orderId
         target_order.transmit = True  # transmit the whole bracket
-        target_order.tif = "DAY"
+        target_order.tif = "GTC"
 
         placed = []
         try:
@@ -173,6 +174,34 @@ class IBKRConnection:
         )
         return parent.orderId
 
+    def place_limit_order(
+        self,
+        ticker: str,
+        action: str,
+        shares: int,
+        limit_price: float,
+    ) -> int:
+        """Place a single plain LMT order (no bracket children).
+
+        Used for SELL exits: a SELL closes an existing long, so there is no
+        stop/target bracket to attach — that geometry only makes sense for a
+        BUY entry. Returns the order_id.
+        """
+        contract = Stock(ticker, "SMART", "USD")
+        self.ib.qualifyContracts(contract)
+
+        order = LimitOrder(action, shares, limit_price)
+        order.orderId = self.ib.client.getReqId()
+        order.transmit = True
+        order.tif = "DAY"  # explicit TIF avoids IB Error 10349 noise
+
+        self.ib.placeOrder(contract, order)
+        logger.info(
+            f"[ibkr] limit order placed: {action} {shares} {ticker} "
+            f"limit=${limit_price:.2f} order_id={order.orderId}"
+        )
+        return order.orderId
+
     def cancel_order(self, order_id: int) -> bool:
         """Cancel an order by order_id."""
         for trade in self.ib.openTrades():
@@ -184,7 +213,11 @@ class IBKRConnection:
         return False
 
     def get_open_orders(self) -> list[dict]:
-        """Return all open orders as a list of dicts."""
+        """Return all open orders as a list of dicts.
+
+        aux_price is set for STP orders (the stop trigger price).
+        lmt_price is set for LMT orders.
+        """
         result = []
         for trade in self.ib.openTrades():
             o = trade.order
@@ -195,8 +228,91 @@ class IBKRConnection:
                 "qty": int(o.totalQuantity),
                 "order_type": o.orderType,
                 "status": trade.orderStatus.status,
+                "lmt_price": getattr(o, "lmtPrice", None),
+                "aux_price": getattr(o, "auxPrice", None),  # stop trigger price for STP orders
             })
         return result
+
+    def get_executions(self, lookback_days: int = 2, timeout: float = 15.0) -> dict[int, float]:
+        """Return {ibkr_order_id: avg_fill_price} for recent executions.
+
+        ``ib.fills()`` only holds executions received during the CURRENT API
+        session — after a Gateway restart or a worker reconnect it is empty for
+        orders placed earlier. That made the periodic fill sweep classify real
+        fills as ERROR (30 such rows as of 2026-08-05, 14 of them for tickers
+        that are still held). ``reqExecutions()`` asks the broker instead, so it
+        survives reconnects.
+
+        IBKR only serves executions for roughly the last 24h via this API, so
+        lookback_days is a best-effort hint, not a guarantee. Merges the
+        in-session ``fills()`` on top since those are always authoritative.
+        """
+        import asyncio
+
+        from ib_async import ExecutionFilter, util
+
+        result: dict[int, float] = {}
+        try:
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+            efilter = ExecutionFilter(time=cutoff.strftime("%Y%m%d-%H:%M:%S"))
+            # MUST have a timeout. IB.reqExecutions() has none, and after a paper
+            # account reset the Gateway accepts the connection but answers data
+            # requests with "Positions info is not available yet" (warning 2151)
+            # and never replies. On 2026-08-05 that hung the worker for 25 minutes
+            # inside startup reconciliation — connected, silent, and doing nothing.
+            # A missed execution sweep is recoverable; a hung worker is not.
+            fills = util.run(
+                asyncio.wait_for(self.ib.reqExecutionsAsync(efilter), timeout=timeout)
+            )
+            for fill in fills:
+                try:
+                    result[fill.execution.orderId] = float(fill.execution.avgPrice)
+                except Exception:
+                    continue
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[ibkr] reqExecutions timed out after {timeout}s — account data "
+                f"may not be ready (post-reset/reconnect). Using session fills only."
+            )
+        except Exception as e:
+            logger.warning(f"[ibkr] reqExecutions failed: {e} — falling back to session fills")
+
+        # In-session fills win over the broker snapshot (fresher price).
+        try:
+            for fill in self.ib.fills():
+                try:
+                    result[fill.execution.orderId] = float(fill.execution.avgPrice)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"[ibkr] ib.fills() failed: {e}")
+
+        return result
+
+    def modify_stop_order(self, ticker: str, new_stop_price: float) -> bool:
+        """Raise the trailing stop for an open STP order on ticker.
+
+        Finds the active SELL STP order for ticker in open trades and updates
+        its auxPrice to new_stop_price. Uses placeOrder() again — IBKR treats
+        a re-submitted order with the same orderId as a modification. Returns
+        True if an order was found and modified, False otherwise.
+        """
+        new_stop_price = round(new_stop_price, 2)
+        for trade in self.ib.openTrades():
+            o = trade.order
+            if (trade.contract.symbol == ticker
+                    and o.orderType == "STP"
+                    and o.action == "SELL"):
+                old_price = round(getattr(o, "auxPrice", 0.0), 2)
+                o.auxPrice = new_stop_price
+                self.ib.placeOrder(trade.contract, o)
+                logger.info(
+                    f"[ibkr] trailing stop updated: {ticker} "
+                    f"${old_price:.2f} -> ${new_stop_price:.2f}"
+                )
+                return True
+        logger.debug(f"[ibkr] no active STP SELL order found for {ticker}")
+        return False
 
     # ── Position & Account queries (Phase 2) ────────────────────────────
 

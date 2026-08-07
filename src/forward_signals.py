@@ -164,11 +164,17 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
 
 
 def _fetch_price_at(ticker: str, target_dt: datetime) -> Optional[float]:
-    """Closing price on target_dt (or the next available trading day)."""
+    """Closing price on target_dt (or the next available trading day).
+
+    Uses auto_adjust=True — same basis as entry_price (a live/real-time price at
+    signal time). A split/dividend within the 7/14/30d horizon would otherwise
+    corrupt the computed return by comparing a raw historical close to a live
+    price (same bug class fixed in src/backtester.py's _get_price_at_date()).
+    """
     start = target_dt.date()
     end = (target_dt + timedelta(days=7)).date()
     try:
-        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
+        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
         if hist is None or hist.empty:
             return None
         return float(hist["Close"].iloc[0])
@@ -250,6 +256,81 @@ def update_outcomes() -> dict:
     return stats
 
 
+def benchmark_excess(lookback_days: int = 90, benchmark: str = "IWM") -> dict | None:
+    """BUY-signal return vs the benchmark over identical holding windows.
+
+    Deliberately uses a LONGER lookback than the digest's display window. A
+    signal fired in the last 7 days cannot have a matured 7-day outcome, so
+    scoping this to the weekly window would measure almost nothing and report a
+    t-stat off a handful of rows. The edge question needs accumulated history.
+
+    A long-only signal in a rising tape earns market beta, and a raw win rate
+    cannot tell the two apart. Between 2026-05 and 2026-08 this digest reported a
+    55.9% win rate while the same signals were measured at -0.25% excess vs IWM
+    (t = -0.33) — the number looked like skill and was the market. Excess return
+    with an n and a t-stat is the only honest headline.
+
+    Returns None when the benchmark cannot be fetched; callers must degrade to
+    the raw numbers rather than silently reporting beta as performance.
+    """
+    import math
+
+    cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT signal_ts, return_7d_pct FROM forward_signals "
+            "WHERE signal_type = 'BUY' AND return_7d_pct IS NOT NULL AND signal_ts >= ?",
+            (cutoff,),
+        ).fetchall()
+    if not rows:
+        return None
+
+    try:
+        import yfinance as yf
+        import pandas as pd
+
+        start = (datetime.now() - timedelta(days=lookback_days + 45)).strftime("%Y-%m-%d")
+        hist = yf.Ticker(benchmark).history(start=start, auto_adjust=True)
+        if hist is None or hist.empty:
+            return None
+        close = hist["Close"]
+        # yfinance normally returns a tz-aware index, but not always (and never
+        # for a cached/offline frame). tz_localize(None) raises on a naive index,
+        # so branch rather than assume.
+        idx = pd.DatetimeIndex(close.index)
+        close.index = (idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None
+                       else idx).normalize()
+    except Exception as e:
+        logger.warning(f"[forward_signals] benchmark fetch failed: {e}")
+        return None
+
+    excess: list[float] = []
+    for r in rows:
+        try:
+            d0 = pd.Timestamp(r["signal_ts"][:10]).normalize()
+            i0 = close.index.searchsorted(d0)
+            i1 = close.index.searchsorted(d0 + pd.Timedelta(days=7))
+            if i0 >= len(close) or i1 >= len(close) or i1 <= i0:
+                continue
+            bench = (float(close.iloc[i1]) / float(close.iloc[i0]) - 1.0) * 100.0
+            excess.append(float(r["return_7d_pct"]) - bench)
+        except Exception:
+            continue
+
+    n = len(excess)
+    if n < 3:
+        return None
+    mean = sum(excess) / n
+    var = sum((x - mean) ** 2 for x in excess) / (n - 1)
+    sd = math.sqrt(var)
+    t = mean / (sd / math.sqrt(n)) if sd > 0 else 0.0
+    return {
+        "benchmark": benchmark, "n": n, "mean_excess_pct": mean,
+        "t_stat": t, "beat_rate_pct": sum(1 for x in excess if x > 0) / n * 100.0,
+        "significant": abs(t) > 2.0,
+    }
+
+
 def weekly_digest(days: int = 7) -> dict:
     """Aggregate stats over the last `days` days of signals."""
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
@@ -269,15 +350,27 @@ def weekly_digest(days: int = 7) -> dict:
     returns_7d, returns_14d, returns_30d = [], [], []
     winners_7d = 0
     measured_7d = 0
+    # Direction-aware win counts, broken out by signal type (BUY win: return > 0;
+    # SELL win: return < 0 — a SELL is correct when price subsequently falls).
+    winners_7d_buy = measured_7d_buy = 0
+    winners_7d_sell = measured_7d_sell = 0
 
     for r in rows:
         t = r["signal_type"]
         by_type[t] = by_type.get(t, 0) + 1
         if r["return_7d_pct"] is not None:
-            returns_7d.append(r["return_7d_pct"])
+            ret = r["return_7d_pct"]
+            returns_7d.append(ret)
             measured_7d += 1
-            if r["return_7d_pct"] > 0:
+            is_win = (ret < 0) if t == "SELL" else (ret > 0)
+            if is_win:
                 winners_7d += 1
+            if t == "SELL":
+                measured_7d_sell += 1
+                winners_7d_sell += 1 if is_win else 0
+            else:
+                measured_7d_buy += 1
+                winners_7d_buy += 1 if is_win else 0
         if r["return_14d_pct"] is not None:
             returns_14d.append(r["return_14d_pct"])
         if r["return_30d_pct"] is not None:
@@ -286,6 +379,9 @@ def weekly_digest(days: int = 7) -> dict:
     def _avg(xs):
         return sum(xs) / len(xs) if xs else None
 
+    def _rate(winners, measured):
+        return (winners / measured * 100.0) if measured else None
+
     return {
         "window_days": days,
         "total_signals": total,
@@ -293,9 +389,25 @@ def weekly_digest(days: int = 7) -> dict:
         "avg_return_7d_pct": _avg(returns_7d),
         "avg_return_14d_pct": _avg(returns_14d),
         "avg_return_30d_pct": _avg(returns_30d),
-        "win_rate_7d_pct": (winners_7d / measured_7d * 100.0) if measured_7d else None,
+        "win_rate_7d_pct": _rate(winners_7d, measured_7d),
         "measured_7d": measured_7d,
+        "win_rate_7d_buy_pct": _rate(winners_7d_buy, measured_7d_buy),
+        "measured_7d_buy": measured_7d_buy,
+        "win_rate_7d_sell_pct": _rate(winners_7d_sell, measured_7d_sell),
+        "measured_7d_sell": measured_7d_sell,
+        # None when the benchmark is unavailable — format_digest_message says so
+        # explicitly rather than quietly printing an unbenchmarked win rate.
+        "excess": _safe_benchmark_excess(),
     }
+
+
+def _safe_benchmark_excess(lookback_days: int = 90) -> dict | None:
+    """benchmark_excess() must never be able to break the weekly digest send."""
+    try:
+        return benchmark_excess(lookback_days)
+    except Exception as e:
+        logger.warning(f"[forward_signals] benchmark_excess failed: {e}")
+        return None
 
 
 def format_digest_message(d: dict) -> str:
@@ -315,4 +427,26 @@ def format_digest_message(d: dict) -> str:
         lines.append(f"Avg 30D return: {d['avg_return_30d_pct']:+.2f}%")
     if d["win_rate_7d_pct"] is not None:
         lines.append(f"Win rate 7D:    {d['win_rate_7d_pct']:.1f}%")
+    if d.get("win_rate_7d_buy_pct") is not None:
+        lines.append(f"  BUY win rate:  {d['win_rate_7d_buy_pct']:.1f}% ({d['measured_7d_buy']} measured)")
+    if d.get("win_rate_7d_sell_pct") is not None:
+        lines.append(f"  SELL win rate: {d['win_rate_7d_sell_pct']:.1f}% ({d['measured_7d_sell']} measured)")
+
+    # The headline. A win rate without a benchmark measures the market, not the
+    # signal — that is precisely how three months of zero edge read as 55.9%.
+    ex = d.get("excess")
+    if ex:
+        verdict = ("✅ statistically meaningful" if ex["significant"]
+                   else "⚠️ NOT distinguishable from zero")
+        lines += [
+            "",
+            f"📐 vs {ex['benchmark']} (7D, same windows):",
+            f"  Excess:    {ex['mean_excess_pct']:+.2f}%  (n={ex['n']}, t={ex['t_stat']:+.2f})",
+            f"  Beat rate: {ex['beat_rate_pct']:.1f}%",
+            f"  {verdict}",
+        ]
+        if not ex["significant"]:
+            lines.append("  🎯 Action: win rate above is market beta, not edge. Do not tune on it.")
+    else:
+        lines += ["", "📐 vs benchmark: unavailable — win rate above is UNBENCHMARKED"]
     return "\n".join(lines)

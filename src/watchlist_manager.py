@@ -24,10 +24,14 @@ _ET = None  # lazy-loaded ZoneInfo
 
 
 def _is_trading_hours() -> bool:
-    """True only during US regular market hours: Mon–Fri 09:30–16:00 ET.
+    """True during ET 04:00–20:00 (pre-market open through after-hours close), Mon–Fri.
 
-    Used to gate price_change / price_above / price_below alerts so they
-    don't fire on stale pre-market or after-hours yfinance prices.
+    Used to gate price_change / price_above / price_below Telegram sends so they
+    don't fire on stale overnight yfinance prices. Widened from the old 09:30–16:00
+    regular-session window: the only scheduled caller (run_watchlist_scan) runs at
+    12:00 Israel time = 05:00 ET, which is always outside 09:30-16:00 ET — the old
+    window meant these alerts could never fire. 04:00-20:00 ET matches documented
+    intent (CLAUDE.md) and covers pre-market + regular + after-hours sessions.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -37,9 +41,9 @@ def _is_trading_hours() -> bool:
         now = datetime.now(_ET)
         if now.weekday() >= 5:          # Saturday = 5, Sunday = 6
             return False
-        market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-        market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-        return market_open <= now <= market_close
+        window_open  = now.replace(hour=4,  minute=0, second=0, microsecond=0)
+        window_close = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        return window_open <= now <= window_close
     except Exception:
         return True  # fail-open so alerts aren't silently lost on tz errors
 SCORE_DELTA_THRESHOLD = 15  # pts — triggers score_delta_drop / score_delta_rise alert
@@ -154,29 +158,35 @@ def scan_watchlist(force: bool = False) -> List[Dict]:
                 _auto_set_price_alerts(ticker, price, score, item)
 
             # ── Price % change vs last recorded ───────────────────────────
-            # Gate: only fire during US regular market hours (09:30–16:00 ET).
-            # Pre-market and after-hours yfinance prices are unreliable / stale.
+            # Gate: Telegram send only fires during ET 04:00-20:00 (see _is_trading_hours).
+            # Baseline is always recorded/advanced regardless of hours, so the % move is
+            # measured from a fresh reference the next time the window is open.
             prev_price = _last_alert_price(ticker, "price_change")
             if prev_price is None:
                 # No baseline yet — record current price as baseline, don't alert
                 watchlist_save_alert(ticker, "price_change", f"Baseline price recorded: ${price:.2f}", score=None, price=price)
                 logger.debug(f"Price baseline set for {ticker}: ${price:.2f}")
-            elif prev_price > 0 and _is_trading_hours():
+            elif prev_price > 0:
                 pct_change = (price - prev_price) / prev_price * 100
                 if abs(pct_change) >= alert_pct and _cooldown_passed(ticker, "price_change"):
-                    direction = "📈 UP" if pct_change > 0 else "📉 DOWN"
-                    action = ("Consider adding to position." if pct_change > 0 and score >= 60
-                              else "Review position — check if stop needs adjustment." if pct_change < 0
-                              else "Monitor for continuation.")
-                    msg = (f"💹 Price Alert: {ticker}\n"
-                           f"Moved {pct_change:+.1f}% {direction}\n"
-                           f"Current: ${price:.2f} | Previous: ${prev_price:.2f}\n"
-                           f"Score: {score:.0f} ({signal_label(score)})\n"
-                           f"🎯 {action}")
-                    _send_alert(telegram, ticker, "price_change", msg, score, price)
+                    if _is_trading_hours():
+                        direction = "📈 UP" if pct_change > 0 else "📉 DOWN"
+                        action = ("Consider adding to position." if pct_change > 0 and score >= 60
+                                  else "Review position — check if stop needs adjustment." if pct_change < 0
+                                  else "Monitor for continuation.")
+                        msg = (f"💹 Price Alert: {ticker}\n"
+                               f"Moved {pct_change:+.1f}% {direction}\n"
+                               f"Current: ${price:.2f} | Previous: ${prev_price:.2f}\n"
+                               f"Score: {score:.0f} ({signal_label(score)})\n"
+                               f"🎯 {action}")
+                        _send_alert(telegram, ticker, "price_change", msg, score, price)
+                    else:
+                        # Outside 04:00-20:00 ET — update baseline, suppress Telegram
+                        watchlist_save_alert(ticker, "price_change", f"Baseline price recorded (outside hours): ${price:.2f}", score=None, price=price)
+                        logger.debug(f"Price baseline refreshed outside hours for {ticker}: ${price:.2f}")
 
             # ── Price level alerts (above / below unified) ────────────────
-            # Gate: only fire during regular market hours (09:30–16:00 ET).
+            # Gate: only fire during ET 04:00-20:00 (see _is_trading_hours).
             for level_val, alert_type, emoji, action in [
                 (price_above, "price_above", "📈", "Level broken to upside — consider entry or add."),
                 (price_below, "price_below", "📉", "Level broken to downside — tighten stop or exit."),
@@ -244,10 +254,14 @@ def scan_portfolio() -> List[Dict]:
                       "shares": shares, "pnl_pct": pnl_pct, "pnl_val": pnl_val,
                       "stop_loss": stop_loss, "target_price": target_price}
 
+            # NOTE: run_portfolio_scan (scheduler) fires at 09:15 IL = ~02:15 ET,
+            # before market open — yfinance returns the prior session's close, not
+            # a live quote. Labelled "Last close" below (not "Price") so the
+            # message doesn't imply this is a real-time price.
             if stop_loss and price <= stop_loss and _cooldown_passed(ticker, "stop_loss"):
                 pnl_str = f"{pnl_val:+.0f}$" if pnl_val else ""
                 msg = (f"🛑 STOP LOSS HIT: {ticker}\n"
-                       f"Price: ${price:.2f} ≤ Stop: ${stop_loss:.2f}\n"
+                       f"Last close: ${price:.2f} ≤ Stop: ${stop_loss:.2f}\n"
                        f"P&L: {pnl_pct:+.1f}% {pnl_str}\n"
                        f"🎯 EXIT — close position to limit losses.")
                 _send_alert(telegram, ticker, "stop_loss", msg, score, price)
@@ -255,14 +269,14 @@ def scan_portfolio() -> List[Dict]:
             if target_price and price >= target_price and _cooldown_passed(ticker, "target_hit"):
                 pnl_str = f"{pnl_val:+.0f}$" if pnl_val else ""
                 msg = (f"🎯 TARGET HIT: {ticker}\n"
-                       f"Price: ${price:.2f} ≥ Target: ${target_price:.2f}\n"
+                       f"Last close: ${price:.2f} ≥ Target: ${target_price:.2f}\n"
                        f"P&L: {pnl_pct:+.1f}% {pnl_str}\n"
                        f"🎯 Take profit or raise stop to lock in gains.")
                 _send_alert(telegram, ticker, "target_hit", msg, score, price)
 
             if score < 35 and _cooldown_passed(ticker, "score_drop"):
                 msg = (f"⚠️ Portfolio Warning: {ticker}\n"
-                       f"Score: {score:.0f}/100 (SKIP) | P&L: {pnl_pct:+.1f}% | Price: ${price:.2f}\n"
+                       f"Score: {score:.0f}/100 (SKIP) | P&L: {pnl_pct:+.1f}% | Last close: ${price:.2f}\n"
                        f"🎯 Review position — consider exit or tight stop.")
                 _send_alert(telegram, ticker, "score_drop", msg, score, price)
 
@@ -372,9 +386,26 @@ def _send_score_delta_alert(
 
 def _send_alert(telegram: TelegramNotifier, ticker: str, alert_type: str,
                 message: str, score: float, price: float):
+    """
+    Sends the Telegram message, then writes the audit/cooldown row to
+    watchlist_alerts ONLY when the send actually succeeded.
+
+    send_message() returns False both when Telegram is globally disabled and
+    when a live send genuinely fails (network error, bad chat id, etc). In
+    either case there is no reason to burn the 24h cooldown here: a disabled
+    Telegram config means the alert was never observed, and a failed send
+    means it may still need to fire again soon (e.g. next cycle after a
+    transient outage) rather than being silently suppressed for a day.
+    Other DB-only alert paths in this module intentionally bypass _send_alert
+    and call watchlist_save_alert() directly — that remains the mechanism for
+    deliberate DB-only (audit-but-no-Telegram) logging.
+    """
     try:
-        telegram.send_message(message)
-        watchlist_save_alert(ticker, alert_type, message, score, price)
-        logger.info(f"Alert sent: {ticker} ({alert_type})")
+        sent = telegram.send_message(message)
+        if sent:
+            watchlist_save_alert(ticker, alert_type, message, score, price)
+            logger.info(f"Alert sent: {ticker} ({alert_type})")
+        else:
+            logger.warning(f"Alert NOT sent (cooldown not consumed): {ticker} ({alert_type})")
     except Exception as e:
         logger.warning(f"Failed to send alert for {ticker}: {e}")

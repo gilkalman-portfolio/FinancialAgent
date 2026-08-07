@@ -88,6 +88,21 @@ reports/
 
 # Temp / scratch files
 _tmp_*.py
+tmp_*.py
+analyze_orders.py
+
+# Backtest cache — regenerable via run_trigger_backtest.py, and the hourly-bar
+# pickles run to tens of MB. Never commit these.
+data/backtest_cache/
+
+# Worker singleton lock (holds a live PID; meaningless in version control)
+ibkr_worker_running.lock
+
+# DB backups taken before destructive operations
+*.db.bak-*
+
+# Generated reports
+qa_report*.docx
 
 # Binary executables
 cloudflared.exe
