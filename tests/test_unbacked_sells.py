@@ -131,3 +131,21 @@ class TestLeavesLegitimateOrders:
         conn = MagicMock()
         conn.get_open_orders.side_effect = RuntimeError("not connected")
         assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+
+    def test_bracket_stop_leg_survives_while_parent_buy_is_still_pending(self, _db):
+        """TMDX/GEN/STE/EVER, 2026-08-07: a bracket's stop+target legs are placed
+        alongside the parent BUY, before it fills. ibkr_positions still shows 0
+        shares for a ticker whose parent hasn't filled (or filled seconds ago and
+        hasn't synced yet) — this must not be read as an orphaned SELL from a
+        reset. A live open BUY for the same ticker means the SELL is waiting on
+        its own parent, not orphaned."""
+        from src import ibkr_worker
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [
+            _order("GEN", action="BUY", qty=448, oid=1, otype="LMT"),
+            _order("GEN", action="SELL", qty=448, oid=2, otype="STP"),
+            _order("GEN", action="SELL", qty=448, oid=3, otype="LMT"),
+        ]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+        conn.cancel_order.assert_not_called()
