@@ -44,6 +44,8 @@
   "long_setups_top_n": 5,
   "alert_monitor_time": "09:30",
   "weekly_rotation_time": "08:15",
+  "llm_universe_curation_enabled": false,
+  "llm_universe_curation_time": "07:45",
   "catalyst_alert_time": "08:05",
   "momentum_enabled": true,
   "momentum_interval_minutes": 30,
