@@ -398,6 +398,9 @@ def weekly_digest(days: int = 7) -> dict:
         # None when the benchmark is unavailable — format_digest_message says so
         # explicitly rather than quietly printing an unbenchmarked win rate.
         "excess": _safe_benchmark_excess(),
+        # None until llm_universe_curator has produced at least one week of
+        # curated data — omitted from the message entirely until then.
+        "llm_curation_comparison": _safe_llm_curation_comparison(days),
     }
 
 
@@ -407,6 +410,73 @@ def _safe_benchmark_excess(lookback_days: int = 90) -> dict | None:
         return benchmark_excess(lookback_days)
     except Exception as e:
         logger.warning(f"[forward_signals] benchmark_excess failed: {e}")
+        return None
+
+
+def _llm_curation_comparison(days: int = 7) -> dict | None:
+    """Split recent forward_signals by whether the ticker was in the LLM's
+    most recent weekly curated set, to measure whether curation adds
+    anything over the quant-only baseline (see src/llm_universe_curator.py).
+
+    Returns None when there is no curation data yet — the feature is off, or
+    hasn't produced a week of curated data — so the digest omits this section
+    entirely rather than showing an empty or meaningless comparison. Never
+    raises; call through _safe_llm_curation_comparison().
+    """
+    with get_connection() as conn:
+        week_row = conn.execute(
+            "SELECT MAX(week_of) AS w FROM llm_curated_universe"
+        ).fetchone()
+        if not week_row or not week_row["w"]:
+            return None
+        curated = {
+            r["ticker"] for r in conn.execute(
+                "SELECT ticker FROM llm_curated_universe "
+                "WHERE week_of = ? AND action IN ('keep','add')",
+                (week_row["w"],),
+            ).fetchall()
+        }
+        if not curated:
+            return None
+
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = conn.execute(
+            "SELECT ticker, signal_type, return_7d_pct FROM forward_signals "
+            "WHERE signal_ts >= ? AND return_7d_pct IS NOT NULL",
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    def _group_stats(group_rows):
+        rets, wins, measured = [], 0, 0
+        for r in group_rows:
+            ret = r["return_7d_pct"]
+            rets.append(ret)
+            measured += 1
+            is_win = (ret < 0) if r["signal_type"] == "SELL" else (ret > 0)
+            wins += 1 if is_win else 0
+        return {
+            "measured": measured,
+            "avg_return_pct": (sum(rets) / len(rets)) if rets else None,
+            "win_rate_pct": (wins / measured * 100.0) if measured else None,
+        }
+
+    curated_rows = [r for r in rows if r["ticker"] in curated]
+    other_rows = [r for r in rows if r["ticker"] not in curated]
+    if not curated_rows and not other_rows:
+        return None
+
+    return {"llm_curated": _group_stats(curated_rows), "quant_only": _group_stats(other_rows)}
+
+
+def _safe_llm_curation_comparison(days: int = 7) -> dict | None:
+    """_llm_curation_comparison() must never be able to break the weekly digest send."""
+    try:
+        return _llm_curation_comparison(days)
+    except Exception as e:
+        logger.warning(f"[forward_signals] LLM curation comparison failed: {e}")
         return None
 
 
@@ -449,4 +519,24 @@ def format_digest_message(d: dict) -> str:
             lines.append("  🎯 Action: win rate above is market beta, not edge. Do not tune on it.")
     else:
         lines += ["", "📐 vs benchmark: unavailable — win rate above is UNBENCHMARKED"]
+
+    cmp = d.get("llm_curation_comparison")
+    if cmp:
+        lc, qo = cmp["llm_curated"], cmp["quant_only"]
+        lines += ["", "🧠 LLM-curated vs quant-only (7D):"]
+        if lc["avg_return_pct"] is not None:
+            lines.append(
+                f"  LLM-curated: {lc['avg_return_pct']:+.2f}% avg, "
+                f"{lc['win_rate_pct']:.1f}% win ({lc['measured']} measured)"
+            )
+        else:
+            lines.append("  LLM-curated: no measured signals this window")
+        if qo["avg_return_pct"] is not None:
+            lines.append(
+                f"  Quant-only:  {qo['avg_return_pct']:+.2f}% avg, "
+                f"{qo['win_rate_pct']:.1f}% win ({qo['measured']} measured)"
+            )
+        else:
+            lines.append("  Quant-only:  no measured signals this window")
+
     return "\n".join(lines)

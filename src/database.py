@@ -155,6 +155,22 @@ def _migrate(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE ibkr_positions ADD COLUMN exit_tier INTEGER DEFAULT 0")
         logger.info("Migrated ibkr_positions: added column exit_tier")
 
+    # llm_curated_universe — weekly LLM curation of the scanner's top-score pool
+    # into the actual monitoring set. action is 'keep' | 'add' | 'remove' relative
+    # to the previous week_of, for audit and low-turnover verification.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_curated_universe (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_of    TEXT NOT NULL,
+            ticker     TEXT NOT NULL,
+            action     TEXT NOT NULL,
+            rationale  TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_curated_week ON llm_curated_universe(week_of)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_curated_ticker ON llm_curated_universe(ticker)")
+
 
 
 _PERSISTENT_PRAGMAS_DONE = False

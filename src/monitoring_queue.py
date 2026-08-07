@@ -23,6 +23,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import yfinance as yf
@@ -30,6 +31,8 @@ import yfinance as yf
 from src.database import get_connection
 from src.execution_engine import _MIN_DAILY_DOLLAR_VOL
 from src.hysteresis import passes_hysteresis, LIQUIDITY_ADV_ENTRY, LIQUIDITY_ADV_EXIT
+
+_CONFIG_PATH = Path(__file__).parent.parent / "scheduler_config.json"
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,20 @@ def _liquid(ticker: str, already_in_queue: bool = False) -> bool:
         return False
 
 
+def _llm_curation_enabled() -> bool:
+    """Reads scheduler_config.json directly rather than importing scheduler.py,
+    to avoid coupling this leaf module to the scheduler's heavier import graph.
+    Defaults to False on any error — missing file, missing key, bad JSON — so
+    an unmodified or malformed config can never silently start filtering the
+    queue.
+    """
+    try:
+        cfg = json.loads(_CONFIG_PATH.read_text())
+        return bool(cfg.get("llm_universe_curation_enabled", False))
+    except Exception:
+        return False
+
+
 def _scanner_tickers(min_score: int = SCANNER_MIN_SCORE) -> list[tuple[str, float, str]]:
     """Recent scan results whose explosion_score >= min_score."""
     cutoff = (datetime.now() - timedelta(hours=SCANNER_LOOKBACK_HOURS)).isoformat()
@@ -160,6 +177,21 @@ def build_queue(min_score: int = SCANNER_MIN_SCORE, apply_liquidity_gate: bool =
 
     for tk, score, ts in _scanner_tickers(min_score=min_score):
         entries[tk] = QueueEntry(ticker=tk, source="scanner", composite_score=score, last_seen=ts)
+
+    # LLM weekly curation (disabled by default) refines the SCANNER pool only —
+    # manual watchlist entries and recent real-time buys are never subject to a
+    # week-old qualitative judgment call, only the broad score>=65 pool is.
+    if entries and _llm_curation_enabled():
+        try:
+            from src.llm_universe_curator import current_curated_tickers
+            curated = current_curated_tickers()
+        except Exception as e:
+            logger.warning(f"[queue] LLM curation lookup failed — leaving scanner pool as-is: {e}")
+            curated = None
+        if curated is not None:
+            before = len(entries)
+            entries = {tk: e for tk, e in entries.items() if tk in curated}
+            logger.info(f"[queue] LLM curation: kept {len(entries)}/{before} scanner tickers")
 
     for tk, ts in _manual_tickers():
         if tk not in entries:

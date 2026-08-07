@@ -570,6 +570,38 @@ def run_weekly_rotation():
         logger.error(f"Weekly rotation failed: {e}")
 
 
+def run_llm_universe_curation():
+    """Weekly LLM curation of the scanner's top-score pool (see src/llm_universe_curator.py).
+
+    Disabled by default (llm_universe_curation_enabled: false) — the scanner's
+    score>=65 gate is unaffected until this is explicitly turned on. On any
+    failure (LLM down, malformed response) run_weekly_curation() persists
+    nothing and the previous week's curated set, if any, remains in effect.
+    """
+    cfg = load_config()
+    if not cfg.get("enabled", False) or not cfg.get("llm_universe_curation_enabled", False):
+        return
+    try:
+        init_db()
+        from src.llm_universe_curator import run_weekly_curation
+        result = run_weekly_curation()
+        if not result["ok"]:
+            logger.warning("LLM universe curation: failed this week, no change made")
+            return
+        logger.info(
+            f"LLM universe curation: week {result['week_of']} — "
+            f"{len(result['curated'])} kept/added, {len(result['removed'])} removed"
+        )
+        if cfg.get("telegram", True) and (result["curated"] or result["removed"]):
+            TelegramNotifier().send_message(
+                f"🧠 LLM universe curation ({result['week_of']})\n"
+                f"Kept/added: {len(result['curated'])} tickers\n"
+                f"Removed: {len(result['removed'])} tickers"
+            )
+    except Exception as e:
+        logger.error(f"LLM universe curation failed: {e}")
+
+
 def run_watchlist_scan():
     if not _is_trading_day():
         logger.info("run_watchlist_scan: skipping — weekend")
@@ -1136,6 +1168,12 @@ def _main_body():
     weekly_rotation_time = cfg.get("weekly_rotation_time", "08:15")
     schedule.every().monday.at(weekly_rotation_time).do(run_weekly_rotation)
     logger.info(f"Weekly rotation scheduled every Monday at {weekly_rotation_time}")
+
+    # LLM Universe Curation — every Monday, disabled by default
+    if cfg.get("llm_universe_curation_enabled", False):
+        llm_curation_time = cfg.get("llm_universe_curation_time", "07:45")
+        schedule.every().monday.at(llm_curation_time).do(run_llm_universe_curation)
+        logger.info(f"LLM universe curation scheduled every Monday at {llm_curation_time}")
 
     schedule.every().day.at(portfolio_news_time).do(run_portfolio_news)
     logger.info(f"Portfolio news at {portfolio_news_time}")
