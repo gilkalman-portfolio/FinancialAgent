@@ -35,8 +35,12 @@ def _db(monkeypatch, tmp_path):
         return conn
 
     import src.llm_universe_curator  # noqa: F401
+    import src.monitoring_queue  # noqa: F401
     monkeypatch.setattr("src.database.get_connection", _get_conn)
     monkeypatch.setattr("src.llm_universe_curator.get_connection", _get_conn)
+    # build_universe_digest() delegates ranking to monitoring_queue._scanner_tickers(),
+    # which binds its own get_connection reference at module load — must be patched too.
+    monkeypatch.setattr("src.monitoring_queue.get_connection", _get_conn)
 
     conn = _get_conn()
     conn.executescript("""
@@ -74,56 +78,78 @@ def _curated_row(get_conn, week_of, ticker, action, rationale="x", created_at=No
 
 
 # ── build_universe_digest ────────────────────────────────────────────────────
+#
+# Ranking is delegated to monitoring_queue._scanner_tickers() (already covered
+# by tests/test_monitoring_queue_liquidity_hysteresis.py and its own scan_type
+# handling) — tests here mock it directly for ranking/top_n behavior, and use
+# real scan_results rows only for the enrichment (price floor, raw_data
+# extraction, latest-row-per-ticker) that build_universe_digest() itself owns.
 
 class TestBuildDigest:
-    def test_empty_when_no_recent_scans(self, _db):
+    def test_empty_when_scanner_has_no_candidates(self, _db):
         from src.llm_universe_curator import build_universe_digest
-        assert build_universe_digest() == []
+        with patch("src.monitoring_queue._scanner_tickers", return_value=[]):
+            assert build_universe_digest() == []
 
-    def test_dedups_to_most_recent_row_per_ticker(self, _db):
+    def test_ticker_with_no_matching_scan_results_row_is_skipped(self, _db):
+        """_scanner_tickers() and the enrichment lookup query scan_results
+        independently — a ticker present in one but not the other (a race, or
+        a row pruned between the two queries) must not crash or fabricate
+        a price."""
         from src.llm_universe_curator import build_universe_digest
-        now = datetime.now()
-        _scan_row(_db, "AAA", 60, 10.0, (now - timedelta(hours=20)).isoformat())
-        _scan_row(_db, "AAA", 75, 12.0, (now - timedelta(hours=2)).isoformat())  # newer wins
-        digest = build_universe_digest()
-        assert len(digest) == 1
-        assert digest[0]["score"] == 75
-        assert digest[0]["price"] == 12.0
+        with patch("src.monitoring_queue._scanner_tickers",
+                   return_value=[("GHOST", 90, "t")]):
+            assert build_universe_digest() == []
 
     def test_price_floor_excludes_penny_stocks(self, _db):
         from src.llm_universe_curator import build_universe_digest
         now = datetime.now().isoformat()
         _scan_row(_db, "PENNY", 90, 2.50, now)
         _scan_row(_db, "REAL", 90, 25.0, now)
-        digest = build_universe_digest()
+        with patch("src.monitoring_queue._scanner_tickers",
+                   return_value=[("PENNY", 90, now), ("REAL", 90, now)]):
+            digest = build_universe_digest()
         tickers = {d["ticker"] for d in digest}
         assert "PENNY" not in tickers
         assert "REAL" in tickers
 
-    def test_sorted_by_score_desc_and_respects_top_n(self, _db):
+    def test_respects_top_n_and_preserves_scanner_order(self, _db):
+        """Score-descending order is _scanner_tickers()'s contract, not
+        re-derived here — build_universe_digest() must not reorder it."""
         from src.llm_universe_curator import build_universe_digest
         now = datetime.now().isoformat()
-        for i, score in enumerate([50, 90, 70, 30, 80]):
-            _scan_row(_db, f"T{i}", score, 20.0, now)
-        digest = build_universe_digest(top_n=3)
-        assert [d["score"] for d in digest] == [90, 80, 70]
+        ranked = [("T1", 90, now), ("T2", 80, now), ("T3", 70, now), ("T4", 60, now)]
+        for t, score, ts in ranked:
+            _scan_row(_db, t, score, 20.0, ts)
+        with patch("src.monitoring_queue._scanner_tickers", return_value=ranked):
+            digest = build_universe_digest(top_n=2)
+        assert [d["ticker"] for d in digest] == ["T1", "T2"]
 
-    def test_extracts_raw_data_fields(self, _db):
+    def test_extracts_raw_data_fields_from_latest_row(self, _db):
         from src.llm_universe_curator import build_universe_digest
-        now = datetime.now().isoformat()
+        now = datetime.now()
+        _scan_row(_db, "AAA", 60, 25.0, (now - timedelta(hours=6)).isoformat())  # stale row
         raw = {"momentum": 5.5, "short_pct": 12.0, "dcf": {"margin_of_safety_pct": 22.0}}
-        _scan_row(_db, "AAA", 80, 30.0, now, raw=raw, catalyst="earnings 8/15")
-        digest = build_universe_digest()
+        _scan_row(_db, "AAA", 80, 30.0, now.isoformat(), raw=raw, catalyst="earnings 8/15")
+        with patch("src.monitoring_queue._scanner_tickers",
+                   return_value=[("AAA", 80, now.isoformat())]):
+            digest = build_universe_digest()
+        assert digest[0]["price"] == 30.0  # latest row's price, not the stale one
         assert digest[0]["momentum"] == 5.5
         assert digest[0]["short_pct"] == 12.0
         assert digest[0]["dcf_margin_of_safety_pct"] == 22.0
         assert digest[0]["catalyst"] == "earnings 8/15"
 
-    def test_old_scans_outside_lookback_are_excluded(self, _db):
+    def test_malformed_raw_data_json_is_tolerated(self, _db):
         from src.llm_universe_curator import build_universe_digest
-        stale = (datetime.now() - timedelta(days=10)).isoformat()
-        _scan_row(_db, "OLD", 90, 20.0, stale)
-        assert build_universe_digest() == []
+        now = datetime.now().isoformat()
+        with _db() as c:
+            c.execute(
+                "INSERT INTO scan_results (ticker, scanned_at, price, explosion_score, raw_data) "
+                "VALUES ('AAA', ?, 30.0, 80, 'not valid json')", (now,))
+        with patch("src.monitoring_queue._scanner_tickers", return_value=[("AAA", 80, now)]):
+            digest = build_universe_digest()
+        assert digest == [{"ticker": "AAA", "score": 80, "price": 30.0}]
 
 
 # ── curate_universe ──────────────────────────────────────────────────────────
@@ -161,6 +187,19 @@ class TestCurateUniverse:
             "selections": [{"ticker": "AAA", "action": "keep", "rationale": "x"}],
             "removed": [],
         }) + "\n```"
+        with patch("src.llm_client.llm_complete", return_value=response):
+            result = curate_universe(self.DIGEST, [])
+        assert result is not None
+        assert result["selections"][0]["ticker"] == "AAA"
+
+    def test_lowercased_ticker_from_llm_still_matches(self, _db):
+        """The shortlist is uppercase; the LLM echoing 'aapl' is a normalization
+        quirk, not an off-list ticker, and must not be silently dropped."""
+        from src.llm_universe_curator import curate_universe
+        response = json.dumps({
+            "selections": [{"ticker": "aaa", "action": "keep", "rationale": "x"}],
+            "removed": [],
+        })
         with patch("src.llm_client.llm_complete", return_value=response):
             result = curate_universe(self.DIGEST, [])
         assert result is not None
@@ -245,6 +284,37 @@ class TestRunWeeklyCuration:
         _curated_row(_db, "2026-07-27", "AAA", "keep")
         _curated_row(_db, "2026-07-27", "BBB", "remove")
         assert _previous_week_tickers("2026-08-03") == ["AAA"]
+
+    def test_rerun_same_week_replaces_not_accumulates(self, _db):
+        """A scheduler crash/restart retrying the same Monday's job must not
+        UNION a stale attempt's rows with the retry's — current_curated_tickers()
+        would otherwise resurrect a superseded selection."""
+        from src import llm_universe_curator as luc
+        now = datetime.now().isoformat()
+        _scan_row(_db, "AAA", 90, 30.0, now)
+        _scan_row(_db, "BBB", 80, 25.0, now)
+
+        first_response = json.dumps({
+            "selections": [{"ticker": "AAA", "action": "add", "rationale": "first attempt"}],
+            "removed": [],
+        })
+        with patch("src.llm_client.llm_complete", return_value=first_response):
+            luc.run_weekly_curation()
+
+        second_response = json.dumps({
+            "selections": [{"ticker": "BBB", "action": "add", "rationale": "retry, different pick"}],
+            "removed": [],
+        })
+        with patch("src.llm_client.llm_complete", return_value=second_response):
+            result = luc.run_weekly_curation()
+
+        assert result["curated"] == ["BBB"]
+        with _db() as c:
+            rows = c.execute(
+                "SELECT ticker FROM llm_curated_universe WHERE week_of = ?", (result["week_of"],)
+            ).fetchall()
+        tickers = {r["ticker"] for r in rows}
+        assert tickers == {"BBB"}, f"expected only the retry's picks, got {tickers}"
 
 
 # ── current_curated_tickers ───────────────────────────────────────────────────

@@ -72,33 +72,52 @@ def _monday_of(dt: datetime) -> str:
 
 
 def build_universe_digest(top_n: int = DIGEST_TOP_N) -> list[dict]:
-    """Most recent scan_results row per ticker, price >= PRICE_FLOOR, top_n by
-    score. Pulls score components already computed by stock_scorer.py out of
-    raw_data — no new scans or API calls. Returns [] if no recent scan data.
+    """Top-ranked tickers from the SAME pool that already feeds the live
+    monitoring queue, enriched with score components already computed by
+    stock_scorer.py — no new scans or API calls. Returns [] if no recent
+    scan data.
+
+    Ranking is delegated to monitoring_queue._scanner_tickers() rather than
+    querying scan_results directly. scan_results is shared by scheduled
+    scans (explosion_score = the stock_scorer composite) AND catalyst scans
+    (explosion_score = a differently-scaled explosion metric) with no
+    scan_type filter of its own — mixing the two produced exactly this bug
+    in backtester.py before it was fixed to filter scan_type='scheduled'.
+    Reusing _scanner_tickers() guarantees the digest's population is
+    provably identical to "the scanner pool" this feature is meant to
+    curate, not a similar-but-diverging duplicate query.
     """
-    cutoff = (datetime.now() - timedelta(hours=SCAN_LOOKBACK_HOURS)).isoformat()
+    from src.monitoring_queue import _scanner_tickers
+
+    ranked = _scanner_tickers(min_score=0)[:top_n]  # already sorted DESC by score
+    if not ranked:
+        return []
+
+    tickers = [t for t, _, _ in ranked]
+    placeholders = ",".join("?" for _ in tickers)
     with get_connection() as conn:
         rows = conn.execute(
-            """
-            SELECT ticker, explosion_score AS score, price, raw_data, catalyst, scanned_at
+            f"""
+            SELECT ticker, price, raw_data, catalyst, scanned_at
             FROM scan_results
-            WHERE scanned_at >= ? AND explosion_score IS NOT NULL AND price >= ?
+            WHERE ticker IN ({placeholders})
             ORDER BY scanned_at ASC
             """,
-            (cutoff, PRICE_FLOOR),
+            tickers,
         ).fetchall()
-
-    latest = {}
+    meta = {}
     for r in rows:
-        latest[r["ticker"]] = r  # ascending scan time — last write per ticker wins
-
-    ranked = sorted(latest.values(), key=lambda r: r["score"] or 0, reverse=True)[:top_n]
+        meta[r["ticker"]] = r  # ascending scan time — last write per ticker wins
 
     digest = []
-    for r in ranked:
-        entry = {"ticker": r["ticker"], "score": r["score"], "price": r["price"]}
+    for ticker, score, _ in ranked:
+        m = meta.get(ticker)
+        price = m["price"] if m else None
+        if price is None or price < PRICE_FLOOR:
+            continue
+        entry = {"ticker": ticker, "score": score, "price": price}
         try:
-            raw = json.loads(r["raw_data"]) if r["raw_data"] else {}
+            raw = json.loads(m["raw_data"]) if m["raw_data"] else {}
         except (TypeError, ValueError):
             raw = {}
         if raw.get("momentum") is not None:
@@ -108,8 +127,8 @@ def build_universe_digest(top_n: int = DIGEST_TOP_N) -> list[dict]:
         dcf = raw.get("dcf")
         if isinstance(dcf, dict) and dcf.get("margin_of_safety_pct") is not None:
             entry["dcf_margin_of_safety_pct"] = dcf["margin_of_safety_pct"]
-        if r["catalyst"]:
-            entry["catalyst"] = r["catalyst"]
+        if m["catalyst"]:
+            entry["catalyst"] = m["catalyst"]
         digest.append(entry)
     return digest
 
@@ -164,6 +183,8 @@ def curate_universe(
     verified = []
     for s in selections:
         t = s.get("ticker") if isinstance(s, dict) else None
+        if isinstance(t, str):
+            t = t.strip().upper()  # the LLM echoing "aapl" must still match "AAPL"
         if t not in allowed:
             logger.warning(f"[llm_curator] dropped off-list ticker from LLM output: {t!r}")
             continue
@@ -227,6 +248,10 @@ def run_weekly_curation(target_size: int = DEFAULT_TARGET_SIZE) -> dict:
         for r in result["removed"]
     ]
     with get_connection() as conn:
+        # A re-run for the same week_of (e.g. a scheduler crash/restart retry)
+        # must REPLACE, not accumulate — otherwise a stale/superseded attempt's
+        # rows stay UNION'd into current_curated_tickers() alongside the retry's.
+        conn.execute("DELETE FROM llm_curated_universe WHERE week_of = ?", (week_of,))
         conn.executemany(
             "INSERT INTO llm_curated_universe (week_of, ticker, action, rationale, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
