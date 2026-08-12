@@ -506,28 +506,35 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
         logger.info(f"[worker] trailing stops updated: {updated} positions raised")
 
 
-def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
-    """Cancel resting SELL orders that have no long position behind them.
+def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
+    """Enforce: no resting SELL order may ever exceed the position it protects.
 
-    In a long-only bot such an order has exactly one possible outcome: if it
-    fills, it opens a short. There is no legitimate case for keeping it.
+    In a long-only bot a resting SELL that fills for more shares than are held
+    has exactly one possible outcome: it opens a short. There is no legitimate
+    case for leaving one oversized. Two situations, two responses:
 
-    This is not theoretical. On 2026-08-06 an IBKR paper-account reset flattened
-    every position but left the GTC bracket legs resting at the broker. Those
-    SELL orders then executed against a zero position and created five shorts
-    (BOX 154, CARG 133, GEN 176 — each exactly the prior long size, i.e. the size
-    its bracket leg was written for). The reset clears positions; it does not
-    clear orders.
+    - held <= 0: CANCEL. Unambiguous — there is nothing left to protect.
+      On 2026-08-06 an IBKR paper-account reset flattened every position but
+      left the GTC bracket legs resting at the broker. Those SELL orders then
+      executed against a zero position and created five shorts (BOX 154,
+      CARG 133, GEN 176 — each exactly the prior long size). The reset clears
+      positions; it does not clear orders.
 
-    Only cancels when held <= 0, which is unambiguous. A SELL larger than the
-    remaining long is logged but left alone: that is the normal shape of a stop
-    leg after a partial exit, and cancelling it would strip the position of its
-    protection.
+    - held > 0 but qty > held: RESIZE down to held, don't cancel and don't
+      leave it. On 2026-08-11 SENEA's T1 tiered exit sold 40% (28 of 70sh) and
+      moved the stop's trigger price to breakeven via modify_stop_order — but
+      that only touches auxPrice, never quantity, so the STP stayed sized for
+      70. It filled a few minutes later against the 42sh actually held,
+      putting the account short exactly 28sh — the T1-sold amount. The
+      original fix here just logged a warning and left the leg alone
+      ("cancelling would strip protection"), which is true but incomplete:
+      the correct move was always to shrink the leg to match, not choose
+      between removing protection and leaving a live short trigger armed.
     """
     try:
         orders = conn.get_open_orders()
     except Exception as e:
-        logger.warning(f"[worker] unbacked-sell sweep: get_open_orders failed: {e}")
+        logger.warning(f"[worker] resting-sell reconcile: get_open_orders failed: {e}")
         return 0
 
     sells = [o for o in orders if o.get("action") == "SELL"]
@@ -536,7 +543,7 @@ def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
 
     # A ticker with a still-open BUY is mid-entry: a bracket's stop/target legs
     # are placed alongside the parent, before it fills, so a SELL here is waiting
-    # on its own parent — not orphaned by a reset. Cancelling it here permanently
+    # on its own parent — not orphaned by a reset. Touching it here permanently
     # strips protection the moment the parent does fill.
     pending_buys = {o.get("ticker") for o in orders if o.get("action") == "BUY"}
 
@@ -546,10 +553,12 @@ def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
             for row in db.execute("SELECT ticker, shares FROM ibkr_positions"):
                 held[row["ticker"]] = float(row["shares"] or 0)
     except Exception as e:
-        logger.warning(f"[worker] unbacked-sell sweep: position read failed: {e}")
+        logger.warning(f"[worker] resting-sell reconcile: position read failed: {e}")
         return 0
 
     cancelled = []
+    resized = []
+    resized_tickers: set[str] = set()
     for o in sells:
         t = o.get("ticker")
         if t in pending_buys:
@@ -557,11 +566,18 @@ def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
         have = held.get(t, 0.0)
         qty = int(o.get("qty") or 0)
         if have > 0:
-            if qty > have:
-                logger.warning(
-                    f"[worker] {t}: resting SELL {qty}sh exceeds long {have:.0f}sh "
-                    f"— left in place (likely a stop leg after a partial exit)"
-                )
+            if qty > have and t not in resized_tickers:
+                resized_tickers.add(t)
+                try:
+                    ids = conn.resize_sell_orders(t, int(have))
+                    if ids:
+                        resized.append(f"{t} {qty}sh -> {int(have)}sh (#{','.join(str(i) for i in ids)})")
+                        logger.warning(
+                            f"[worker] resized resting SELL: {t} {qty}sh -> {int(have)}sh "
+                            f"— was oversized after a partial exit"
+                        )
+                except Exception as e:
+                    logger.error(f"[worker] failed to resize resting SELL {t}: {e}")
             continue
         try:
             if conn.cancel_order(o["order_id"]):
@@ -580,6 +596,13 @@ def _cancel_unbacked_sell_orders(conn: IBKRConnection) -> int:
             + "\n".join(f"  {c}" for c in cancelled)
             + "\n\n🎯 Action: none needed — they are gone. Usually caused by an "
               "account reset, which clears positions but not resting orders."
+        )
+    if resized:
+        _send_telegram(
+            "✂️ RESIZED OVERSIZED STOP/TARGET ORDERS\n"
+            "These exceeded the current position after a partial exit — capped to avoid opening a short:\n"
+            + "\n".join(f"  {r}" for r in resized)
+            + "\n\n🎯 Action: none needed — protection is still in place at the correct size."
         )
     return len(cancelled)
 
@@ -1104,9 +1127,9 @@ def run_once(conn: IBKRConnection) -> int:
     except Exception as e:
         logger.warning(f"[worker] unbacked-sell sweep: pre-sync failed: {e}")
     try:
-        _cancel_unbacked_sell_orders(conn)
+        _reconcile_resting_sell_orders(conn)
     except Exception as e:
-        logger.warning(f"[worker] unbacked-sell sweep failed: {e}")
+        logger.warning(f"[worker] resting-sell reconcile failed: {e}")
 
     # Exit strategy layer — runs after signals, never blocks the main loop
     try:

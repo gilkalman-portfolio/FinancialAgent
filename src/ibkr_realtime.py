@@ -314,6 +314,37 @@ class IBKRConnection:
         logger.debug(f"[ibkr] no active STP SELL order found for {ticker}")
         return False
 
+    def resize_sell_orders(self, ticker: str, max_qty: int) -> list[int]:
+        """Cap every resting SELL order for ticker at max_qty shares.
+
+        A bracket's STP stop and LMT target legs are both written for the
+        full entry size. A partial exit (tiered take-profit) shrinks the
+        held position but leaves both legs at the old, larger quantity —
+        whichever fills first then sells more than is held, opening a short
+        for exactly the difference. Resizing in place (same technique as
+        modify_stop_order: re-submit with the same orderId) keeps the
+        order's protection/target at the correct smaller quantity instead of
+        cancelling it outright or leaving it oversized.
+
+        Returns the order_ids that were resized.
+        """
+        resized = []
+        for trade in self.ib.openTrades():
+            o = trade.order
+            if (trade.contract.symbol == ticker
+                    and o.action == "SELL"
+                    and o.orderType in ("STP", "LMT")
+                    and int(o.totalQuantity) > max_qty):
+                old_qty = int(o.totalQuantity)
+                o.totalQuantity = max_qty
+                self.ib.placeOrder(trade.contract, o)
+                logger.info(
+                    f"[ibkr] resized resting SELL: {ticker} {old_qty} -> {max_qty} "
+                    f"(order_id={o.orderId}, type={o.orderType})"
+                )
+                resized.append(o.orderId)
+        return resized
+
     # ── Position & Account queries (Phase 2) ────────────────────────────
 
     def get_positions(self) -> dict[str, dict]:

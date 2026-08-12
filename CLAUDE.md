@@ -969,6 +969,50 @@ Fixes:
 **Operator action this does NOT cover:** the 14 existing shorts must be closed manually in
 TWS. The code prevents recurrence and forces a halt; it does not unwind an existing book.
 
+### 🔴 Resting Stop/Target Left Oversized After a Partial Exit — 2026-08-12
+
+Fourth distinct mechanism (after 2026-08-03, -05, -06) that put the long-only bot into a
+short. Each prior incident was patched narrowly for its own mechanism instead of the actual
+invariant — **a resting SELL order must never exceed the position it protects** — which is
+exactly why a new one kept appearing every few days. `_cancel_unbacked_sell_orders()` (added
+2026-08-06) already checked resting SELL qty against held shares, but only acted when
+`held <= 0`; when `held > 0` and `qty > held` it logged a warning and explicitly left the
+order alone, reasoning that cancelling it would strip real protection. That reasoning was
+half right — cancelling is wrong — but leaving it oversized is just as wrong, and this
+incident is the proof.
+
+**SENEA, 2026-08-10/11:** bracket BUY 70sh filled; STP stop + LMT target legs both written
+for 70. T1 tiered exit (+7%) sold 40% = 28sh via a separate order and moved the STP's trigger
+price to breakeven via `modify_stop_order()` — which only ever touches `auxPrice`, never
+`totalQuantity`. The STP stayed resting at qty=70 against a 42sh position. Every cycle from
+21:49 onward logged `SENEA: resting SELL 70sh exceeds long 42sh — left in place` and did
+nothing. During a routine disconnect/reconnect gap (22:54:34–22:57:00) the stop filled for
+the full 70sh, flipping the account to **-28sh** — exactly the T1-sold amount, the same
+signature as the 2026-08-06 incident (short size == prior order's written size). The
+2026-08-05 short-alarm guard (`_raise_short_alarm`) caught it on the next sync and paused
+trading; it has stayed paused every cycle since, including across a worker restart. No BUY
+orders were submitted while paused — the safety net held. Paper account only (`IBKR_LIVE`
+unset); no real money was at risk.
+
+- [x] **`IBKRConnection.resize_sell_orders(ticker, max_qty)`** — `src/ibkr_realtime.py`: caps
+  every resting SELL (STP or LMT) for a ticker at `max_qty`, re-submitting with the same
+  orderId (same in-place-modify technique as `modify_stop_order`). Handles both bracket legs
+  (stop and target) in one call.
+- [x] **`_cancel_unbacked_sell_orders` → `_reconcile_resting_sell_orders`** —
+  `src/ibkr_worker.py`: same cancel-when-`held<=0` behavior, plus a new
+  resize-when-`0 < held < qty` branch that calls `resize_sell_orders(ticker, held)` instead of
+  only logging. Telegram sent on either action (`🧹 CANCELLED...` / `✂️ RESIZED...`).
+- [x] Runs from the same call site in `run_once()`, same cadence (every cycle, right after the
+  fresh position sync) — no new scheduling surface.
+
+`tests/test_unbacked_sells.py` — replays the SENEA incident exactly (70sh order, 42sh held →
+must resize to 42, must not cancel) plus the case of both bracket legs oversized together
+(one `resize_sell_orders` call handles both, not two). 12 tests, all passing.
+
+**Structural note for future incidents in this family:** if a fifth mechanism surfaces, prefer
+strengthening `_reconcile_resting_sell_orders` (the one place this invariant is enforced) over
+adding another narrow guard in whichever code path triggered it.
+
 ### Trigger Backtest — 2026-08-05
 
 `src/trigger_backtest.py` + `run_trigger_backtest.py` added. This is the validation

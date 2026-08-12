@@ -1,11 +1,18 @@
 """
-A resting SELL with no long behind it can only open a short.
+A resting SELL that can fill for more shares than are held can only open a short.
 
 On 2026-08-06 an IBKR paper-account reset flattened every position but left the
 GTC bracket legs resting at the broker. They executed against a zero position and
 created five shorts — BOX 154, CARG 133, GEN 176, each exactly the prior long
 size, i.e. the size its bracket leg was written for. A reset clears positions; it
-does not clear orders.
+does not clear orders. Those get CANCELLED (held <= 0, unambiguous).
+
+On 2026-08-11 SENEA's T1 tiered exit sold 40% (28 of 70sh) and moved the STP
+stop's trigger price to breakeven, but never touched its quantity — it stayed
+sized for 70. It filled minutes later against the 42sh actually held, shorting
+the account exactly 28sh (the T1-sold amount). Those get RESIZED down to the
+held amount (held > 0, but qty > held) — cancelling would strip real protection,
+leaving it oversized guarantees a short the moment it fills.
 """
 
 import sqlite3
@@ -62,7 +69,7 @@ class TestCancelsUnbacked:
         conn.cancel_order.return_value = True
 
         with patch.object(ibkr_worker, "_send_telegram") as tg:
-            n = ibkr_worker._cancel_unbacked_sell_orders(conn)
+            n = ibkr_worker._reconcile_resting_sell_orders(conn)
 
         assert n == 1
         conn.cancel_order.assert_called_once_with(11)
@@ -79,7 +86,7 @@ class TestCancelsUnbacked:
         conn.cancel_order.return_value = True
 
         with patch.object(ibkr_worker, "_send_telegram"):
-            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 5
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 5
         assert conn.cancel_order.call_count == 5
 
     def test_short_position_also_counts_as_unbacked(self, _db):
@@ -89,7 +96,64 @@ class TestCancelsUnbacked:
         conn.get_open_orders.return_value = [_order("KSS", qty=300, oid=9)]
         conn.cancel_order.return_value = True
         with patch.object(ibkr_worker, "_send_telegram"):
-            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 1
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 1
+
+
+class TestResizesOversized:
+    def test_oversized_stop_leg_is_resized_not_cancelled(self, _db):
+        """Normal after a partial exit — cancelling would strip protection,
+        leaving it oversized would arm a short. Resize is the only safe move."""
+        from src import ibkr_worker
+        _pos(_db, "AAA", 60)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("AAA", qty=100, oid=4)]
+        conn.resize_sell_orders.return_value = [4]
+        with patch.object(ibkr_worker, "_send_telegram") as tg:
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
+        conn.cancel_order.assert_not_called()
+        conn.resize_sell_orders.assert_called_once_with("AAA", 60)
+        assert "AAA" in tg.call_args[0][0]
+
+    def test_senea_incident_replay(self, _db):
+        """70sh entry, T1 sells 28 (40%), 42 remain. The STP stop leg was left
+        at qty=70 by the old code and later filled short by exactly 28sh. The
+        reconcile pass must cap it at 42 before that can happen."""
+        from src import ibkr_worker
+        _pos(_db, "SENEA", 42)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [
+            _order("SENEA", qty=70, oid=75240, otype="STP"),
+        ]
+        conn.resize_sell_orders.return_value = [75240]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+        conn.resize_sell_orders.assert_called_once_with("SENEA", 42)
+        conn.cancel_order.assert_not_called()
+
+    def test_both_bracket_legs_resized_together_once(self, _db):
+        """A bracket leaves both a STP stop and a LMT target, both oversized
+        after a partial exit. One resize_sell_orders call per ticker handles
+        both legs at the broker; the worker must not call it twice."""
+        from src import ibkr_worker
+        _pos(_db, "AAA", 42)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [
+            _order("AAA", qty=70, oid=1, otype="STP"),
+            _order("AAA", qty=70, oid=2, otype="LMT"),
+        ]
+        conn.resize_sell_orders.return_value = [1, 2]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+        conn.resize_sell_orders.assert_called_once_with("AAA", 42)
+
+    def test_resize_failure_does_not_raise(self, _db):
+        from src import ibkr_worker
+        _pos(_db, "AAA", 60)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("AAA", qty=100, oid=4)]
+        conn.resize_sell_orders.side_effect = RuntimeError("not connected")
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
 
 
 class TestLeavesLegitimateOrders:
@@ -99,38 +163,29 @@ class TestLeavesLegitimateOrders:
         conn = MagicMock()
         conn.get_open_orders.return_value = [_order("AAA", qty=200, oid=3)]
         with patch.object(ibkr_worker, "_send_telegram"):
-            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
         conn.cancel_order.assert_not_called()
-
-    def test_oversized_stop_leg_is_warned_not_cancelled(self, _db):
-        """Normal after a partial exit — cancelling would strip protection."""
-        from src import ibkr_worker
-        _pos(_db, "AAA", 60)
-        conn = MagicMock()
-        conn.get_open_orders.return_value = [_order("AAA", qty=100, oid=4)]
-        with patch.object(ibkr_worker, "_send_telegram"):
-            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
-        conn.cancel_order.assert_not_called()
+        conn.resize_sell_orders.assert_not_called()
 
     def test_buy_orders_are_ignored(self, _db):
         from src import ibkr_worker
         conn = MagicMock()
         conn.get_open_orders.return_value = [_order("AAA", action="BUY", qty=100, oid=5)]
         with patch.object(ibkr_worker, "_send_telegram"):
-            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
         conn.cancel_order.assert_not_called()
 
     def test_no_orders_is_a_no_op(self, _db):
         from src import ibkr_worker
         conn = MagicMock()
         conn.get_open_orders.return_value = []
-        assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+        assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
 
     def test_broker_failure_does_not_raise(self, _db):
         from src import ibkr_worker
         conn = MagicMock()
         conn.get_open_orders.side_effect = RuntimeError("not connected")
-        assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+        assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
 
     def test_bracket_stop_leg_survives_while_parent_buy_is_still_pending(self, _db):
         """TMDX/GEN/STE/EVER, 2026-08-07: a bracket's stop+target legs are placed
@@ -147,5 +202,6 @@ class TestLeavesLegitimateOrders:
             _order("GEN", action="SELL", qty=448, oid=3, otype="LMT"),
         ]
         with patch.object(ibkr_worker, "_send_telegram"):
-            assert ibkr_worker._cancel_unbacked_sell_orders(conn) == 0
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
         conn.cancel_order.assert_not_called()
+        conn.resize_sell_orders.assert_not_called()
