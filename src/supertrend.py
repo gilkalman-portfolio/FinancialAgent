@@ -23,6 +23,7 @@ Algorithm:
 
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from typing import Optional
 from loguru import logger
 
@@ -130,3 +131,82 @@ def supertrend(
     except Exception as e:
         logger.warning(f"[supertrend] calculation failed: {e}")
         return _empty
+
+
+def scan_supertrend_universe(
+    tickers: list,
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> list:
+    """
+    Batch-download daily OHLCV for `tickers` (same yf.download(..., threads=True)
+    pattern as momentum_scanner.scan_momentum — ~0.2s/ticker at scale) and return
+    every ticker with a FRESH bullish Supertrend flip (bars_ago == 1) on the daily
+    bar, unfiltered by composite score. Mirrors a bare TradingView
+    alertcondition(buySignal) applied to the whole scan universe, not just the
+    pre-filtered IBKR monitoring queue (see src/monitoring_queue.py:39,
+    SCANNER_MIN_SCORE=65) — the two are intentionally independent so a ticker
+    with a strong technical flip but a middling composite score is still caught.
+
+    Returns list of {"ticker", "price", "level", "avg_volume"} sorted by ticker.
+    """
+    if not tickers:
+        return []
+
+    logger.info(f"Supertrend universe scan: downloading {len(tickers)} tickers")
+    try:
+        raw = yf.download(
+            tickers,
+            period="1y",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        logger.error(f"Supertrend universe scan download failed: {e}")
+        return []
+
+    if raw.empty:
+        logger.warning("Supertrend universe scan: empty data returned")
+        return []
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        highs, lows, closes, volumes = raw["High"], raw["Low"], raw["Close"], raw["Volume"]
+    else:
+        highs   = raw[["High"]].rename(columns={"High": tickers[0]})
+        lows    = raw[["Low"]].rename(columns={"Low": tickers[0]})
+        closes  = raw[["Close"]].rename(columns={"Close": tickers[0]})
+        volumes = raw[["Volume"]].rename(columns={"Volume": tickers[0]})
+
+    results = []
+    for ticker in tickers:
+        if ticker not in closes.columns:
+            continue
+        try:
+            hist = pd.DataFrame({
+                "High":  highs[ticker],
+                "Low":   lows[ticker],
+                "Close": closes[ticker],
+            }).dropna()
+            if len(hist) < period + 2:
+                continue
+
+            st = supertrend(hist, period=period, multiplier=multiplier, lookback=1)
+            if st["signal"] != "BUY":
+                continue
+
+            vol = volumes[ticker].dropna() if ticker in volumes.columns else pd.Series(dtype=float)
+            avg_volume = float(vol.tail(20).mean()) if len(vol) >= 20 else 0.0
+
+            results.append({
+                "ticker":     ticker,
+                "price":      float(hist["Close"].iloc[-1]),
+                "level":      st["level"],
+                "avg_volume": avg_volume,
+            })
+        except Exception as e:
+            logger.debug(f"Supertrend universe scan {ticker}: {e}")
+
+    results.sort(key=lambda r: r["ticker"])
+    logger.info(f"Supertrend universe scan complete: {len(results)}/{len(tickers)} fresh bullish flips")
+    return results

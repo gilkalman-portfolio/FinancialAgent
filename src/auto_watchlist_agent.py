@@ -134,16 +134,29 @@ def _filter_momentum(r: dict, src_cfg: dict, req_liquidity: bool, already_in: bo
     return True
 
 
+def _filter_supertrend(r: dict, src_cfg: dict, req_liquidity: bool, already_in: bool = False) -> bool:
+    """Intentionally NO composite-score gate — every fresh bullish Supertrend
+    flip qualifies, mirroring a bare TradingView alertcondition(buySignal).
+    Only sanity floors apply (penny-stock price floor, optional liquidity)."""
+    if r.get("price", 0) < src_cfg.get("price_floor", 5.0):
+        return False
+    if req_liquidity and not _check_liquidity(r, src_cfg, already_in=already_in):
+        return False
+    return True
+
+
 _FILTERS = {
-    "squeeze":  _filter_squeeze,
-    "catalyst": _filter_catalyst,
-    "momentum": _filter_momentum,
+    "squeeze":     _filter_squeeze,
+    "catalyst":    _filter_catalyst,
+    "momentum":    _filter_momentum,
+    "supertrend":  _filter_supertrend,
 }
 
 _EMOJI = {
-    "squeeze":  "🔥",
-    "catalyst": "⚡",
-    "momentum": "🚀",
+    "squeeze":    "🔥",
+    "catalyst":   "⚡",
+    "momentum":   "🚀",
+    "supertrend": "📈",
 }
 
 
@@ -164,6 +177,8 @@ def _build_notes(r: dict, source: str) -> str:
             f"Auto [momentum]: ROC {r.get('roc_20d', 0):+.1f}% "
             f"Vol {r.get('vol_ratio', 0):.1f}x Score {r.get('score', 0):.0f} on {today}"
         )
+    if source == "supertrend":
+        return f"Auto [supertrend]: Bullish flip @ ${r.get('price', 0):.2f}, stop ${r.get('level', 0):.2f} on {today}"
     return f"Auto [{source}] on {today}"
 
 
@@ -179,6 +194,8 @@ def _build_telegram_line(r: dict, source: str) -> str:
         event = r.get("catalyst_detail") or r.get("catalyst", "Event")
         days  = r.get("days_to_event", "?")
         return f"{ticker} | Score {r.get('explosion_score', 0):.0f} | {event} ({days}d)"
+    if source == "supertrend":
+        return f"{ticker} | Bullish flip @ ${r.get('price', 0):.2f} | Stop ${r.get('level', 0):.2f}"
     # momentum
     return (
         f"{ticker} | Score {r.get('score', 0):.0f} | "

@@ -51,6 +51,9 @@
   "momentum_interval_minutes": 30,
   "momentum_threshold": 70,
   "momentum_indices": ["Russell 2000", "S&P 500"],
+  "supertrend_universe_enabled": true,
+  "supertrend_universe_interval_minutes": 30,
+  "supertrend_universe_indices": ["Russell 2000", "S&P 500"],
   "auto_watchlist": {
     "enabled": true,
     "default_min_score": 60,
@@ -83,6 +86,12 @@
         "breakout_lookback_days": 20,
         "price_change_5d_min": 8.0,
         "min_avg_dollar_volume": 2000000
+      },
+      "supertrend": {
+        "enabled": true,
+        "price_floor": 5.0,
+        "alert_pct": 5.0,
+        "min_avg_dollar_volume": 1000000
       }
     },
     "deduplication": {

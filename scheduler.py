@@ -1074,6 +1074,52 @@ def _momentum_monitor_thread(interval_minutes: int, threshold: float, indices: l
         time.sleep(interval_minutes * 60)
 
 
+def _supertrend_universe_monitor_thread(interval_minutes: int, indices: list):
+    """Background thread — scans the FULL scan universe (not just the IBKR
+    monitoring queue, which is gated to composite score >= 65, see
+    src/monitoring_queue.py:39) for fresh bullish Supertrend flips every N min
+    during market hours, and auto-adds every flip to the watchlist with no
+    score gate. Mirrors a bare TradingView alertcondition(buySignal) applied to
+    every ticker, closing the coverage gap where a technically strong breakout
+    on a middling-composite-score ticker was previously never monitored."""
+    from src.supertrend import scan_supertrend_universe
+    from src.index_loader import get_index
+    from src.price_alert_monitor import _is_market_hours
+
+    _log(f"Supertrend universe monitor started — every {interval_minutes} min | indices={indices}")
+
+    while True:
+        try:
+            if _is_market_hours():
+                _log("Supertrend universe monitor: running scan...")
+                cfg = load_config()
+
+                tickers_set: set = set()
+                for index_name in indices:
+                    df = get_index(index_name)
+                    if df is not None:
+                        tickers_set.update(df["ticker"].tolist())
+                tickers = list(tickers_set)
+
+                if not tickers:
+                    _log("Supertrend universe monitor: no tickers loaded — skipping")
+                else:
+                    results = scan_supertrend_universe(tickers)
+                    _log(f"Supertrend universe monitor: {len(results)} fresh bullish flips")
+
+                    if results:
+                        from src.auto_watchlist_agent import run as aw_run
+                        added = aw_run(results, "supertrend", cfg)
+                        _log(f"Supertrend universe monitor: auto_watchlist_agent added {len(added)} ticker(s)")
+            else:
+                now_str = datetime.now().strftime("%H:%M")
+                _log(f"Supertrend universe monitor: outside market hours ({now_str}) — skipping")
+        except Exception as e:
+            _log(f"Supertrend universe monitor error: {e}")
+
+        time.sleep(interval_minutes * 60)
+
+
 def _price_monitor_thread(interval_minutes: int):
     """Background thread — checks price targets + volume spikes + pairs spreads every N minutes."""
     from src.price_alert_monitor import (
@@ -1228,6 +1274,25 @@ def _main_body():
         logger.info(
             f"Momentum monitor started "
             f"(every {momentum_interval}m | threshold={momentum_threshold} | indices={momentum_indices})"
+        )
+
+    # Supertrend Universe Monitor — unfiltered coverage of the full scan
+    # universe (unlike the IBKR real-time queue, no composite-score gate)
+    supertrend_universe_enabled  = cfg.get("supertrend_universe_enabled", True)
+    supertrend_universe_interval = cfg.get("supertrend_universe_interval_minutes", 30)
+    supertrend_universe_indices  = cfg.get("supertrend_universe_indices", ["Russell 2000", "S&P 500"])
+
+    if supertrend_universe_enabled:
+        supertrend_universe_thread = threading.Thread(
+            target=_supertrend_universe_monitor_thread,
+            args=(supertrend_universe_interval, supertrend_universe_indices),
+            daemon=True,
+            name="SupertrendUniverseMonitor"
+        )
+        supertrend_universe_thread.start()
+        logger.info(
+            f"Supertrend universe monitor started "
+            f"(every {supertrend_universe_interval}m | indices={supertrend_universe_indices})"
         )
 
     # News Catalyst Monitor
