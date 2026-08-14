@@ -101,7 +101,7 @@
     },
     "watchlist_policy": {
       "max_items_per_source": 10,
-      "max_items_total": 30,
+      "max_items_total": 50,
       "require_liquidity_check": true
     }
   }

@@ -10,11 +10,12 @@ Usage:
 """
 
 from datetime import datetime, timedelta
+from typing import Optional
 from loguru import logger
 
 from src.database import (
-    watchlist_get_all, watchlist_add,
-    watchlist_save_alert, watchlist_get_alerts,
+    watchlist_get_all, watchlist_add, watchlist_remove,
+    watchlist_save_alert, watchlist_get_alerts, get_recent_scan_scores,
 )
 from src.telegram_notifier import TelegramNotifier
 from src.hysteresis import (
@@ -23,12 +24,22 @@ from src.hysteresis import (
     CATALYST_SI_ENTRY, CATALYST_SI_EXIT,
     LIQUIDITY_ADV_ENTRY, LIQUIDITY_ADV_EXIT,
     AUTO_EXIT_COOLDOWN_DAYS, AUTO_WL_REENTRY_SCORE, AUTO_WL_MIN_HOLD_DAYS,
-    AUTO_WL_SCORE_ENTRY,
+    AUTO_WL_SCORE_ENTRY, AUTO_WL_SCORE_EXIT,
 )
 
 
 def _in_watchlist(ticker: str, existing: set) -> bool:
     return (ticker or "").upper() in existing
+
+
+# Mirrors scheduler.py's _AUTO_PREFIXES / _is_auto_ticker exactly — duplicated
+# locally (not imported) because scheduler.py imports FROM this module, so
+# importing back would be circular.
+_AUTO_PREFIXES = ("Auto:", "Auto [", "Momentum:", "Squeeze:", "Catalyst:")
+
+
+def _is_auto_ticker(notes: str) -> bool:
+    return (notes or "").startswith(_AUTO_PREFIXES)
 
 
 # ── Cooldown ──────────────────────────────────────────────────────────────────
@@ -204,6 +215,113 @@ def _build_telegram_line(r: dict, source: str) -> str:
     )
 
 
+# ── Capacity rotation ────────────────────────────────────────────────────────
+# When the watchlist is at max_items_total, a new candidate used to be silently
+# dropped (see the old "max_total reached — stopping" break below). With four
+# discovery sources now running every 30 min or less (squeeze, catalyst,
+# momentum, supertrend), that silently blocked most candidates most of the
+# time. Instead, evict the weakest eligible AUTO-added incumbent to make room
+# — the same "replace the weakest with something better" logic
+# scheduler.run_weekly_rotation() already uses, just triggered on demand
+# instead of once a week.
+
+def _min_hold_satisfied(added_at: str, min_days: int = AUTO_WL_MIN_HOLD_DAYS) -> bool:
+    """Duplicated from scheduler.py (not imported — scheduler.py imports FROM
+    this module, so importing back would be circular). Fails open (True) on
+    any parse failure so legacy/missing added_at never locks a ticker in."""
+    if not added_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(added_at)
+    except Exception:
+        try:
+            ts = datetime.strptime(added_at[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return True
+    return (datetime.now() - ts) >= timedelta(days=min_days)
+
+
+def _weakest_evictable_auto_ticker(items: list) -> Optional[tuple]:
+    """Among auto-added tickers that have cleared the minimum hold period,
+    return (ticker, avg_3d_score, added_at) for the lowest-scoring one, or
+    None if there is nothing eligible to evict."""
+    eligible = [
+        w for w in items
+        if _is_auto_ticker(w.get("notes", "")) and _min_hold_satisfied(w.get("added_at", ""))
+    ]
+    if not eligible:
+        return None
+
+    scored = []
+    for w in eligible:
+        scores = get_recent_scan_scores(w["ticker"], limit=3)
+        avg = sum(scores) / len(scores) if scores else 0.0
+        scored.append((w["ticker"], avg, w.get("added_at", "")))
+
+    return min(scored, key=lambda x: x[1])
+
+
+def _evict_for_capacity(candidate_score: Optional[float], cfg: dict) -> Optional[str]:
+    """Try to free one watchlist slot for a candidate that arrived while the
+    list is full. Two decision rules depending on whether the candidate has a
+    comparable composite score:
+
+      - candidate_score is a number (squeeze/catalyst/momentum): evict only
+        if it STRICTLY beats the weakest incumbent's recent average — same
+        upgrade bar as scheduler.run_weekly_rotation().
+      - candidate_score is None (supertrend — no composite gate by design):
+        never numerically compared against a real score. Only evict when the
+        weakest incumbent's recent average has already fallen below
+        AUTO_WL_SCORE_EXIT (40), i.e. it is dead weight that has not yet
+        cycled out through the normal auto-exit path. A scoreless flip can
+        claim a dead slot; it can never bump a ticker still earning its
+        place — that would let the least-vetted source crowd out the others.
+
+    Returns the evicted ticker, or None if no eviction happened — the caller
+    must then fall back to the old "list is full" block.
+    """
+    weakest = _weakest_evictable_auto_ticker(watchlist_get_all())
+    if weakest is None:
+        return None
+    weakest_ticker, weakest_score, _ = weakest
+
+    if candidate_score is not None:
+        if candidate_score <= weakest_score:
+            return None
+    elif weakest_score >= AUTO_WL_SCORE_EXIT:
+        return None
+
+    # Same hardened ordering as every other exit path in this codebase:
+    # cooldown rows written BEFORE the remove, so a crash between the two
+    # still blocks re-add.
+    watchlist_save_alert(
+        weakest_ticker, "auto_exit_score",
+        f"Capacity rotation: replaced (3d avg score {weakest_score:.0f})",
+        score=weakest_score,
+    )
+    watchlist_save_alert(
+        weakest_ticker, "auto_exit_cooldown",
+        f"Cooldown {AUTO_EXIT_COOLDOWN_DAYS}d after capacity rotation exit",
+        score=weakest_score,
+    )
+    watchlist_remove(weakest_ticker)
+    logger.info(
+        f"auto_watchlist: capacity rotation evicted {weakest_ticker} "
+        f"(3d avg score {weakest_score:.0f})"
+    )
+
+    if cfg.get("telegram", True):
+        try:
+            TelegramNotifier().send_message(
+                f"🔄 Capacity rotation: removed {weakest_ticker} "
+                f"(score {weakest_score:.0f}) to make room for a new candidate"
+            )
+        except Exception as e:
+            logger.warning(f"auto_watchlist: capacity rotation Telegram failed: {e}")
+
+    return weakest_ticker
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(results: list, source: str, cfg: dict) -> list:
@@ -281,15 +399,31 @@ def run(results: list, source: str, cfg: dict) -> list:
             logger.warning(f"[auto-watchlist] {ticker} cooldown check failed: {_cd_err} — skipping (fail-safe)")
             continue
 
-        if cur_total + len(added) >= max_total:
-            logger.info(f"auto_watchlist: max_total ({max_total}) reached — stopping")
-            break
-
+        # Check the per-source cap FIRST — it's a cheap break with no side
+        # effects. Checking it before the capacity/eviction block below
+        # avoids evicting a ticker to free a slot this candidate can't
+        # actually use because the source is already exhausted this cycle.
         if len(added) >= max_per_source:
             logger.info(
                 f"auto_watchlist [{source}]: max_items_per_source ({max_per_source}) reached"
             )
             break
+
+        # A ticker already on the watchlist doesn't need a new slot — only
+        # gate/evict when this candidate would actually grow the list.
+        if ticker not in existing and cur_total + len(added) >= max_total:
+            # Distinguish "no comparable score" (None — e.g. supertrend, no
+            # composite gate by design) from "score is 0" (real, if unlikely).
+            _capacity_score = r.get("explosion_score")
+            if _capacity_score is None:
+                _capacity_score = r.get("score")
+            evicted = _evict_for_capacity(_capacity_score, cfg)
+            if evicted:
+                existing.discard(evicted)
+                cur_total -= 1
+            else:
+                logger.info(f"auto_watchlist: max_total ({max_total}) reached — stopping")
+                break
 
         notes = _build_notes(r, source)
         score = r.get("explosion_score") or r.get("score", 0)
