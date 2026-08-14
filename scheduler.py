@@ -1088,6 +1088,13 @@ def _supertrend_universe_monitor_thread(interval_minutes: int, indices: list):
 
     _log(f"Supertrend universe monitor started — every {interval_minutes} min | indices={indices}")
 
+    # Stagger the first cycle by half the interval so this thread's full-universe
+    # yf.download() doesn't land in the same instant as the Momentum monitor's
+    # (both start together at scheduler boot; without this offset they compound
+    # into one large concurrent batch every cycle and risk YFRateLimitError —
+    # observed once during manual verification of this feature on 2026-08-14).
+    time.sleep(max(1, interval_minutes * 30))
+
     while True:
         try:
             if _is_market_hours():
