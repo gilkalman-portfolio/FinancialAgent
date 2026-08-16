@@ -68,6 +68,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `market_regime.py` | BULL / CAUTION / BEAR regime based on VIX thresholds (20/28) + SPY vs SMA200 (`_SPY_HISTORY = "1y"`, ~252 trading days); used by `execution_engine.py` for position sizing and stop adjustments |
 | `execution_engine.py` | Trade decision engine (Layers -1.5 through 6): daily loss limit (Layer 0), hard veto, confluence check, position sizing scaled by market regime, time-of-day flag, sector exposure guard. **Layer -1: SELL veto** if `exposure <= 0` (no open position, belt-and-braces against a short reporting as "exposure≠0"). **Layer -1.5: already-long BUY veto** — no pyramiding; short positions (shares<0) NOT vetoed since BUY-to-cover is legitimate. BEAR regime veto is BUY-only (`check_hard_vetos(signal_type=...)`) — SELL exits always allowed. Fail-open on DB error. |
 | `momentum_scanner.py` | 5-factor momentum score (Price ROC, Relative Strength vs SPY, MA Stack, RSI zone, Volume Surge); vectorized pandas + `yf.download` batch (~0.2s/ticker at scale); runs every 30 min as daemon thread |
+| `gap_scanner.py` | Two independent scanners feeding the Premarket Gap Alert and Opening Print Alert one-shot Telegram jobs — see Scheduler Jobs below. `scan_premarket_gaps()` uses **Massive/Polygon per-ticker REST** (`MASSIVE_API_KEY`, `ThreadPoolExecutor` fan-out, `massive_max_workers` in `scheduler_config.json`) — rewritten 2026-08-16 after yfinance was found to always report premarket volume as exactly 0 in production (see Incident Archive). `scan_opening_prints()` is unchanged, still `yf.download` 1m regular-session bars — separately verified working, no reason to add cost there. Informational-only: not called from `auto_watchlist_agent.py`, `order_manager.py`, or `ibkr_worker.py`. Added 2026-08-15 after the NMAX gap-catch investigation (see Incident Archive). |
 | `long_setup_scanner.py` | 5-factor long setup scanner (RSI zone, MACD crossover, Volume surge, MA alignment, Momentum); daily 09:30; auto-adds top candidates to watchlist |
 | `opportunity_tracker.py` | Records every BUY signal as opportunity with T1/stop targets; daily 18:00 fills outcomes; weekly Friday 20:00 Telegram digest with win-rate |
 | `alert_monitor.py` | Daily health-check agent at 09:30 — detects noisy alerts, dead threads, portfolio drawdowns >8%; sends Telegram health report. Uses `get_connection()` (WAL-safe, `with` block — no leaked connections). |
@@ -384,6 +385,8 @@ Migration via `_migrate()` in `database.py` — adds columns without breaking da
 |---|---|---|
 | Watchlist Cleanup | 08:00 | `run_watchlist_cleanup()` |
 | Catalyst+SI Alert | 08:05 | `run_catalyst_alert()` |
+| Premarket Gap Alert | 15:50 (~08:50 ET) | `run_premarket_gap_alert()` — full-universe scan for a real premarket gap (price move backed by actual premarket volume) vs. prior regular-session close; informational Telegram only, catches genuine overnight-news gappers |
+| Opening Print Alert | 16:37 (~09:37 ET) | `run_opening_print_alert()` — full-universe scan comparing each ticker's 09:30 open print to its price ~7 min later with a volume filter; the check that would have caught NMAX (already +12-13% within its first 5-7 minutes on heavy volume) |
 | LLM Universe Curation | 07:45, weekly | `run_llm_universe_curation()` — see below |
 | Portfolio News | 08:30 | `run_portfolio_news()` |
 | Scan + Auto-Watchlist + Breakout | 08:30, 15:00 | `run_scan()` |
@@ -447,6 +450,8 @@ All alerts include a `🎯 Action:` line. Telegram is reserved for **real-time, 
 |---|---|---|---|---|
 | `combined_buy` / `combined_sell` | Supertrend 1H flip + monitoring queue membership (no score gate either direction) | 24h | **Telegram** — the only true real-time path | `ibkr_worker` → `signal_combiner` |
 | `catalyst_si_alert` | SI ≥ 10% + catalyst ≤ 7 days + explosion_score ≥ 40 | 24h | **Telegram** — forward-looking, latency-tolerant | `scheduler.py` |
+| `premarket_gap_alert` | real premarket gap: gap% ≥ threshold + real premarket $volume ≥ threshold | 24h | **Telegram** — informational, unvalidated for edge | `scheduler.py` |
+| `opening_print_alert` | 09:30 open print vs. price ~7min later, move% ≥ threshold + $volume ≥ threshold | 24h | **Telegram** — informational, unvalidated for edge | `scheduler.py` |
 | `auto_wl_squeeze` / `auto_wl_catalyst` / `auto_wl_momentum` / `auto_wl_supertrend` | per-source filter pass in `auto_watchlist_agent.py` | 24h (1440min) | **Telegram** — informational | `auto_watchlist_agent.py` |
 | `price_above` / `price_below` / `price_target` / `price_change` | user-defined levels; `price_change` gated ET 04:00–20:00 | 24h / 4h | **Telegram** — manual targets | `watchlist_manager.py`, `price_alert_monitor.py` |
 | `price_surge_rescore` | watchlist ticker moves >10% since baseline; Telegram if rescored ≥55; gated 09:30–16:00 ET | 2h | **Telegram** | `price_alert_monitor.py` |
@@ -489,6 +494,7 @@ TELEGRAM_ENABLED
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
 IBKR_LIVE              # "true" to enable live order placement (port 4001); absent or any other value = paper mode (port 4002)
+MASSIVE_API_KEY         # Massive/Polygon.io REST API — src/gap_scanner.py::scan_premarket_gaps only (paid "Starter" plan, $29/mo)
 ```
 
 ---
@@ -508,6 +514,7 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 - `stock_scorer.py` Forecast weight (15) is defined but `forecast_score=0` in code — inactive
 - **The `combined_buy`/Supertrend trigger itself has no demonstrated statistical edge net of a realistic exit** — see [Live-Readiness Audit](#2026-08-05--live-readiness-audit-no-measurable-alpha) and [Exit Simulation](#2026-08-05--exit-simulation-supersedes-the-horizon-result-above). Coverage-expanding features (Supertrend Universe Monitor, capacity rotation) close information gaps, not this gap.
 - Multi-agent audits found and fixed a long tail of mechanical issues (connection leaks, XSS, thread-safety, cache TTL bugs, NaN handling) across 2026-05/06 — see git history for `CLAUDE.md` at those dates if a specific one needs to be traced; current-state facts from those fixes are folded into the module descriptions above rather than re-listed here.
+- `gap_scanner.py`'s Premarket Gap Alert / Opening Print Alert (added 2026-08-15) are informational-only and **unvalidated for edge** — unlike `combined_buy`/Supertrend signals they don't write to `forward_signals` (they're not a trade signal), so there's no automated win-rate tracking. Manually review actual hit quality over a few weeks of live Telegram output before ever considering wiring either into `auto_watchlist_agent` or the IBKR pipeline. (This caveat is about trading-signal usefulness, not data correctness — the premarket half's underlying data source, Massive/Polygon since 2026-08-16, is a paid, verified-accurate real-premarket-volume feed; see Incident Archive.)
 
 ---
 
@@ -523,6 +530,7 @@ IBKR_LIVE              # "true" to enable live order placement (port 4001); abse
 - [ ] `modify_stop_order()` matches the first STP SELL by ticker — ambiguous if multiple STPs exist for one ticker; needs a `stop_order_id` column in `order_log` to fully fix
 - [ ] `record_fill()` is not idempotent on duplicate fill events — rare, but can corrupt an older `forward_signals` row
 - [ ] Track whether Supertrend-universe / capacity-rotation additions (2026-08-14) perform differently from the existing sources in `forward_signals` before treating the wider net as a return improvement, not just a coverage one
+- [ ] Manually review `gap_scanner.py` Premarket Gap Alert / Opening Print Alert hit-rate and usefulness after a few weeks of live output before considering wiring either into `auto_watchlist_agent` (added 2026-08-15, see Incident Archive)
 
 ---
 
@@ -598,3 +606,15 @@ The IBKR real-time queue only ever runs Supertrend on tickers already scoring �
 
 ### 2026-08-14 — Docker/WSL2 BSOD investigation (host-level, not this codebase)
 User-machine troubleshooting, not a FinancialAgent code change — kept here only because the machine hosts the live IB Gateway container. WinDbg analysis of 5 minidumps found 2 of 5 sharing an identical kernel fault signature (`0x1_SysCallNum_36_nt!KiSystemServiceExitPico`) tied to WSL2's Pico-process syscall path, with the most recent crash occurring inside `com.docker.backend.exe` itself — a genuine Docker/WSL2 kernel bug, not a third-party driver. `.wslconfig` memory cap (4GB) applied; WSL updated 2.6.2→2.7.11. Full detail (bugcheck codes, process names per dump, VBS/Core-Isolation test still pending) is in this session's memory files, not here — this repo isn't the right home for host OS diagnostics.
+
+### 2026-08-15 — Premarket Gap Alert + Opening Print Alert (the NMAX gap-catch gap)
+Investigation of a `auto_wl_momentum` Telegram alert for NMAX (fired ~6h after the open at $10.78, already +13.4% off the $9.51 prior close and already 6% off its high) found the entire move happened in the first 3-5 minutes of the REGULAR session (09:30-09:35 ET): premarket (04:00-09:30 ET) was completely dead — 44 one-minute bars, **zero** cumulative volume, price flat $9.55-9.79 all morning, open print only +4%. `_momentum_monitor_thread` (every 30 min, additionally gated by watchlist-capacity rotation — many 30-min cycles found 300+ tickers scoring above threshold but added 0-1) structurally cannot catch a move that completes in its first few minutes.
+
+Built two new one-shot Telegram jobs (`src/gap_scanner.py`, `scheduler.py::run_premarket_gap_alert` / `run_opening_print_alert`) instead of one, because NMAX and a genuine overnight-news gapper are different categories needing different data: a real premarket gap needs premarket volume as confirmation (the reason NMAX itself wasn't a premarket gap — no volume backed the flat overnight price), while NMAX's actual pattern needs a post-open comparison of the 09:30 print vs. price ~7 minutes later, with its own volume filter. Both run informational-only to Telegram (`premarket_gap_alert` / `opening_print_alert` alert types, `watchlist_alerts` table, no new migration) — explicitly **not** wired into `auto_watchlist_agent.run()`, `order_manager.py`, or `ibkr_worker.py` for this first version; see Known Limitations for the plan to validate before ever changing that.
+
+### 2026-08-16 — Premarket Gap Alert data source was silently broken (yfinance → Massive/Polygon)
+Follow-up investigation found `scan_premarket_gaps()` (added 2026-08-15) was **non-functional in production from day one**: yfinance's `prepost=True` intraday download always reports premarket volume as exactly **0**, confirmed across 6 independent real historical ticker/day cases pulled from this project's own `watchlist_alerts` table (NMAX, TKNO, STIM, FRMM, GO, CALM — including CALM, a liquid $80+ mid-cap, ruling out "only illiquid microcaps" as the explanation). Since the function's whole design gates on `premarket_dollar_volume >= min_premarket_dollar_volume`, the filter could never pass and the alert simply never fired, silently.
+
+Two free alternatives were evaluated and both also failed: Alpaca's free/IEX-feed tier returns **zero bars at all** before 09:30 ET (not even zero-volume bars — the data isn't requested/returned at that tier); EODHD's free tier returns HTTP 403 ("Only EOD data allowed for free users") for any intraday request. Massive/Polygon (Polygon.io's Oct-2025 rebrand) was the only source that worked, verified against a real paid "Starter" account (`MASSIVE_API_KEY`, $29/mo, 15-min delayed — acceptable since this check runs well before the open, not real-time-critical) across the same 7 cases, including a negative control: WEST on 2026-07-27 correctly came back with **0** premarket volume (proving the source reports true zeros, not just "always something").
+
+`scan_premarket_gaps()` was rewritten to call Massive/Polygon per-ticker (`/v2/aggs/ticker/{ticker}/prev` for prior close, `/v2/aggs/ticker/{ticker}/range/5/minute/{date}/{date}` for premarket bars — Polygon has no batch endpoint, unlike `yf.download`), fanned out via `ThreadPoolExecutor` (mirrors `catalyst_scanner.py::fetch_sec_8k_events`'s pattern), with a one-call preflight key check (fails fast on 401/403 instead of attempting ~5,000 doomed requests) and per-ticker failure isolation (one ticker's fetch error no longer aborts the whole scan, unlike the old shared-batch-call model). `scan_opening_prints()` was deliberately left untouched — it uses yfinance regular-session (not premarket) data, separately verified accurate, so there was no reason to add paid-API cost there. **Timestamp handling note for future maintainers:** Polygon/Massive bar timestamps (`t`) are Unix milliseconds in UTC, not ET — every bar must be explicitly converted (`tz=timezone.utc` then `.astimezone(ET)`) before any time-of-day boundary check, or the premarket window filter silently admits/drops the wrong bars.

@@ -132,6 +132,33 @@ def _is_trading_day() -> bool:
     return True
 
 
+def _in_premarket_gap_window() -> bool:
+    """True ET 07:30-09:29 — the intended firing window for run_premarket_gap_alert.
+    Belt-and-suspenders against scheduler restarts / US-Israel DST mismatch drifting
+    the configured local-time schedule string away from true premarket (mirrors the
+    fail-open style of src/watchlist_manager.py::_is_trading_hours())."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        window_open  = now.replace(hour=7,  minute=30, second=0, microsecond=0)
+        window_close = now.replace(hour=9,  minute=29, second=0, microsecond=0)
+        return window_open <= now <= window_close
+    except Exception:
+        return True  # fail-open so the alert isn't silently lost on tz errors
+
+
+def _in_opening_print_window() -> bool:
+    """True ET 09:31-10:15 — the intended firing window for run_opening_print_alert."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        window_open  = now.replace(hour=9,  minute=31, second=0, microsecond=0)
+        window_close = now.replace(hour=10, minute=15, second=0, microsecond=0)
+        return window_open <= now <= window_close
+    except Exception:
+        return True  # fail-open so the alert isn't silently lost on tz errors
+
+
 def load_tickers(sector: str, max_stocks: int, index_names: list = None) -> list:
     """מחזיר עד max_stocks מניות לסקטור מכל אחד מה-indices, מבלי כפילויות."""
     if index_names is None:
@@ -862,6 +889,226 @@ def run_catalyst_alert():
         logger.error(f"Catalyst alert failed: {e}")
 
 
+def run_premarket_gap_alert():
+    """One-shot premarket scan (~08:50 ET): real price gap vs. prior close,
+    backed by actual premarket volume. Informational Telegram only — never
+    calls auto_watchlist_agent, order_manager, or ibkr_worker. See
+    src/gap_scanner.py and CLAUDE.md Incident Archive 2026-08-15."""
+    if not _is_trading_day():
+        logger.info("run_premarket_gap_alert: skipping — weekend")
+        return
+    cfg = load_config()
+    gap_cfg = cfg.get("gap_scanner", {})
+    if not cfg.get("enabled", False) or not gap_cfg.get("enabled", True) or not cfg.get("telegram", True):
+        return
+    if not _in_premarket_gap_window():
+        logger.info("run_premarket_gap_alert: skipping — outside premarket window")
+        return
+    try:
+        init_db()
+        from src.gap_scanner import scan_premarket_gaps
+        from src.index_loader import get_index
+
+        indices = gap_cfg.get("indices", ["Russell 2000", "S&P 500"])
+        tickers_set: set = set()
+        for index_name in indices:
+            df = get_index(index_name)
+            if df is not None:
+                tickers_set.update(df["ticker"].tolist())
+        tickers = list(tickers_set)
+        if not tickers:
+            logger.info("run_premarket_gap_alert: no tickers loaded — skipping")
+            return
+
+        logger.info(f"Premarket gap alert: scanning {len(tickers)} tickers")
+        results = scan_premarket_gaps(
+            tickers,
+            gap_pct_min=gap_cfg.get("gap_pct_min", 8.0),
+            min_premarket_dollar_volume=gap_cfg.get("min_premarket_dollar_volume", 200000),
+            massive_max_workers=gap_cfg.get("massive_max_workers", 10),
+        )
+
+        price_floor = gap_cfg.get("price_floor", 5.0)
+        candidates = [
+            r for r in results
+            if r.get("price", 0) >= price_floor
+            and not _alert_sent_recently(r["ticker"], "premarket_gap_alert", hours=24)
+        ]
+        candidates.sort(key=lambda x: x.get("gap_pct", 0), reverse=True)
+        top = candidates[:gap_cfg.get("max_alerts_per_run", 8)]
+
+        logger.info(f"Premarket gap alert: {len(candidates)} candidates, sending top {len(top)}")
+
+        if not top:
+            return
+
+        # Soft catalyst enrichment on the shortlist only — cheap since narrow.
+        # Graceful degradation: on any failure just omit the catalyst line,
+        # matching the existing PDUFA/8-K precedent elsewhere in the project.
+        catalyst_by_ticker = {}
+        try:
+            from src.catalyst_scanner import fetch_sec_8k_events
+            events = fetch_sec_8k_events([r["ticker"] for r in top], days=2)
+            catalyst_by_ticker = {e["ticker"]: e for e in events if e.get("ticker")}
+        except Exception as e:
+            logger.debug(f"Premarket gap alert: catalyst enrichment skipped: {e}")
+
+        blocks = []
+        cooldown_rows = []  # (ticker, block, gap_pct, price) — written only after a successful send
+        for r in top:
+            ticker      = r["ticker"]
+            gap_pct     = r.get("gap_pct", 0)
+            price       = r.get("price", 0)
+            prior_close = r.get("prior_close", 0)
+            pm_dvol     = r.get("premarket_dollar_volume", 0)
+
+            catalyst_line = ""
+            ev = catalyst_by_ticker.get(ticker)
+            if ev:
+                detail = _escape_md(str(ev.get("detail", "8-K filed")))
+                if ev.get("date"):
+                    detail = f"{detail} ({ev['date']})"
+                catalyst_line = f"\n  📰 {detail}"
+
+            block = (
+                f"*{ticker}* | Gap {gap_pct:+.1f}% | ${price:.2f} (prior close ${prior_close:.2f})\n"
+                f"  Premarket $vol: ${pm_dvol:,.0f}"
+                + catalyst_line
+                + f"\n  🎯 Real premarket gap with volume confirmation — review before the open."
+            )
+            blocks.append(block)
+            cooldown_rows.append((ticker, block, gap_pct, price))
+
+        msg = (
+            f"🌅 Premarket Gap Watch — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"{len(top)} tickers | gap ≥{gap_cfg.get('gap_pct_min', 8.0):.0f}% + real premarket volume\n\n"
+            + "\n\n".join(blocks)
+        )
+        sent = TelegramNotifier().send_message(msg)
+
+        if sent:
+            # Cooldown rows are only written on a confirmed send — otherwise a
+            # failed send would silently drop all candidates for 24h with no
+            # alert ever reaching Telegram (mirrors run_catalyst_alert).
+            for ticker, block, gap_pct, price in cooldown_rows:
+                watchlist_save_alert(ticker, "premarket_gap_alert", block,
+                                     score=gap_pct, price=price)
+                logger.info(f"Premarket gap: {ticker} | gap={gap_pct:+.1f}% | ${price:.2f}")
+        else:
+            logger.warning("Premarket gap alert: Telegram send failed — cooldown NOT written, will retry next run")
+
+    except Exception as e:
+        logger.error(f"Premarket gap alert failed: {e}")
+
+
+def run_opening_print_alert():
+    """One-shot post-open scan (~09:37 ET, ~7min after the bell): price move
+    from the 09:30 open print vs. now, backed by a dollar-volume filter.
+    This is the check that would have caught NMAX on 2026-08-14 — its
+    premarket was dead, but it moved heavily within minutes of the open.
+    Informational Telegram only — never calls auto_watchlist_agent,
+    order_manager, or ibkr_worker. See src/gap_scanner.py and CLAUDE.md
+    Incident Archive 2026-08-15."""
+    if not _is_trading_day():
+        logger.info("run_opening_print_alert: skipping — weekend")
+        return
+    cfg = load_config()
+    gap_cfg = cfg.get("gap_scanner", {})
+    if not cfg.get("enabled", False) or not gap_cfg.get("enabled", True) or not cfg.get("telegram", True):
+        return
+    if not _in_opening_print_window():
+        logger.info("run_opening_print_alert: skipping — outside opening-print window")
+        return
+    try:
+        init_db()
+        from src.gap_scanner import scan_opening_prints
+        from src.index_loader import get_index
+
+        indices = gap_cfg.get("indices", ["Russell 2000", "S&P 500"])
+        tickers_set: set = set()
+        for index_name in indices:
+            df = get_index(index_name)
+            if df is not None:
+                tickers_set.update(df["ticker"].tolist())
+        tickers = list(tickers_set)
+        if not tickers:
+            logger.info("run_opening_print_alert: no tickers loaded — skipping")
+            return
+
+        logger.info(f"Opening print alert: scanning {len(tickers)} tickers")
+        results = scan_opening_prints(
+            tickers,
+            pct_move_min=gap_cfg.get("opening_pct_min", 10.0),
+            min_dollar_volume=gap_cfg.get("min_opening_dollar_volume", 500000),
+        )
+
+        price_floor = gap_cfg.get("price_floor", 5.0)
+        candidates = [
+            r for r in results
+            if r.get("price", 0) >= price_floor
+            and not _alert_sent_recently(r["ticker"], "opening_print_alert", hours=24)
+        ]
+        candidates.sort(key=lambda x: x.get("move_pct", 0), reverse=True)
+        top = candidates[:gap_cfg.get("max_alerts_per_run", 8)]
+
+        logger.info(f"Opening print alert: {len(candidates)} candidates, sending top {len(top)}")
+
+        if not top:
+            return
+
+        catalyst_by_ticker = {}
+        try:
+            from src.catalyst_scanner import fetch_sec_8k_events
+            events = fetch_sec_8k_events([r["ticker"] for r in top], days=2)
+            catalyst_by_ticker = {e["ticker"]: e for e in events if e.get("ticker")}
+        except Exception as e:
+            logger.debug(f"Opening print alert: catalyst enrichment skipped: {e}")
+
+        blocks = []
+        cooldown_rows = []  # (ticker, block, move_pct, price) — written only after a successful send
+        for r in top:
+            ticker     = r["ticker"]
+            move_pct   = r.get("move_pct", 0)
+            price      = r.get("price", 0)
+            open_print = r.get("open_print", 0)
+            dvol       = r.get("dollar_volume", 0)
+
+            catalyst_line = ""
+            ev = catalyst_by_ticker.get(ticker)
+            if ev:
+                detail = _escape_md(str(ev.get("detail", "8-K filed")))
+                if ev.get("date"):
+                    detail = f"{detail} ({ev['date']})"
+                catalyst_line = f"\n  📰 {detail}"
+
+            block = (
+                f"*{ticker}* | Move {move_pct:+.1f}% | ${price:.2f} (open print ${open_print:.2f})\n"
+                f"  Volume since open: ${dvol:,.0f}"
+                + catalyst_line
+                + f"\n  🎯 Already moving fast at the open — this is not a fresh entry, review risk before chasing."
+            )
+            blocks.append(block)
+            cooldown_rows.append((ticker, block, move_pct, price))
+
+        msg = (
+            f"💥 Opening Range Explosion — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"{len(top)} tickers | move ≥{gap_cfg.get('opening_pct_min', 10.0):.0f}% since the 09:30 print\n\n"
+            + "\n\n".join(blocks)
+        )
+        sent = TelegramNotifier().send_message(msg)
+
+        if sent:
+            for ticker, block, move_pct, price in cooldown_rows:
+                watchlist_save_alert(ticker, "opening_print_alert", block,
+                                     score=move_pct, price=price)
+                logger.info(f"Opening print: {ticker} | move={move_pct:+.1f}% | ${price:.2f}")
+        else:
+            logger.warning("Opening print alert: Telegram send failed — cooldown NOT written, will retry next run")
+
+    except Exception as e:
+        logger.error(f"Opening print alert failed: {e}")
+
+
 def run_long_setups():
     """Daily Long Setup scan — top setups from SP100_SUBSET sent to Telegram."""
     if not _is_trading_day():
@@ -1210,6 +1457,21 @@ def _main_body():
     catalyst_alert_time = cfg.get("catalyst_alert_time", "08:05")
     schedule.every().day.at(catalyst_alert_time).do(run_catalyst_alert)
     logger.info(f"Catalyst+SI alert at {catalyst_alert_time}")
+
+    # Premarket Gap Alert + Opening Print Alert — see CLAUDE.md Incident
+    # Archive 2026-08-15. Israel-local times below; ET = Israel - 7h during
+    # the summer DST overlap (see src/watchlist_manager.py _is_trading_hours
+    # comment). Each job also re-checks its own ET window at run time
+    # (_in_premarket_gap_window / _in_opening_print_window) as a safety net
+    # against scheduler-restart drift and the US/Israel DST mismatch.
+    gap_scanner_cfg = cfg.get("gap_scanner", {})
+    premarket_gap_alert_time = gap_scanner_cfg.get("premarket_gap_alert_time", "15:50")
+    schedule.every().day.at(premarket_gap_alert_time).do(run_premarket_gap_alert)
+    logger.info(f"Premarket gap alert at {premarket_gap_alert_time} (Israel local, ~08:50 ET)")
+
+    opening_print_alert_time = gap_scanner_cfg.get("opening_print_alert_time", "16:37")
+    schedule.every().day.at(opening_print_alert_time).do(run_opening_print_alert)
+    logger.info(f"Opening print alert at {opening_print_alert_time} (Israel local, ~09:37 ET)")
 
     # Long Setups — daily after open
     long_setups_time = cfg.get("long_setups_time", "09:30")
