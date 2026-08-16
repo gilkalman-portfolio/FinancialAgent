@@ -54,6 +54,19 @@
   "supertrend_universe_enabled": true,
   "supertrend_universe_interval_minutes": 30,
   "supertrend_universe_indices": ["Russell 2000", "S&P 500"],
+  "gap_scanner": {
+    "enabled": true,
+    "indices": ["Russell 2000", "S&P 500"],
+    "premarket_gap_alert_time": "15:50",
+    "opening_print_alert_time": "16:37",
+    "gap_pct_min": 8.0,
+    "min_premarket_dollar_volume": 200000,
+    "opening_pct_min": 10.0,
+    "min_opening_dollar_volume": 500000,
+    "price_floor": 5.0,
+    "max_alerts_per_run": 8,
+    "massive_max_workers": 10
+  },
   "auto_watchlist": {
     "enabled": true,
     "default_min_score": 60,
