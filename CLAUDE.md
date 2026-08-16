@@ -4,7 +4,7 @@
 AI-powered stock scanner & financial analysis dashboard.
 - **Location:** `C:/Projects/FinancialAgent`
 - **Stack:** Python 3.14, Streamlit 1.52.2, SQLite, yfinance, Finnhub, Alpha Vantage, SEC EDGAR
-- **LLMs:** Gemini 2.0 Flash (primary) → Groq Llama 3.3 70B (fallback) via `src/llm_client.py`
+- **LLMs:** Gemini 2.0 Flash (primary) → Groq Qwen3.6 27B (fallback, `reasoning_effort="none"`) via `src/llm_client.py`
 - **Run:** `streamlit run dashboard.py` → http://localhost:8501
 - **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **533 passed, 2 skipped, 0 failed** (2026-08-14). This number moves every sprint — re-run it rather than trusting this line for long. The old "5 pre-existing failures in test_pnl_digest_fixes.py" were test rot (helpers seeded with literal dates against a relative-date filter), fixed by using relative dates. **Never seed a time-filtered query with a literal date.**
 
@@ -41,7 +41,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `database.py` | SQLite CRUD + auto migration. WAL-hardened (see DB Concurrency below) |
 | `watchlist_manager.py` | Alert logic — score threshold, price levels, portfolio stop/target, score delta. `price_change` gated to ET 04:00–20:00 (`zoneinfo`) |
 | `score_alert.py` | Score jump/drop alerts for ALL scanned tickers (not just watchlist) — 24h cooldown, shared alert types with watchlist_manager |
-| `llm_client.py` | Gemini → Groq fallback. `_try_groq()` wrapped in try/except — Groq errors raise `RuntimeError` instead of propagating raw |
+| `llm_client.py` | Gemini → Groq fallback (`qwen/qwen3.6-27b`, migrated 2026-08-16 off decommissioned `llama-3.3-70b-versatile`; `reasoning_effort="none"` to keep behavior non-reasoning for tight `max_tokens` budgets like `earnings_sentiment.py`'s 150). `_try_groq()` wrapped in try/except — Groq errors raise `RuntimeError` instead of propagating raw |
 | `market_feed.py` | Live indices + macro events. `get_upcoming_macro()` returns approximate weekly schedule — events marked `*` as disclaimer |
 | `news_impact_analyzer.py` | 3-layer LLM news analysis |
 | `macro_signals.py` | Macro signals |

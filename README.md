@@ -12,7 +12,7 @@ Streamlit dashboard combining technical analysis, DCF valuation, short squeeze s
 | UI | Streamlit 1.52.2 |
 | Language | Python 3.14 (main) · Python 3.13 (IBKR worker) |
 | DB | SQLite (WAL mode, WAL hardened) |
-| LLMs | Gemini 2.0 Flash → Groq Llama 3.3 70B fallback |
+| LLMs | Gemini 2.0 Flash → Groq Qwen3.6 27B fallback |
 | Market Data | yfinance · Finnhub · Alpha Vantage · SEC EDGAR (free) |
 | Broker | Interactive Brokers via `ib_async` (Python 3.13 venv, Docker IB Gateway) |
 | Alerts | Telegram Bot (outbound + two-way commands) |

@@ -320,7 +320,7 @@ Migration: `_migrate()` in `database.py` — adds columns without breaking exist
 | Model | Role |
 |---|---|
 | Gemini 2.5 Flash | Primary — used for all AI tasks |
-| Groq Llama 3.3 70B | Fallback — automatic on Gemini failure |
+| Groq Qwen3.6 27B | Fallback — automatic on Gemini failure (migrated 2026-08-16 off decommissioned Llama 3.3 70B) |
 
 ---
 

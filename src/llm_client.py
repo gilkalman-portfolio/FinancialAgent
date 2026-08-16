@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _GEMINI_MODEL = "gemini-2.0-flash"
-_GROQ_MODEL   = "llama-3.3-70b-versatile"
+_GROQ_MODEL   = "qwen/qwen3.6-27b"
 
 _DATE_PREFIX = (
     "Today's date is {date}. All market data, news, and events in this conversation "
@@ -97,6 +97,7 @@ def _try_groq(prompt: str, system: str, max_tokens: int) -> str:
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.1,
+            reasoning_effort="none",
         )
         text = resp.choices[0].message.content.strip()
         logger.debug(f"Groq fallback response: {len(text)} chars")

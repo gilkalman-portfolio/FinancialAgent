@@ -5,7 +5,7 @@
 
 ## פרטי פרויקט
 - **מיקום:** `C:/Projects/FinancialAgent`
-- **Stack:** Python 3.14, Streamlit 1.52.2, yfinance, Gemini 2.5 Flash / Groq Llama 3.3 70B, SQLite, Finnhub, Alpha Vantage, SEC EDGAR, sec-api.io
+- **Stack:** Python 3.14, Streamlit 1.52.2, yfinance, Gemini 2.5 Flash / Groq Qwen3.6 27B, SQLite, Finnhub, Alpha Vantage, SEC EDGAR, sec-api.io
 - **הרצה:** `streamlit run dashboard.py` → http://localhost:8501
 - **Tests:** `python -m pytest tests/test_scorer.py` · `python -m pytest tests/test_insider_sec_api.py`
 - **Service:** `run_scheduler_watchdog.py` → מריץ את `scheduler.py` ברקע, מאתחל אוטומטית אחרי קריסה. רשום ב-Windows Task Scheduler כ-`FinancialAgentWatchdog` (At Startup, Run as Admin)
