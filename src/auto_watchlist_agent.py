@@ -16,6 +16,7 @@ from loguru import logger
 from src.database import (
     watchlist_get_all, watchlist_add, watchlist_remove,
     watchlist_save_alert, watchlist_get_alerts, get_recent_scan_scores,
+    has_open_ibkr_position,
 )
 from src.telegram_notifier import TelegramNotifier
 from src.hysteresis import (
@@ -241,41 +242,79 @@ def _min_hold_satisfied(added_at: str, min_days: int = AUTO_WL_MIN_HOLD_DAYS) ->
     return (datetime.now() - ts) >= timedelta(days=min_days)
 
 
+def _avg_recent_score(ticker: str) -> Optional[float]:
+    """The ticker's real composite-scan average (last 3 scan_results rows), or
+    None if it has never been through the main composite scan (run_scan()).
+    Discovery-source scores (momentum/squeeze/catalyst — each its own 0-100
+    formula) are NOT comparable to this and must never be substituted for it;
+    see CLAUDE.md Incident Archive 2026-08-17 for why that substitution was
+    the root cause of wrongly evicting strong picks."""
+    scores = get_recent_scan_scores(ticker, limit=3)
+    return sum(scores) / len(scores) if scores else None
+
+
+def _candidate_beats_weakest(ticker: str, weakest_score: float) -> bool:
+    """Whether `ticker` is allowed to evict an incumbent scoring `weakest_score`
+    (a real composite average — see _weakest_evictable_auto_ticker). Shared by
+    _evict_for_capacity and scheduler.run_weekly_rotation so the rule can't
+    drift between the two call sites again.
+
+    `ticker`'s own composite history decides which rule applies — not which
+    scanner discovered it, so a supertrend/momentum/squeeze/catalyst pick that
+    also happens to have real scan_results can compete fairly:
+
+      - Real composite average exists for `ticker`: must STRICTLY beat
+        weakest_score. Apples-to-apples, same scale on both sides.
+      - No composite average for `ticker`: never numerically compared against
+        a real score (there is nothing valid to compare). Can only claim a
+        slot whose incumbent has already fallen below AUTO_WL_SCORE_EXIT (40)
+        — i.e. dead weight that hasn't cycled out through the normal auto-exit
+        path yet. Can never bump a ticker still earning its place.
+    """
+    candidate_avg = _avg_recent_score(ticker)
+    if candidate_avg is not None:
+        return candidate_avg > weakest_score
+    return weakest_score < AUTO_WL_SCORE_EXIT
+
+
 def _weakest_evictable_auto_ticker(items: list) -> Optional[tuple]:
     """Among auto-added tickers that have cleared the minimum hold period,
-    return (ticker, avg_3d_score, added_at) for the lowest-scoring one, or
-    None if there is nothing eligible to evict."""
+    have no open IBKR position (never sacrifice a real held position to free
+    a watchlist slot), and have a real composite-scan average, return
+    (ticker, avg_3d_score, added_at) for the lowest-scoring one — or None if
+    there is nothing eligible.
+
+    A ticker with zero scan_results rows (discovered only via momentum/
+    squeeze/catalyst/supertrend, never independently covered by run_scan())
+    is excluded entirely rather than defaulted to a score of 0.0 — that
+    default was the root cause of wrongly evicting strong picks (e.g. a
+    97/100 momentum score ticker) within hours of being added. See CLAUDE.md
+    Incident Archive 2026-08-17."""
     eligible = [
         w for w in items
-        if _is_auto_ticker(w.get("notes", "")) and _min_hold_satisfied(w.get("added_at", ""))
+        if _is_auto_ticker(w.get("notes", ""))
+        and _min_hold_satisfied(w.get("added_at", ""))
+        and not has_open_ibkr_position(w["ticker"])
     ]
     if not eligible:
         return None
 
     scored = []
     for w in eligible:
-        scores = get_recent_scan_scores(w["ticker"], limit=3)
-        avg = sum(scores) / len(scores) if scores else 0.0
+        avg = _avg_recent_score(w["ticker"])
+        if avg is None:
+            continue
         scored.append((w["ticker"], avg, w.get("added_at", "")))
+    if not scored:
+        return None
 
     return min(scored, key=lambda x: x[1])
 
 
-def _evict_for_capacity(candidate_score: Optional[float], cfg: dict) -> Optional[str]:
-    """Try to free one watchlist slot for a candidate that arrived while the
-    list is full. Two decision rules depending on whether the candidate has a
-    comparable composite score:
-
-      - candidate_score is a number (squeeze/catalyst/momentum): evict only
-        if it STRICTLY beats the weakest incumbent's recent average — same
-        upgrade bar as scheduler.run_weekly_rotation().
-      - candidate_score is None (supertrend — no composite gate by design):
-        never numerically compared against a real score. Only evict when the
-        weakest incumbent's recent average has already fallen below
-        AUTO_WL_SCORE_EXIT (40), i.e. it is dead weight that has not yet
-        cycled out through the normal auto-exit path. A scoreless flip can
-        claim a dead slot; it can never bump a ticker still earning its
-        place — that would let the least-vetted source crowd out the others.
+def _evict_for_capacity(ticker: str, cfg: dict) -> Optional[str]:
+    """Try to free one watchlist slot for `ticker`, a candidate that arrived
+    while the list is full. Whether it may evict the weakest incumbent is
+    decided by _candidate_beats_weakest() — see that function for the rule.
 
     Returns the evicted ticker, or None if no eviction happened — the caller
     must then fall back to the old "list is full" block.
@@ -285,10 +324,10 @@ def _evict_for_capacity(candidate_score: Optional[float], cfg: dict) -> Optional
         return None
     weakest_ticker, weakest_score, _ = weakest
 
-    if candidate_score is not None:
-        if candidate_score <= weakest_score:
-            return None
-    elif weakest_score >= AUTO_WL_SCORE_EXIT:
+    if weakest_ticker == ticker:
+        return None  # candidate is already the incumbent — nothing to evict
+
+    if not _candidate_beats_weakest(ticker, weakest_score):
         return None
 
     # Same hardened ordering as every other exit path in this codebase:
@@ -385,16 +424,21 @@ def run(results: list, source: str, cfg: dict) -> list:
             continue
 
         # Re-entry cooldown after a prior auto-exit. Only an exceptionally
-        # strong signal (score >= AUTO_WL_REENTRY_SCORE) bypasses the
-        # AUTO_EXIT_COOLDOWN_DAYS window. Fail-safe: any error → skip.
+        # strong REAL COMPOSITE score (>= AUTO_WL_REENTRY_SCORE) bypasses the
+        # AUTO_EXIT_COOLDOWN_DAYS window — a source-specific score (momentum/
+        # squeeze/catalyst) is on a different scale and was previously able to
+        # silently defeat this cooldown (see CLAUDE.md Incident Archive
+        # 2026-08-17). No composite history → cooldown always stays in effect.
+        # Fail-safe: any error → skip.
         try:
-            _candidate_score = r.get("explosion_score") or r.get("score", 0) or 0
-            if _in_auto_exit_cooldown(ticker) and _candidate_score < AUTO_WL_REENTRY_SCORE:
-                logger.info(
-                    f"[auto-watchlist] {ticker} in {AUTO_EXIT_COOLDOWN_DAYS}d cooldown after auto-exit "
-                    f"(score {_candidate_score:.0f} < re-entry {AUTO_WL_REENTRY_SCORE}) — skip"
-                )
-                continue
+            if _in_auto_exit_cooldown(ticker):
+                _candidate_avg = _avg_recent_score(ticker)
+                if _candidate_avg is None or _candidate_avg < AUTO_WL_REENTRY_SCORE:
+                    logger.info(
+                        f"[auto-watchlist] {ticker} in {AUTO_EXIT_COOLDOWN_DAYS}d cooldown after auto-exit "
+                        f"(composite avg {_candidate_avg} < re-entry {AUTO_WL_REENTRY_SCORE}) — skip"
+                    )
+                    continue
         except Exception as _cd_err:
             logger.warning(f"[auto-watchlist] {ticker} cooldown check failed: {_cd_err} — skipping (fail-safe)")
             continue
@@ -412,12 +456,7 @@ def run(results: list, source: str, cfg: dict) -> list:
         # A ticker already on the watchlist doesn't need a new slot — only
         # gate/evict when this candidate would actually grow the list.
         if ticker not in existing and cur_total + len(added) >= max_total:
-            # Distinguish "no comparable score" (None — e.g. supertrend, no
-            # composite gate by design) from "score is 0" (real, if unlikely).
-            _capacity_score = r.get("explosion_score")
-            if _capacity_score is None:
-                _capacity_score = r.get("score")
-            evicted = _evict_for_capacity(_capacity_score, cfg)
+            evicted = _evict_for_capacity(ticker, cfg)
             if evicted:
                 existing.discard(evicted)
                 cur_total -= 1

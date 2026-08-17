@@ -454,21 +454,36 @@ def _run_scan_impl():
     _aw_enabled = (_aw_cfg is True or _aw_cfg == "true" or
                    (isinstance(_aw_cfg, dict) and _aw_cfg))
     if _aw_enabled:
+        from src.auto_watchlist_agent import _evict_for_capacity
+
         existing = {w["ticker"] for w in watchlist_get_all()}
         # Ensure we don't exceed max total items (usually 30)
         _aw_policy = _aw_cfg.get("watchlist_policy", {}) if isinstance(_aw_cfg, dict) else {}
         max_total = _aw_policy.get("max_items_total", 30)
-        
+
         auto_added = []
         today_str = datetime.now().strftime("%Y-%m-%d")
-        
+
         # Sort results by score to add best ones first
         all_results.sort(key=lambda x: x["score"], reverse=True)
-        
+
         for r in all_results:
-            if len(existing) >= max_total:
-                break
-                
+            if r["score"] >= AUTO_WL_SCORE_ENTRY and r["ticker"] not in existing and len(existing) >= max_total:
+                # Every candidate here already has a real composite score
+                # (r["score"] came from score_stock() a few lines up in this
+                # same function), so this always compares fairly — unlike the
+                # momentum/squeeze/catalyst call sites this shares
+                # _evict_for_capacity with. Previously this just silently
+                # dropped the candidate — the same "watchlist pinned at
+                # capacity, zero new adds" bug from 2026-08-14, just never
+                # fixed on this 5th, highest-volume auto-add path. See
+                # CLAUDE.md Incident Archive 2026-08-17.
+                evicted = _evict_for_capacity(r["ticker"], _aw_cfg if isinstance(_aw_cfg, dict) else {})
+                if evicted:
+                    existing.discard(evicted)
+                else:
+                    break
+
             if r["score"] >= AUTO_WL_SCORE_ENTRY and r["ticker"] not in existing:
                 # Re-entry cooldown: if recently auto-exited, require stronger score
                 if (_in_auto_exit_cooldown(r["ticker"])
@@ -545,26 +560,26 @@ def run_weekly_rotation():
         return
     try:
         init_db()
-        from src.database import get_recent_scan_scores, watchlist_remove
+        from src.database import watchlist_remove
         from src.momentum_scanner import scan_momentum
         from src.index_loader import get_index
+        from src.auto_watchlist_agent import (
+            _weakest_evictable_auto_ticker, _candidate_beats_weakest,
+        )
 
         items = watchlist_get_all()
-        auto_items = [w for w in items if _is_auto_ticker(w.get("notes", ""))]
-        if not auto_items:
-            logger.info("Weekly rotation: no auto-added tickers in watchlist")
+        # _weakest_evictable_auto_ticker (shared with auto_watchlist_agent's
+        # capacity rotation) applies min-hold + open-position protection +
+        # no-composite-history exclusion, none of which this function used to
+        # apply on its own — see CLAUDE.md Incident Archive 2026-08-17.
+        weakest = _weakest_evictable_auto_ticker(items)
+        if weakest is None:
+            logger.info("Weekly rotation: no evictable auto-added tickers")
             return
-
-        existing_tickers = {w["ticker"] for w in items}
-
-        def avg_score(ticker: str) -> float:
-            scores = get_recent_scan_scores(ticker, limit=3)
-            return sum(scores) / len(scores) if scores else 0.0
-
-        scored = [(w["ticker"], avg_score(w["ticker"])) for w in auto_items]
-        weakest_ticker, weakest_score = min(scored, key=lambda x: x[1])
+        weakest_ticker, weakest_score, _ = weakest
         logger.info(f"Weekly rotation: weakest={weakest_ticker} score_3d_avg={weakest_score:.1f}")
 
+        existing_tickers = {w["ticker"] for w in items}
         tickers_set: set = set()
         for index_name in ["Russell 2000", "S&P 500"]:
             df = get_index(index_name)
@@ -583,12 +598,16 @@ def run_weekly_rotation():
 
         best = results[0]
         best_ticker = best["ticker"]
-        best_score = best["score"]
+        best_score = best["score"]  # momentum-scale score — informational/notes only, see below
 
-        if best_score <= weakest_score:
+        # best_score is on momentum_scanner's scale, not composite — never
+        # compare it to weakest_score directly (that mismatch was the same
+        # root cause behind the capacity-rotation bug). _candidate_beats_weakest
+        # resolves best_ticker's own composite history internally.
+        if not _candidate_beats_weakest(best_ticker, weakest_score):
             logger.info(
-                f"Weekly rotation: best candidate {best_ticker} ({best_score:.1f}) "
-                f"not better than weakest {weakest_ticker} ({weakest_score:.1f}) — skipping"
+                f"Weekly rotation: best candidate {best_ticker} (momentum score {best_score:.1f}) "
+                f"not better than weakest {weakest_ticker} (composite avg {weakest_score:.1f}) — skipping"
             )
             return
 
@@ -1194,7 +1213,12 @@ def run_watchlist_cleanup():
         for item in auto_items:
             ticker = item["ticker"]
             scores = get_recent_scan_scores(ticker, limit=3)
-            if len(scores) >= 3 and all(s < 50 for s in scores):
+            # min-hold guard added 2026-08-17 — without it, a ticker added
+            # mid-day could accumulate 3 low scores within ~1.5 days (run_scan
+            # runs twice daily), well under the 3-day hold every other
+            # removal path enforces. See CLAUDE.md Incident Archive.
+            if (_min_hold_satisfied(item.get("added_at", ""))
+                    and len(scores) >= 3 and all(s < 50 for s in scores)):
                 try:
                     last_score = float(scores[0]) if scores else 0.0
                     # Write cooldown BEFORE removing (retry_on_busy wrapped)

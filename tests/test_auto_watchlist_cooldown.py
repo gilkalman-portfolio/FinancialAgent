@@ -196,13 +196,23 @@ def test_cleanup_writes_cooldown_and_blocks_readd(temp_db, monkeypatch):
         DB_PATH, watchlist_add, watchlist_get_all, watchlist_get_alerts,
     )
 
-    # 1. Auto-add ticker BAR to watchlist
+    # 1. Auto-add ticker BAR to watchlist, backdated past AUTO_WL_MIN_HOLD_DAYS
+    # (3) — run_watchlist_cleanup() now enforces the same minimum-hold-time
+    # protection every other removal path has (added 2026-08-17; see CLAUDE.md
+    # Incident Archive), so a same-day add is no longer eligible for removal.
+    from datetime import timedelta
     watchlist_add(
         "BAR",
         notes=f"Auto: score 72 on {datetime.now().strftime('%Y-%m-%d')}",
         alert_score=70,
         alert_pct=5.0,
     )
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE watchlist SET added_at = ? WHERE ticker = ?",
+            ((datetime.now() - timedelta(days=10)).isoformat(), "BAR"),
+        )
+        conn.commit()
     assert any(w["ticker"] == "BAR" for w in watchlist_get_all())
 
     # 2. Insert a scan_run + 3 scan_results all with score < 50

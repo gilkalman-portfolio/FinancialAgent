@@ -520,6 +520,18 @@ def get_last_saved_score(ticker: str) -> Optional[float]:
         return float(row[0]) if row and row[0] is not None else None
 
 
+def has_open_ibkr_position(ticker: str) -> bool:
+    """True if IBKR currently reports a long position for ticker. Used to stop
+    watchlist eviction from silently stripping a held position of its
+    monitoring_queue coverage — see CLAUDE.md Incident Archive 2026-08-17."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM ibkr_positions WHERE ticker = ? AND shares > 0",
+            (ticker,)
+        ).fetchone()
+        return row is not None
+
+
 def get_db_stats() -> Dict:
     with get_connection() as conn:
         return {
