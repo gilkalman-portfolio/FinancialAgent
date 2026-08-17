@@ -28,6 +28,22 @@ CONFIG_PATH = Path("scheduler_config.json")
 LOG_FILE    = Path(__file__).parent / "logs" / "scheduler.log"
 _PID_FILE   = Path(__file__).parent / "logs" / "scheduler.pid"
 
+# loguru ships with only a default stderr sink. The watchdog (run_scheduler_watchdog.py)
+# launches this process with stdout=stderr=DEVNULL, so without an explicit file sink every
+# direct logger.info()/logger.error() call in this module was silently discarded in
+# production (confirmed: no logger.add() existed anywhere in the repo before this line).
+# See CLAUDE.md Incident Archive 2026-08-17.
+LOG_FILE.parent.mkdir(exist_ok=True)
+logger.add(
+    LOG_FILE,
+    rotation="10 MB",
+    retention=5,
+    level="INFO",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+    encoding="utf-8",
+    enqueue=True,
+)
+
 
 # ── Singleton guard — prevents two scheduler processes running simultaneously ──
 def _acquire_singleton() -> bool:
@@ -63,14 +79,12 @@ def _release_singleton():
 
 
 def _log(msg: str):
-    """Thread-safe log — writes directly to file AND loguru."""
+    """Thread-safe log via loguru — the file sink is configured at module load
+    (see LOG_FILE / logger.add() above). Previously this also wrote LOG_FILE
+    directly as a workaround for loguru having no sink; that hand-rolled write
+    both duplicated every line and mangled non-ASCII characters (no encoding
+    specified), so it's removed now that the real sink exists."""
     logger.info(msg)
-    try:
-        LOG_FILE.parent.mkdir(exist_ok=True)
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | INFO | {msg}\n")
-    except Exception:
-        pass
 
 
 def load_config() -> dict:
@@ -286,6 +300,17 @@ def _check_breakout(ticker: str, score: float, price: float) -> Optional[str]:
 
 
 def run_scan():
+    """Thin exception guard — run_scan is the only job among ~17 that lacked
+    one; an unhandled error anywhere in _run_scan_impl() (including the
+    auto-add block) would otherwise kill the whole scheduler process. See
+    CLAUDE.md Incident Archive 2026-08-17."""
+    try:
+        _run_scan_impl()
+    except Exception as e:
+        logger.error(f"run_scan: unhandled failure — {e}")
+
+
+def _run_scan_impl():
     if not _is_trading_day():
         logger.info("run_scan: skipping — weekend")
         return

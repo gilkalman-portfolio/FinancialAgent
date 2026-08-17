@@ -163,8 +163,16 @@ def check_daily_loss_limit() -> VetoResult:
         day_pnl = _position_tracker.get_daily_pnl()
         portfolio_value = _position_tracker.get_portfolio_value()
     except Exception as e:
-        logger.warning(f"check_daily_loss_limit: data fetch failed: {e} — skipping")
-        return VetoResult(passed=True, reason="")
+        # This is the circuit breaker for the worst day, not a routine entry-
+        # quality gate — failing open here means a DB hiccup on a bad loss day
+        # silently lets trading continue. Fail closed, matching the
+        # portfolio_value<=0 case right below. See CLAUDE.md Incident Archive
+        # 2026-08-17.
+        logger.warning(f"check_daily_loss_limit: data fetch failed: {e} — vetoing trade")
+        return VetoResult(
+            passed=False,
+            reason=f"daily loss limit check failed ({e}) — cannot verify trading is within the loss limit",
+        )
 
     if portfolio_value <= 0:
         logger.warning("check_daily_loss_limit: portfolio_value unavailable — vetoing trade")
