@@ -176,12 +176,22 @@ def check_price_targets():
             )
             if item.get("notes"):
                 msg += f"\nהערה: {item['notes']}"
+            # send_message() swallows its own errors and returns False rather
+            # than raising, so the cooldown row must gate on the return value,
+            # not a try/except — otherwise a failed send still consumes the
+            # cooldown and the alert never fires again. Mirrors
+            # watchlist_manager.py::_send_alert(). See CLAUDE.md Incident
+            # Archive 2026-08-17.
             try:
-                telegram.send_message(msg)
-                watchlist_save_alert(ticker, "price_target", msg, score=None, price=price)
-                logger.info(f"Price target alert SENT: {ticker} @ ${price:.2f} (target ${target:.2f})")
+                sent = telegram.send_message(msg)
             except Exception as e:
                 logger.warning(f"Failed to send price alert {ticker}: {e}")
+                sent = False
+            if sent:
+                watchlist_save_alert(ticker, "price_target", msg, score=None, price=price)
+                logger.info(f"Price target alert SENT: {ticker} @ ${price:.2f} (target ${target:.2f})")
+            else:
+                logger.warning(f"Price target alert NOT sent (cooldown not consumed): {ticker}")
 
 
 def check_volume_spikes():

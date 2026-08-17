@@ -351,12 +351,15 @@ def _evict_for_capacity(ticker: str, cfg: dict) -> Optional[str]:
 
     if cfg.get("telegram", True):
         try:
-            TelegramNotifier().send_message(
+            sent = TelegramNotifier().send_message(
                 f"🔄 Capacity rotation: removed {weakest_ticker} "
                 f"(score {weakest_score:.0f}) to make room for a new candidate"
             )
         except Exception as e:
             logger.warning(f"auto_watchlist: capacity rotation Telegram failed: {e}")
+            sent = False
+        if not sent:
+            logger.warning(f"auto_watchlist: capacity rotation Telegram not sent — evicted {weakest_ticker} anyway")
 
     return weakest_ticker
 
@@ -502,12 +505,24 @@ def run(results: list, source: str, cfg: dict) -> list:
             f"— {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             f"Added {len(added)} ticker(s):\n\n" + "\n".join(lines)
         )
+        # The adds already happened (DB writes above) — an independent, valid
+        # decision regardless of Telegram. Only the courtesy notification can
+        # fail here; it must be logged clearly rather than silently, now that
+        # scheduler.py's logging actually reaches disk. See CLAUDE.md
+        # Incident Archive 2026-08-17.
         try:
-            TelegramNotifier().send_message(msg)
+            sent = TelegramNotifier().send_message(msg)
+        except Exception as e:
+            logger.warning(f"auto_watchlist [{source}]: Telegram failed: {e}")
+            sent = False
+        if sent:
             logger.info(
                 f"auto_watchlist [{source}]: Telegram sent for {[r['ticker'] for r in added]}"
             )
-        except Exception as e:
-            logger.warning(f"auto_watchlist [{source}]: Telegram failed: {e}")
+        else:
+            logger.warning(
+                f"auto_watchlist [{source}]: Telegram summary failed to send — "
+                f"added anyway: {[r['ticker'] for r in added]}"
+            )
 
     return added

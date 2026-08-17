@@ -325,6 +325,31 @@ class TestPriceTargetCrossing:
         assert len(results) == 1
         assert mock_tg.send_message.call_count == 1
 
+    def test_failed_send_does_not_write_cooldown(self):
+        """2026-08-17 fix: send_message() swallows its own errors and returns
+        False rather than raising, so the old bare try/except never caught a
+        failed send — watchlist_save_alert ran unconditionally right after,
+        consuming the cooldown for an alert the user never saw. Must now
+        gate on the return value, same as watchlist_manager.py::_send_alert."""
+        import src.price_alert_monitor as pam
+        pam._last_seen_price.clear()
+
+        item = {"ticker": "FAKE", "price_target": 50.0, "notes": None}
+        results = []
+        with patch.object(pam, "_is_market_hours", return_value=True), \
+             patch.object(pam, "watchlist_get_all", return_value=[item]), \
+             patch.object(pam, "_get_price", return_value=50.02), \
+             patch.object(pam, "_cooldown_ok", return_value=True), \
+             patch.object(pam, "watchlist_save_alert",
+                          side_effect=lambda *a, **kw: results.append(a)), \
+             patch.object(pam, "TelegramNotifier") as MockNotifier:
+            mock_tg = MagicMock()
+            mock_tg.send_message.return_value = False  # simulates a failed/disabled send
+            MockNotifier.return_value = mock_tg
+            pam.check_price_targets()
+
+        assert results == [], "expected no cooldown row written when the send failed"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. _send_alert: cooldown row not written on failed send

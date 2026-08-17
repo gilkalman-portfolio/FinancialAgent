@@ -159,7 +159,20 @@ def calculate_dcf(info: dict, cashflow_df=None, ticker: str = "") -> Optional[di
         terminal_growth = 0.025
 
         # ── WACC — CAPM cost of equity + actual cost of debt ─────────────────
-        de_ratio      = (info.get("debtToEquity") or 0) / 100   # yfinance: D/E×100
+        # A missing field here (yfinance omits it, common for smaller names)
+        # is not the same as a confirmed zero — `.get(...) or 0` used to treat
+        # them identically, silently pricing a leveraged company as debt-free
+        # and inflating its margin of safety. Genuinely insufficient data for
+        # a reliable DCF falls through to P/S, same as every other
+        # insufficient-data case in this function (equity_value<=0, etc).
+        # See CLAUDE.md Incident Archive 2026-08-17.
+        if (info.get("debtToEquity") is None
+                or info.get("totalDebt") is None
+                or info.get("totalCash") is None):
+            logger.debug(f"DCF {ticker}: debt/cash data unavailable — insufficient for a reliable DCF")
+            return None
+
+        de_ratio      = info.get("debtToEquity") / 100   # yfinance: D/E×100
         weight_debt   = de_ratio / (1 + de_ratio)
         weight_equity = 1 - weight_debt
 
@@ -168,7 +181,7 @@ def calculate_dcf(info: dict, cashflow_df=None, ticker: str = "") -> Optional[di
         # Actual cost of debt = interestExpense / totalDebt (from filings).
         # Falls back to leverage-tiered estimate when unavailable.
         interest_expense = abs(info.get("interestExpense") or 0)
-        total_debt_raw   = info.get("totalDebt") or 0
+        total_debt_raw   = info.get("totalDebt")   # guaranteed non-None, see check above
         if interest_expense > 0 and total_debt_raw > 0:
             cost_of_debt = _clamp(interest_expense / total_debt_raw, 0.02, 0.15)
         elif de_ratio >= 2.0:   cost_of_debt = 0.08
@@ -199,8 +212,8 @@ def calculate_dcf(info: dict, cashflow_df=None, ticker: str = "") -> Optional[di
         # sum(pv_fcfs) + pv_terminal is the FCFF-based Enterprise Value.
         # Converting to equity value requires subtracting net financial debt.
         # Cash-rich companies (negative net debt) get a positive adjustment.
-        total_debt    = info.get("totalDebt") or 0
-        total_cash    = info.get("totalCash") or 0
+        total_debt    = info.get("totalDebt")   # guaranteed non-None, see check above
+        total_cash    = info.get("totalCash")   # guaranteed non-None, see check above
         net_debt      = total_debt - total_cash
         equity_value  = sum(pv_fcfs) + pv_terminal - net_debt
         if equity_value <= 0:

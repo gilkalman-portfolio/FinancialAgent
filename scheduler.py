@@ -441,12 +441,18 @@ def _run_scan_impl():
     logger.info(f"Scan complete | {len(all_results)} above threshold")
 
     # ── Batch auto-exit notification ──────────────────────────────────────────
+    # The removals themselves already happened (cooldown-then-remove, above) —
+    # that's an independent, valid decision regardless of Telegram. This is
+    # just the courtesy notification; if it fails, the tickers are still
+    # correctly gone, but the user has no way to know unless the failure is
+    # logged clearly. See CLAUDE.md Incident Archive 2026-08-17.
     if auto_exited and telegram_on and breakout_telegram:
-        breakout_telegram.send_message(
+        if not breakout_telegram.send_message(
             f"🗑 Auto-exit: removed {len(auto_exited)} ticker(s) (score < {EXIT_SCORE_THRESHOLD})\n"
             + ", ".join(auto_exited)
             + "\n🎯 These stocks no longer meet minimum criteria."
-        )
+        ):
+            logger.warning(f"run_scan: auto-exit Telegram summary failed to send — removed anyway: {auto_exited}")
 
     # ── Auto-add high-score stocks to watchlist ───────────────────────────────
     _aw_cfg = cfg.get("auto_watchlist", True)
@@ -633,10 +639,14 @@ def run_weekly_rotation():
         logger.info(f"Weekly rotation: removed {weakest_ticker} → added {best_ticker}")
 
         if cfg.get("telegram", True):
-            TelegramNotifier().send_message(
+            if not TelegramNotifier().send_message(
                 f"🔄 Weekly rotation: removed {weakest_ticker} ({weakest_score:.0f}) "
                 f"→ added {best_ticker} ({best_score:.0f})"
-            )
+            ):
+                logger.warning(
+                    f"Weekly rotation: Telegram not sent — removed {weakest_ticker} → "
+                    f"added {best_ticker} anyway"
+                )
     except Exception as e:
         logger.error(f"Weekly rotation failed: {e}")
 
@@ -719,11 +729,12 @@ def run_watchlist_scan():
                     except Exception as e:
                         logger.warning(f"Auto-exit remove {r['ticker']}: {e}")
         if auto_exited and telegram_on:
-            TelegramNotifier().send_message(
+            if not TelegramNotifier().send_message(
                 f"🗑 Auto-exit: removed {len(auto_exited)} ticker(s) (score < {EXIT_SCORE_THRESHOLD})\n"
                 + ", ".join(auto_exited)
                 + "\n🎯 These stocks no longer meet minimum criteria."
-            )
+            ):
+                logger.warning(f"run_watchlist_scan: auto-exit Telegram summary failed to send — removed anyway: {auto_exited}")
     except Exception as e:
         logger.error(f"Watchlist scan failed: {e}")
 

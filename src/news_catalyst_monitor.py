@@ -285,19 +285,28 @@ def run_catalyst_check(
                 if not force and news_seen_contains(key):
                     continue  # already processed
 
-                # Mark as seen regardless of threshold (avoid re-checking low-score headlines)
-                news_seen_add(key, ticker, cscore)
+                if cscore < catalyst_threshold:
+                    # Genuinely low-signal — safe to mark seen immediately,
+                    # no reason to ever re-score this exact headline.
+                    news_seen_add(key, ticker, cscore)
+                    continue
 
-                if cscore >= catalyst_threshold:
-                    new_articles.append((article, cscore))
-                    logger.info(f"[CatalystMonitor] {ticker}: catalyst={cscore} — '{headline[:60]}'")
+                # Above threshold: do NOT mark seen yet. This headline still
+                # has to survive the LLM budget check, an LLM call (which can
+                # time out or error), an impact check, and a Telegram send —
+                # any of which can fail. news_seen_add() has no expiry, so
+                # marking it here would permanently blacklist a real catalyst
+                # on a transient failure. Marked only after a confirmed send,
+                # below. See CLAUDE.md Incident Archive 2026-08-17.
+                new_articles.append((article, cscore, key))
+                logger.info(f"[CatalystMonitor] {ticker}: catalyst={cscore} — '{headline[:60]}'")
 
             if not new_articles:
                 continue
 
             # Sort by catalyst score, take the strongest
             new_articles.sort(key=lambda x: x[1], reverse=True)
-            top_article, top_score = new_articles[0]
+            top_article, top_score, top_key = new_articles[0]
 
             # LLM budget check
             if llm_calls >= max_llm_calls:
@@ -346,6 +355,9 @@ def run_catalyst_check(
 
             if telegram.send_message(msg, parse_mode="Markdown"):
                 alerts_sent += 1
+                # Only now — confirmed delivered — is it safe to permanently
+                # blacklist this exact headline from ever being reconsidered.
+                news_seen_add(top_key, ticker, top_score)
                 # Save to watchlist_alerts for history
                 watchlist_save_alert(
                     ticker     = ticker,
@@ -355,7 +367,7 @@ def run_catalyst_check(
                 )
                 logger.info(f"[CatalystMonitor] Alert sent for {ticker} | impact={impact['impact']} | layer={impact['layer']}")
             else:
-                logger.warning(f"[CatalystMonitor] Telegram send failed for {ticker}")
+                logger.warning(f"[CatalystMonitor] Telegram send failed for {ticker} — not marked seen, will retry next cycle")
 
         except Exception as e:
             logger.error(f"[CatalystMonitor] Error processing {ticker}: {e}")

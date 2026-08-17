@@ -80,7 +80,14 @@ def _edgar_eps_fallback(ticker: str) -> dict:
         from src.edgar_fcf import get_eps_yoy_growth
         yoy = get_eps_yoy_growth(ticker)
         if yoy is None:
-            return {"score": 0, "sentiment": "neutral", "source": "none", "detail": "no data"}
+            # score=2 (the existing "neutral/inline" tier below), not 0 — "no
+            # data" was previously scored identically to a confirmed >15%
+            # earnings decline, silently penalizing tickers we simply have no
+            # signal on. source stays "none" for callers that check it, but
+            # stock_scorer.py currently feeds `score` straight into the
+            # composite without checking `source`. See CLAUDE.md Incident
+            # Archive 2026-08-17.
+            return {"score": 2, "sentiment": "neutral", "source": "none", "detail": "no data"}
 
         if   yoy >= 0.30: score, sentiment = 5, "bullish"
         elif yoy >= 0.15: score, sentiment = 4, "bullish"
@@ -96,7 +103,7 @@ def _edgar_eps_fallback(ticker: str) -> dict:
             "detail":    f"EPS YoY avg: {yoy*100:+.1f}% (4Q)",
         }
     except Exception:
-        return {"score": 0, "sentiment": "neutral", "source": "none", "detail": "edgar fallback failed"}
+        return {"score": 2, "sentiment": "neutral", "source": "none", "detail": "edgar fallback failed"}
 
 
 # ── Tier 2: Transcript LLM analysis ─────────────────────────────────────────
@@ -143,7 +150,10 @@ def get_earnings_sentiment(ticker: str, finnhub_key: str) -> dict:
       source    : str  'transcript_llm' | 'eps_surprise' | 'none'
       detail    : str  human-readable reason
     """
-    fallback = {'score': 0, 'sentiment': 'neutral', 'source': 'none', 'detail': 'no data'}
+    # score=2 (neutral tier), not 0 — see the matching fix in
+    # _edgar_eps_fallback() above for why "no data" must not score the same
+    # as a confirmed bad result. CLAUDE.md Incident Archive 2026-08-17.
+    fallback = {'score': 2, 'sentiment': 'neutral', 'source': 'none', 'detail': 'no data'}
 
     if not finnhub_key:
         return fallback

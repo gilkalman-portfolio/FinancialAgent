@@ -30,6 +30,13 @@ def _base_info(**overrides):
         "revenueGrowth": 0.10,
         "earningsGrowth": 0.10,
         "debtToEquity": 50,
+        # totalDebt/totalCash: as of 2026-08-17, calculate_dcf() returns None
+        # when these are missing rather than defaulting to 0 (see
+        # tests/test_dcf_missing_data.py for that fix's own coverage) — these
+        # tests are about growth-rate handling, not missing-data handling, so
+        # they need real values here to keep reaching the code under test.
+        "totalDebt": 500_000_000,
+        "totalCash": 200_000_000,
     }
     base.update(overrides)
     return base
