@@ -140,13 +140,34 @@ def _pending_sell_shares_for(ticker: str) -> int:
     return 0
 
 
+_POSITION_STALENESS_WARN_MINUTES = 10
+
+
 def _held_shares_for(ticker: str) -> int:
+    """Every software-driven exit sizes itself off this — submit_exit() is
+    the single funnel they all route through (see its docstring). There is
+    deliberately no freshness gate here: exits must never be blocked (see
+    CLAUDE.md — the exit layer runs regardless of position-sync health,
+    unlike BUY signals which do gate on `positions_fresh`). This only logs a
+    warning when the underlying row is stale, so a genuinely out-of-date
+    read is at least visible instead of silently trusted. See CLAUDE.md
+    Incident Archive 2026-08-17."""
     try:
         with get_connection() as conn:
             row = conn.execute(
-                "SELECT shares FROM ibkr_positions WHERE ticker = ?", (ticker,)
+                "SELECT shares, last_synced FROM ibkr_positions WHERE ticker = ?", (ticker,)
             ).fetchone()
         if row and row["shares"] is not None:
+            if row["last_synced"]:
+                try:
+                    age_min = (datetime.now() - datetime.fromisoformat(row["last_synced"])).total_seconds() / 60
+                    if age_min > _POSITION_STALENESS_WARN_MINUTES:
+                        logger.warning(
+                            f"[order_manager] _held_shares_for({ticker}): position data is "
+                            f"{age_min:.0f} min stale (last_synced={row['last_synced']})"
+                        )
+                except (ValueError, TypeError):
+                    pass
             return int(float(row["shares"]))
     except Exception as e:
         logger.warning(f"[order_manager] _held_shares_for({ticker}) failed: {e}")
@@ -516,5 +537,25 @@ class OrderManager:
         if composite_score is not None:
             base["score"] = composite_score
             base["explosion_score"] = composite_score
+
+        # combined_buy has no composite-score gate by design (2026-06-03,
+        # Supertrend flip is the sole trigger) — a ticker discovered ONLY
+        # through that path, never independently scanned by run_scan(), and
+        # with no composite_score on the alert either, reaches here as
+        # base == {"price": price} and nothing else. normalize_score_data()
+        # below then fills every other field with a plausible-looking
+        # default (fundamentals_score=5, etc.) rather than "unknown". This is
+        # currently intentional (the Supertrend-only path is meant to trade
+        # without composite data) and today's Track A confluence constants
+        # happen to reject a fully data-free profile — but that's an
+        # arithmetic coincidence, not a deliberate floor. If those constants
+        # are ever retuned, a completely data-free ticker could size a real
+        # bracket order on fabricated inputs with no explicit gate catching
+        # it. Flagged, not fixed — see CLAUDE.md Incident Archive 2026-08-17.
+        if base == {"price": price}:
+            logger.debug(
+                f"[order_manager] {ticker}: no scan_results at all — score_data will be "
+                "fully synthetic after normalize_score_data() defaults"
+            )
 
         return self.engine.normalize_score_data(base)

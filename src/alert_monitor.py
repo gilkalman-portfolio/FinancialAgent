@@ -383,7 +383,11 @@ def run_alert_monitor():
 
     report = "\n".join(lines)
     _log("Sending Telegram report")
-    telegram.send_message(report, parse_mode="")
+    if not telegram.send_message(report, parse_mode=""):
+        # This job's entire purpose is catching exactly this class of
+        # silent failure elsewhere — its own send failing must not go
+        # unnoticed. See CLAUDE.md Incident Archive 2026-08-17.
+        _log("WARNING: Alert Monitor's own Telegram report failed to send")
 
     _log(f"Alert Monitor complete. Issues={issue_count}, suppressed={len(all_suppressed)}")
     _log("=" * 60)

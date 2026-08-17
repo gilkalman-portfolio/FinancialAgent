@@ -250,6 +250,12 @@ def evaluate_trade(
         return _veto("L0: price unavailable (0)")
 
     # Layer -1: SELL requires an open position
+    # Fails CLOSED on error (2026-08-17, was fail-open): this is the belt-
+    # and-braces guard against an unintended short, the single most severe
+    # incident family in this project's history (see CLAUDE.md Incident
+    # Archive 2026-08-05). A DB read failure here must never be treated as
+    # "assume there's something to sell". WAL + retry_on_busy already absorb
+    # routine lock contention, so an error reaching here is not routine.
     if is_sell and _position_tracker is not None:
         try:
             exposure = _position_tracker.get_current_exposure(ticker)
@@ -259,9 +265,13 @@ def evaluate_trade(
             if exposure <= 0.0:
                 return _veto("L-1: No open long position to sell")
         except Exception as e:
-            logger.warning("evaluate_trade(%s): position check failed: %s — allowing", ticker, e)
+            logger.warning("evaluate_trade(%s): position check failed: %s — vetoing", ticker, e)
+            return _veto(f"L-1: position check failed ({e}) — cannot verify an open position exists")
 
     # Layer -1.5: BUY veto if already holding a long position (no pyramiding)
+    # Fails CLOSED on error (2026-08-17, was fail-open) — same reasoning as
+    # L-1: missing a BUY is low-cost, unverified pyramiding into an existing
+    # position is not.
     if signal_type == "BUY":
         try:
             with get_connection() as _conn:
@@ -273,9 +283,12 @@ def evaluate_trade(
                 logger.info(f"[engine] {ticker}: BUY vetoed — already long {_existing['shares']:.0f}sh")
                 return _veto(f"L-1.5: Already long {ticker} ({_existing['shares']:.0f}sh) — no pyramiding")
         except Exception as _e:
-            logger.warning(f"[engine] existing-long check failed for {ticker}: {_e} — allowing trade")
+            logger.warning(f"[engine] existing-long check failed for {ticker}: {_e} — vetoing")
+            return _veto(f"L-1.5: existing-long check failed ({_e}) — cannot verify no pyramiding")
 
     # Layer -1.2: BUY veto if max open positions reached
+    # Fails CLOSED on error (2026-08-17, was fail-open) — unverified position
+    # count risks exceeding the account's max-positions/leverage limit.
     if signal_type == "BUY":
         try:
             with get_connection() as _conn:
@@ -287,7 +300,8 @@ def evaluate_trade(
                 logger.info(f"[engine] {ticker}: BUY vetoed — {_pos_count}/{_max_pos} positions open")
                 return _veto(f"L-1.2: Max positions reached ({_pos_count}/{_max_pos})")
         except Exception as _e:
-            logger.warning(f"[engine] max-positions check failed for {ticker}: {_e} — allowing trade")
+            logger.warning(f"[engine] max-positions check failed for {ticker}: {_e} — vetoing")
+            return _veto(f"L-1.2: max-positions check failed ({_e}) — cannot verify position count")
 
     # Layer 0: daily loss limit (runs before everything else — applies to SELL too
     # as a circuit-breaker, though exits normally reduce risk)
@@ -721,6 +735,15 @@ def normalize_score_data(r: dict[str, Any]) -> dict[str, Any]:
       fund_score  → fundamentals_score
       dcf['intrinsic'] → dcf_intrinsic
       avg_volume: fetched live if absent
+
+    Caller contract, worth stating explicitly: every default below
+    (fundamentals_score=5, days_to_event=999, etc.) fires whenever the
+    caller's `r` is missing that field — which includes the legitimate case
+    of a combined_buy signal for a ticker never independently scanned by
+    run_scan() (order_manager.py::_build_score_data() then passes in nothing
+    but {"price": ...}). Today's Track A confluence constants happen to
+    reject a fully-defaulted profile, but that's not an explicit gate here —
+    see the note at that call site. See CLAUDE.md Incident Archive 2026-08-17.
     """
     dcf_dict = r.get("dcf") or {}
     return {

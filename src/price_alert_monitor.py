@@ -45,9 +45,15 @@ _ET = ZoneInfo("America/New_York")
 
 
 def _is_market_hours() -> bool:
-    now = datetime.now(_ET)
-    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+    # Holiday-aware as of 2026-08-17 — this gates the momentum/Supertrend
+    # universe background threads, which previously only checked weekday and
+    # kept running full-universe yfinance scans on market holidays while
+    # every schedule.every().day.at(...) job correctly stood down. See
+    # src/trading_calendar.py and CLAUDE.md Incident Archive 2026-08-17.
+    from src.trading_calendar import is_trading_day
+    if not is_trading_day():
         return False
+    now = datetime.now(_ET)
     market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
     return market_open <= now <= market_close

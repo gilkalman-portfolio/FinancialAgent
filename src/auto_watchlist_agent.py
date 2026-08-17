@@ -74,7 +74,11 @@ def _in_auto_exit_cooldown(ticker: str, days: int = AUTO_EXIT_COOLDOWN_DAYS) -> 
 # ── Per-source filters ────────────────────────────────────────────────────────
 
 def _check_liquidity(r: dict, src_cfg: dict, already_in: bool = False) -> bool:
-    """Returns True if dollar-volume passes the hysteresis-aware gate, or if data unavailable.
+    """Returns True if dollar-volume passes the hysteresis-aware gate. Fails
+    CLOSED when data is unavailable (2026-08-17, was fail-open) — a thinly-
+    traded ticker with missing volume data should not sail past the gate by
+    default; this matches monitoring_queue.py::_liquid(), the equivalent gate
+    for real IBKR monitoring, which already fails closed correctly.
 
     Uses LIQUIDITY_ADV_ENTRY / _EXIT for tickers gating into vs. already-in the
     monitored pool. Falls back to the legacy `min_avg_dollar_volume` config value
@@ -83,7 +87,7 @@ def _check_liquidity(r: dict, src_cfg: dict, already_in: bool = False) -> bool:
     price = r.get("price", 0) or 0
     dv = r.get("avg_dollar_volume") or (price * r.get("avg_volume", 0))
     if not dv:
-        return True  # no data — don't filter out
+        return False  # no data — cannot verify liquidity, don't let it through
     # Hysteresis band (only applied if config floor doesn't override stricter)
     if not passes_hysteresis(dv, already_in, LIQUIDITY_ADV_ENTRY, LIQUIDITY_ADV_EXIT):
         return False

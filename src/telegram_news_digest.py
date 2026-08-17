@@ -13,6 +13,7 @@ load_dotenv()
 
 from src.telegram_notifier import TelegramNotifier
 from src.database import portfolio_get_all
+from src.news_catalyst_monitor import _escape_md
 
 
 def send_market_digest():
@@ -59,12 +60,14 @@ def send_market_digest():
             emoji = "🟢" if "Bullish" in sent and "Somewhat" not in sent else \
                     "🟡" if "Somewhat" in sent else \
                     "🔴" if "Bearish" in sent else "⚪"
-            headline = a.get("headline", "")[:150]
+            headline = _escape_md(a.get("headline", "")[:150])
             lines.append(f"  {emoji} {headline}")
 
         msg = "\n".join(lines)
-        telegram.send_message(msg, parse_mode="Markdown")
-        logger.info("Market digest sent to Telegram")
+        if telegram.send_message(msg, parse_mode="Markdown"):
+            logger.info("Market digest sent to Telegram")
+        else:
+            logger.warning("Market digest: Telegram send failed")
 
     except Exception as e:
         logger.error(f"Market digest failed: {e}")
@@ -96,7 +99,7 @@ def send_portfolio_news():
                 found_any = True
                 lines.append(f"*{ticker}* ({len(articles_raw)} כתבות):")
                 for a in articles_raw[:3]:
-                    headline = a.get("headline", "")[:150]
+                    headline = _escape_md(a.get("headline", "")[:150])
                     pub = a.get("published", "")
                     prefix = f"[{pub}] " if pub else ""
                     lines.append(f"  • {prefix}{headline}")
@@ -109,8 +112,10 @@ def send_portfolio_news():
             logger.info("Portfolio news: no news found for any holding")
             return
 
-        telegram.send_message("\n".join(lines), parse_mode="Markdown")
-        logger.info(f"Portfolio news digest sent for {len(holdings)} holdings")
+        if telegram.send_message("\n".join(lines), parse_mode="Markdown"):
+            logger.info(f"Portfolio news digest sent for {len(holdings)} holdings")
+        else:
+            logger.warning("Portfolio news digest: Telegram send failed")
 
     except Exception as e:
         logger.error(f"Portfolio news failed: {e}")

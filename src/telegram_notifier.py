@@ -59,21 +59,57 @@ class TelegramNotifier:
             return False
 
         if len(text) > self.MAX_MSG_LEN:
-            text = text[:self.MAX_MSG_LEN - 20] + "\n…[truncated]"
+            # Prefer cutting at the last newline before the limit — a raw
+            # mid-line cut is more likely to split a Markdown entity
+            # (*bold*, _italic_) than a paragraph boundary is. Not a full
+            # Markdown parser; the plain-text retry in _post() below is the
+            # real safety net for whatever still ends up unbalanced.
+            cut = text.rfind("\n", 0, self.MAX_MSG_LEN - 20)
+            if cut < self.MAX_MSG_LEN // 2:   # no reasonable newline nearby — hard-cut
+                cut = self.MAX_MSG_LEN - 20
+            text = text[:cut] + "\n…[truncated]"
             logger.warning("Telegram message truncated to 4000 chars")
 
+        return self._post(text, parse_mode, retry_429=True, retry_plain=True)
+
+    def _post(self, text: str, parse_mode: Optional[str], retry_429: bool, retry_plain: bool) -> bool:
+        """Single send attempt, with two one-shot retries:
+          - HTTP 429: honor Retry-After (clamped 1-30s) and retry once.
+          - HTTP 400 with a Markdown parse_mode set: Telegram rejects the
+            whole message on any unbalanced entity — a truncation cut, an
+            unescaped ticker with an underscore, anything. Retrying once as
+            plain text recovers the message instead of losing it outright.
+        See CLAUDE.md Incident Archive 2026-08-17."""
+        import time
         try:
             url = f"{TELEGRAM_API_URL}/sendMessage"
             payload = {
                 'chat_id': self.chat_id,
                 'text': text,
-                'parse_mode': parse_mode,
-                'disable_web_page_preview': True
+                'disable_web_page_preview': True,
             }
+            if parse_mode:
+                payload['parse_mode'] = parse_mode
             response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
             logger.info("Telegram message sent successfully")
             return True
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 429 and retry_429:
+                retry_after = 2
+                try:
+                    retry_after = max(1, min(30, int(e.response.headers.get("Retry-After", 2))))
+                except (TypeError, ValueError):
+                    pass
+                logger.warning(f"Telegram rate limited (429) — retrying once after {retry_after}s")
+                time.sleep(retry_after)
+                return self._post(text, parse_mode, retry_429=False, retry_plain=retry_plain)
+            if status == 400 and parse_mode and retry_plain:
+                logger.warning("Telegram 400 (likely unbalanced Markdown entities) — retrying as plain text")
+                return self._post(text, None, retry_429=retry_429, retry_plain=False)
+            logger.error(f"Failed to send Telegram message: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
             return False

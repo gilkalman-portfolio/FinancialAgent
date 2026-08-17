@@ -104,46 +104,11 @@ def _escape_md(text: str) -> str:
 
 
 def _is_trading_day() -> bool:
-    """Returns True only on US market trading days (Mon-Fri, excluding federal holidays)."""
-    from zoneinfo import ZoneInfo
-    now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5:          # Saturday / Sunday
-        return False
-    # US market holidays (NYSE schedule) — fixed + floating
-    year, month, day = now.year, now.month, now.day
-    # Fixed holidays
-    if (month, day) in [(1, 1), (7, 4), (12, 25)]:
-        return False
-    # New Year's / Christmas / Independence Day observed (if on weekend → adjacent weekday)
-    if (month, day) in [(1, 2), (7, 3), (12, 24), (12, 26)]:
-        if now.weekday() == 4:      # observed on Friday when holiday falls on Saturday
-            return False
-        if now.weekday() == 0:      # observed on Monday when holiday falls on Sunday
-            return False
-    # MLK Day — 3rd Monday of January
-    if month == 1 and now.weekday() == 0 and 15 <= day <= 21:
-        return False
-    # Presidents Day — 3rd Monday of February
-    if month == 2 and now.weekday() == 0 and 15 <= day <= 21:
-        return False
-    # Memorial Day — last Monday of May
-    if month == 5 and now.weekday() == 0 and day >= 25:
-        return False
-    # Juneteenth — June 19 (observed)
-    if (month, day) == (6, 19):
-        return False
-    if (month, day) == (6, 18) and now.weekday() == 4:   # observed Friday
-        return False
-    if (month, day) == (6, 20) and now.weekday() == 0:   # observed Monday
-        return False
-    # Labor Day — 1st Monday of September
-    if month == 9 and now.weekday() == 0 and day <= 7:
-        return False
-    # Thanksgiving — 4th Thursday of November
-    if month == 11 and now.weekday() == 3 and 22 <= day <= 28:
-        return False
-    # Good Friday — not easily computable, skip (rare edge case)
-    return True
+    """Returns True only on US market trading days (Mon-Fri, excluding
+    federal holidays). Delegates to src/trading_calendar.py — the single
+    shared copy of this logic (see that module's docstring for why)."""
+    from src.trading_calendar import is_trading_day
+    return is_trading_day()
 
 
 def _in_premarket_gap_window() -> bool:
@@ -456,10 +421,7 @@ def _run_scan_impl():
 
     # ── Auto-add high-score stocks to watchlist ───────────────────────────────
     _aw_cfg = cfg.get("auto_watchlist", True)
-    # Normalize: bool True, string "true", or non-empty dict all enable auto-watchlist
-    _aw_enabled = (_aw_cfg is True or _aw_cfg == "true" or
-                   (isinstance(_aw_cfg, dict) and _aw_cfg))
-    if _aw_enabled:
+    if _auto_watchlist_enabled(_aw_cfg):
         from src.auto_watchlist_agent import _evict_for_capacity
 
         existing = {w["ticker"] for w in watchlist_get_all()}
@@ -558,6 +520,19 @@ _AUTO_PREFIXES = ("Auto:", "Auto [", "Momentum:", "Squeeze:", "Catalyst:")
 
 def _is_auto_ticker(notes: str) -> bool:
     return (notes or "").startswith(_AUTO_PREFIXES)
+
+
+def _auto_watchlist_enabled(aw_cfg) -> bool:
+    """Normalize the auto_watchlist config value: bool True, string "true",
+    or a dict with enabled!=False all enable it. Extracted as its own
+    function 2026-08-17 — previously inlined as
+    `isinstance(_aw_cfg, dict) and _aw_cfg`, which only checked the dict was
+    non-empty, so "auto_watchlist": {"enabled": false, ...} did NOT actually
+    disable run_scan()'s inline auto-add path, unlike
+    auto_watchlist_agent.py::run()'s correct `aw_cfg.get("enabled", True)`
+    check for the other four sources. See CLAUDE.md Incident Archive 2026-08-17."""
+    return (aw_cfg is True or aw_cfg == "true" or
+            (isinstance(aw_cfg, dict) and aw_cfg.get("enabled", True)))
 
 
 def run_weekly_rotation():
