@@ -27,6 +27,7 @@ working, so there's no reason to add paid-API cost there.
 """
 
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time as dtime, timezone
@@ -72,12 +73,33 @@ def _download_with_retry(tickers: list, **kwargs) -> pd.DataFrame:
     raise last_err  # unreachable, satisfies linters
 
 
+_thread_local = threading.local()
+
+
+def _thread_session() -> requests.Session:
+    """One pooled, keep-alive requests.Session per ThreadPoolExecutor worker
+    thread — deliberately NOT a single Session shared across all threads
+    (requests.Session is documented as not thread-safe). A scan makes ~2x N
+    calls to the same host (api.polygon.io); routing them through a reused,
+    thread-local Session instead of a bare requests.get() per call collapses
+    that down to `massive_max_workers` persistent keep-alive connections
+    instead of ~2x N fresh TLS handshakes. See CLAUDE.md Incident Archive,
+    2026-08-18 — the fresh-connection-per-call version crashed the entire
+    scheduler process with a native STATUS_HEAP_CORRUPTION fault ~6.5 minutes
+    into a 2463-ticker scan."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _thread_local.session = session
+    return session
+
+
 def _massive_get(url: str, params: dict) -> Tuple[int, Optional[dict]]:
     """Single seam every Massive/Polygon call routes through. Never raises —
     returns (0, None) on any network/timeout/decode failure so callers can
     treat it uniformly with real HTTP failures."""
     try:
-        r = requests.get(url, params=params, timeout=8)
+        r = _thread_session().get(url, params=params, timeout=8)
         return r.status_code, (r.json() if r.status_code == 200 else None)
     except Exception as e:
         logger.debug(f"Massive API request failed: {url}: {e}")

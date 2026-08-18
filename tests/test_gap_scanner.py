@@ -207,7 +207,8 @@ class TestScanPremarketGaps:
 
 
 class TestMassiveHttpHelpers:
-    """Mocks requests.get directly — the lower-level parsing/window-filter
+    """Mocks requests.Session.get (the thread-local pooled session every call
+    routes through as of 2026-08-18) — the lower-level parsing/window-filter
     behavior that's newly meaningful now that there's an HTTP layer at all."""
 
     def test_fetch_premarket_bars_filters_to_true_window(self):
@@ -229,7 +230,7 @@ class TestMassiveHttpHelpers:
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {"status": "OK", "results": raw_bars}
 
-        with patch("src.gap_scanner.requests.get", return_value=mock_resp):
+        with patch("requests.Session.get", return_value=mock_resp):
             bars = _fetch_premarket_bars("AAPL", et_today.strftime("%Y-%m-%d"))
 
         assert [b["v"] for b in bars] == [200, 300]
@@ -239,14 +240,14 @@ class TestMassiveHttpHelpers:
 
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {"status": "OK", "results": [{"c": 42.5}]}
-        with patch("src.gap_scanner.requests.get", return_value=mock_resp):
+        with patch("requests.Session.get", return_value=mock_resp):
             assert _fetch_prior_close("AAPL") == pytest.approx(42.5)
 
     def test_fetch_prior_close_non_200_returns_none_without_raising(self):
         from src.gap_scanner import _fetch_prior_close
 
         mock_resp = MagicMock(status_code=500)
-        with patch("src.gap_scanner.requests.get", return_value=mock_resp):
+        with patch("requests.Session.get", return_value=mock_resp):
             assert _fetch_prior_close("AAPL") is None
 
     def test_preflight_fails_only_on_401_403(self):
@@ -254,13 +255,13 @@ class TestMassiveHttpHelpers:
 
         for status in (401, 403):
             mock_resp = MagicMock(status_code=status)
-            with patch("src.gap_scanner.requests.get", return_value=mock_resp):
+            with patch("requests.Session.get", return_value=mock_resp):
                 assert _preflight_check_api_key() is False
 
         for status in (200, 404, 429, 500):
             mock_resp = MagicMock(status_code=status)
             mock_resp.json.return_value = {"status": "OK", "results": [{"c": 1.0}]}
-            with patch("src.gap_scanner.requests.get", return_value=mock_resp):
+            with patch("requests.Session.get", return_value=mock_resp):
                 assert _preflight_check_api_key() is True  # fail-open
 
 
