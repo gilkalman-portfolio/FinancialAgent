@@ -6,6 +6,7 @@ Fallback: SEC EDGAR XML scraper (original, slow)
 
 import os
 import requests
+import threading
 from lxml import etree
 import time
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ if not _email:
 HEADERS = {'User-Agent': f'FinancialAgent ({_email})'}
 
 _SEC_API_AVAILABLE = bool(os.getenv("SEC_API_KEY", ""))
+
+_thread_local = threading.local()  # module-level, mirrors src/gap_scanner.py::_thread_session()
 
 
 @dataclass
@@ -38,13 +41,30 @@ class InsiderScore:
 
 class InsiderTracker:
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+        # No self.session here — see _thread_session(). InsiderTracker is
+        # used as a process-wide singleton (stock_scorer.py's module-level
+        # `_insider`), and _score_via_edgar_xml() is the ACTIVE fallback
+        # whenever sec-api.io is rate-limited — a single shared Session on
+        # this singleton would be hit concurrently by every worker thread
+        # once score_stock() runs in parallel. See CLAUDE.md Incident
+        # Archive, 2026-08-18 (the same class of bug crashed the scheduler
+        # process via a shared requests.Session under concurrent load).
         self._ticker_map = None  # lazy load — only needed for fallback
         if _SEC_API_AVAILABLE:
             logger.info("InsiderTracker: using sec-api.io (fast mode)")
         else:
             logger.info("InsiderTracker: sec-api.io unavailable, using EDGAR XML (slow mode)")
+
+    @staticmethod
+    def _thread_session() -> requests.Session:
+        """One pooled, keep-alive requests.Session per calling thread —
+        mirrors src/gap_scanner.py::_thread_session() / src/sec_api_client.py."""
+        session = getattr(_thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            _thread_local.session = session
+        return session
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -78,7 +98,7 @@ class InsiderTracker:
         cutoff = datetime.now() - timedelta(days=90)
         try:
             url      = f"https://data.sec.gov/submissions/CIK{cik}.json"
-            response = self.session.get(url, timeout=15)
+            response = self._thread_session().get(url, timeout=15)
             filings  = response.json()['filings']['recent']
 
             transactions = []
@@ -97,7 +117,7 @@ class InsiderTracker:
                 xml_url  = self._fix_sec_url(cik, acc_num, doc_name)
 
                 try:
-                    resp = self.session.get(xml_url, timeout=15)
+                    resp = self._thread_session().get(xml_url, timeout=15)
                     root = etree.fromstring(resp.content)
                 except Exception as e:
                     logger.debug(f"XML parse error for {ticker} filing {i}: {e}")
@@ -174,7 +194,7 @@ class InsiderTracker:
     def _load_ticker_map(self) -> dict:
         try:
             url  = "https://www.sec.gov/files/company_tickers.json"
-            data = self.session.get(url).json()
+            data = self._thread_session().get(url).json()
             return {v['ticker']: str(v['cik_str']).zfill(10) for k, v in data.items()}
         except Exception as e:
             logger.error(f"Failed to load SEC ticker map: {e}")

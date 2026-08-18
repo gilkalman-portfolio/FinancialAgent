@@ -13,6 +13,7 @@ Actual field names (verified from live response):
 """
 
 import os
+import threading
 import time
 import requests
 from datetime import datetime, timedelta
@@ -24,8 +25,24 @@ load_dotenv()
 _API_KEY  = os.getenv("SEC_API_KEY", "")
 _BASE_URL = "https://api.sec-api.io"
 
-_session = requests.Session()
-_session.headers.update({"Content-Type": "application/json"})
+_thread_local = threading.local()
+
+
+def _thread_session() -> requests.Session:
+    """One pooled, keep-alive requests.Session per calling thread — mirrors
+    src/gap_scanner.py::_thread_session(). Deliberately NOT a single Session
+    shared across all threads (requests.Session is documented as not
+    thread-safe). This module's _post() is reachable from every score_stock()
+    call once watchlist_manager.py scores tickers concurrently — a shared
+    Session under concurrent access is the exact pattern that crashed the
+    scheduler process with a native STATUS_HEAP_CORRUPTION fault. See
+    CLAUDE.md Incident Archive, 2026-08-18."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"Content-Type": "application/json"})
+        _thread_local.session = session
+    return session
 
 
 def _post(endpoint: str, payload: dict) -> dict | None:
@@ -34,7 +51,7 @@ def _post(endpoint: str, payload: dict) -> dict | None:
         return None
     resp = None
     try:
-        resp = _session.post(
+        resp = _thread_session().post(
             f"{_BASE_URL}/{endpoint}",
             params={"token": _API_KEY},
             json=payload,

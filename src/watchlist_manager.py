@@ -6,6 +6,7 @@ Watchlist Manager
 """
 import os, requests
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from loguru import logger
@@ -107,7 +108,46 @@ def _cooldown_passed(ticker: str, alert_type: str) -> bool:
     return True
 
 
-def scan_watchlist(force: bool = False) -> List[Dict]:
+# Deliberately much lower than gap_scanner.py's massive_max_workers=10: each
+# score_stock() call is far heavier (CPU-bound ARIMA/MLP fit + 6-8 sequential
+# network calls, vs. gap_scanner's 2 lightweight REST calls), and
+# Finnhub/sec-api.io free-tier rate limits are already saturated today at
+# zero concurrency — going wider multiplies 429s, not speed. A parameter, not
+# hardcoded, so it can be raised once a load test shows headroom.
+_DEFAULT_SCAN_MAX_WORKERS = 5
+
+
+def _score_one(ticker: str, forecast_days: int, label: str) -> Optional[Dict]:
+    """ThreadPoolExecutor worker unit — mirrors gap_scanner.py's
+    _fetch_one_ticker_premarket shape: never raises, so pool.map() can't
+    abort the batch on one ticker's failure. score_stock() already catches
+    its own exceptions internally; this is defense-in-depth and preserves
+    the exact log message the old inline try/except used."""
+    try:
+        return score_stock(ticker, forecast_days=forecast_days)
+    except Exception as e:
+        logger.warning(f"{label} {ticker}: {e}")
+        return None
+
+
+def _score_all_parallel(tickers: List[str], forecast_days: int = 30,
+                         max_workers: int = _DEFAULT_SCAN_MAX_WORKERS,
+                         label: str = "Scan") -> Dict[str, Optional[Dict]]:
+    """Phase 1 — the ONLY concurrent part of scan_watchlist()/scan_portfolio().
+    No DB writes, no Telegram — those stay single-threaded in Phase 2 so every
+    existing cooldown-check-then-write and Telegram-send is exactly as safe
+    as it was before. Requires sec_api_client.py / insider_tracker.py's
+    thread-local session fix (CLAUDE.md Incident Archive, 2026-08-18) — both
+    are reachable from every score_stock() call via the insider-score
+    component."""
+    if not tickers:
+        return {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        scored = list(pool.map(lambda t: _score_one(t, forecast_days, label), tickers))
+    return dict(zip(tickers, scored))
+
+
+def scan_watchlist(force: bool = False, max_workers: int = _DEFAULT_SCAN_MAX_WORKERS) -> List[Dict]:
     """
     Scans all watchlist tickers. Checks four alert types:
       - score_threshold : score >= alert_score
@@ -115,15 +155,23 @@ def scan_watchlist(force: bool = False) -> List[Dict]:
       - price_above     : price crossed above price_above target
       - price_below     : price crossed below price_below target
     All alerts respect ALERT_COOLDOWN_HOURS to prevent spam.
+
+    Scoring (the expensive part) runs concurrently across tickers (Phase 1);
+    alert-checking, DB writes, and Telegram sends stay sequential in the
+    tickers' original order (Phase 2) — unchanged from the prior behavior.
     """
-    tickers = watchlist_get_all()
-    if not tickers:
+    items = watchlist_get_all()
+    if not items:
         return []
+
+    tickers = [item["ticker"] for item in items]
+    scored  = _score_all_parallel(tickers, forecast_days=30, max_workers=max_workers,
+                                   label="Watchlist scan")
 
     results  = []
     telegram = TelegramNotifier()
 
-    for item in tickers:
+    for item in items:
         ticker      = item["ticker"]
         alert_score = item.get("alert_score", 60)
         alert_pct   = item.get("alert_pct", 5.0)
@@ -131,7 +179,7 @@ def scan_watchlist(force: bool = False) -> List[Dict]:
         price_below = item.get("price_below")
 
         try:
-            r = score_stock(ticker, forecast_days=30)
+            r = scored.get(ticker)
             if not r:
                 continue
 
@@ -220,15 +268,22 @@ def scan_watchlist(force: bool = False) -> List[Dict]:
     return results
 
 
-def scan_portfolio() -> List[Dict]:
+def scan_portfolio(max_workers: int = _DEFAULT_SCAN_MAX_WORKERS) -> List[Dict]:
     """
     Scans portfolio holdings.
     Alerts on: stop loss breach, target price hit, score drop below 35.
     All with ALERT_COOLDOWN_HOURS cooldown.
+
+    Same Phase 1 (parallel scoring) / Phase 2 (sequential alerts) split as
+    scan_watchlist() — see there for the reasoning.
     """
     holdings = portfolio_get_all()
     if not holdings:
         return []
+
+    tickers = [item["ticker"] for item in holdings]
+    scored  = _score_all_parallel(tickers, forecast_days=30, max_workers=max_workers,
+                                   label="Portfolio scan")
 
     telegram = TelegramNotifier()
     results  = []
@@ -241,7 +296,7 @@ def scan_portfolio() -> List[Dict]:
         shares       = item.get("shares", 0)
 
         try:
-            r = score_stock(ticker, forecast_days=30)
+            r = scored.get(ticker)
             if not r:
                 continue
 

@@ -246,13 +246,13 @@ class TestGetInsiderTransactions:
         return mock
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_returns_buy_and_sell(self, mock_session):
+    @patch("requests.Session.post")
+    def test_returns_buy_and_sell(self, mock_post):
         filings = [
             _make_filing("AAPL", "P", 1000, 50.0, owner="CEO"),
             _make_filing("AAPL", "S", 500,  52.0, owner="CFO"),
         ]
-        mock_session.post.return_value = self._mock_response(filings)
+        mock_post.return_value = self._mock_response(filings)
         result = get_insider_transactions("AAPL", days=90)
         assert len(result) == 2
         assert result[0]["type"] == "BUY"
@@ -260,13 +260,13 @@ class TestGetInsiderTransactions:
         assert result[0]["value"] == 50_000.0
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_filters_vesting(self, mock_session):
+    @patch("requests.Session.post")
+    def test_filters_vesting(self, mock_post):
         filings = [
             _make_filing("AAPL", "M", 5000, 0.0),
             _make_filing("AAPL", "A", 3000, 0.0),
         ]
-        mock_session.post.return_value = self._mock_response(filings)
+        mock_post.return_value = self._mock_response(filings)
         result = get_insider_transactions("AAPL")
         assert result == []
 
@@ -275,15 +275,15 @@ class TestGetInsiderTransactions:
         assert get_insider_transactions("AAPL") == []
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_api_error_returns_empty(self, mock_session):
-        mock_session.post.side_effect = Exception("timeout")
+    @patch("requests.Session.post")
+    def test_api_error_returns_empty(self, mock_post):
+        mock_post.side_effect = Exception("timeout")
         assert get_insider_transactions("AAPL") == []
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_empty_response_returns_empty(self, mock_session):
-        mock_session.post.return_value = self._mock_response([])
+    @patch("requests.Session.post")
+    def test_empty_response_returns_empty(self, mock_post):
+        mock_post.return_value = self._mock_response([])
         assert get_insider_transactions("AAPL") == []
 
 
@@ -300,27 +300,27 @@ class TestGetRecentInsiderBuyers:
         return mock
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_filters_below_min_value(self, mock_session):
+    @patch("requests.Session.post")
+    def test_filters_below_min_value(self, mock_post):
         # value = 100 * 10 = 1000 < 50_000
-        mock_session.post.return_value = self._mock_response([_make_filing("GME", "P", 100, 10.0)])
+        mock_post.return_value = self._mock_response([_make_filing("GME", "P", 100, 10.0)])
         result = get_recent_insider_buyers(days=1, min_value=50_000)
         assert result == []
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_returns_above_min_value(self, mock_session):
+    @patch("requests.Session.post")
+    def test_returns_above_min_value(self, mock_post):
         # value = 5000 * 20 = 100_000 >= 50_000
-        mock_session.post.return_value = self._mock_response([_make_filing("GME", "P", 5000, 20.0)])
+        mock_post.return_value = self._mock_response([_make_filing("GME", "P", 5000, 20.0)])
         result = get_recent_insider_buyers(days=1, min_value=50_000)
         assert len(result) == 1
         assert result[0]["ticker"] == "GME"
         assert result[0]["value"] == 100_000.0
 
     @patch("src.sec_api_client._API_KEY", "fake_key")
-    @patch("src.sec_api_client._session")
-    def test_excludes_sells(self, mock_session):
-        mock_session.post.return_value = self._mock_response([_make_filing("GME", "S", 5000, 20.0)])
+    @patch("requests.Session.post")
+    def test_excludes_sells(self, mock_post):
+        mock_post.return_value = self._mock_response([_make_filing("GME", "S", 5000, 20.0)])
         result = get_recent_insider_buyers(days=1, min_value=0)
         assert result == []
 
