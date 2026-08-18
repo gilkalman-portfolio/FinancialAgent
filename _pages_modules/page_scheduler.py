@@ -13,7 +13,8 @@ _LOG_FILE = _LOG_DIR / "scheduler.log"
 _PID_FILE = Path("scheduler.pid")
 _CFG_FILE = Path("scheduler_config.json")
 _TIMES    = ["07:00", "07:30", "08:00", "08:15", "08:30", "09:00", "09:15",
-             "09:30", "12:00", "15:30", "16:00", "16:30", "17:00"]
+             "09:30", "09:35", "09:40", "12:00", "12:05", "15:00", "15:30",
+             "16:00", "16:30", "17:00"]
 
 _DEFAULT_CFG = {
     "enabled":                         False,
@@ -85,6 +86,13 @@ def _safe_index(options: list, value: str, default: int = 0) -> int:
         return default
 
 
+def _safe_multiselect_default(options: list, values: list) -> list:
+    """Drop any saved default not in `options` — st.multiselect raises
+    (crashing the whole page) instead of silently ignoring an unknown
+    default, unlike st.selectbox with _safe_index above."""
+    return [v for v in (values or []) if v in options]
+
+
 def render():
     st.markdown("### Scheduler")
     _LOG_DIR.mkdir(exist_ok=True)
@@ -106,8 +114,10 @@ def render():
 
     with col1:
         enabled     = st.toggle("Enable scheduler", value=cfg.get("enabled", False))
-        sel_sectors = st.multiselect("Sectors to scan", sectors, default=cfg.get("sectors", sectors[:2]))
-        scan_times  = st.multiselect("Scan times", _TIMES, default=cfg.get("times", ["08:30", "16:30"]))
+        sel_sectors = st.multiselect("Sectors to scan", sectors,
+                                      default=_safe_multiselect_default(sectors, cfg.get("sectors", sectors[:2])))
+        scan_times  = st.multiselect("Scan times", _TIMES,
+                                      default=_safe_multiselect_default(_TIMES, cfg.get("times", ["08:30", "16:30"])))
         watchlist_time = st.selectbox("Watchlist scan",  _TIMES, index=_safe_index(_TIMES, cfg.get("watchlist_time", "09:00")))
         portfolio_time = st.selectbox("Portfolio scan",  _TIMES, index=_safe_index(_TIMES, cfg.get("portfolio_time", "09:15")))
 

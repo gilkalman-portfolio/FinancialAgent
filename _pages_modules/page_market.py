@@ -342,13 +342,14 @@ def render():
             for m in macro:
                 t_name   = _html_mod.escape(str(m.get("name", "")))
                 t_impact = _html_mod.escape(str(m.get("impact", "")).upper())
+                m_color  = m.get("color", "#6b7280")
                 rows_html += _html(f"""
                     <div style="display:flex;justify-content:space-between;padding:7px 10px;
-                                border-left:3px solid {m['color']};margin-bottom:5px;
+                                border-left:3px solid {m_color};margin-bottom:5px;
                                 background:#fafafa;border-radius:0 6px 6px 0;">
                       <div>
                         <span style="font-weight:600;font-size:13px;color:#1e293b;">{t_name}</span>
-                        <span style="font-size:10px;background:{m['color']};color:white;
+                        <span style="font-size:10px;background:{m_color};color:white;
                                      padding:1px 6px;border-radius:3px;margin-left:6px;">
                           {t_impact}
                         </span>

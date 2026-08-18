@@ -205,12 +205,16 @@ def get_backtest_stats() -> Dict:
 
 
 def get_top_signals(limit: int = 20) -> List[Dict]:
-    """המניות שקיבלו BUY והכי עלו — one row per ticker (best result)"""
+    """המניות שקיבלו BUY והכי עלו — one row per ticker (best result).
+    Excludes unmatured signals (pct_change IS NULL, outcome not checked yet) —
+    an all-NULL ticker group has no ranking, and SQLite's NULL-sort behavior
+    would otherwise surface it as a fake best/worst."""
     init_backtest_tables()
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT ticker, signal, score, MAX(pct_change) as pct_change, days_ahead, signal_date
             FROM backtest_results
+            WHERE pct_change IS NOT NULL
             GROUP BY ticker
             ORDER BY pct_change DESC
             LIMIT ?
@@ -219,13 +223,14 @@ def get_top_signals(limit: int = 20) -> List[Dict]:
 
 
 def get_worst_signals(limit: int = 20) -> List[Dict]:
-    """המניות שקיבלו BUY והכי ירדו — one row per ticker (worst result)"""
+    """המניות שקיבלו BUY והכי ירדו — one row per ticker (worst result).
+    Excludes unmatured signals — see get_top_signals()."""
     init_backtest_tables()
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT ticker, signal, score, MIN(pct_change) as pct_change, days_ahead, signal_date
             FROM backtest_results
-            WHERE signal IN ('BUY', 'STRONG BUY')
+            WHERE signal IN ('BUY', 'STRONG BUY') AND pct_change IS NOT NULL
             GROUP BY ticker
             ORDER BY pct_change ASC
             LIMIT ?
