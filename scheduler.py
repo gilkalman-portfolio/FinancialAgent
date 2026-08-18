@@ -629,10 +629,11 @@ def run_weekly_rotation():
 def run_llm_universe_curation():
     """Weekly LLM curation of the scanner's top-score pool (see src/llm_universe_curator.py).
 
-    Disabled by default (llm_universe_curation_enabled: false) — the scanner's
-    score>=65 gate is unaffected until this is explicitly turned on. On any
-    failure (LLM down, malformed response) run_weekly_curation() persists
-    nothing and the previous week's curated set, if any, remains in effect.
+    Gated by llm_universe_curation_enabled in scheduler_config.json (currently
+    true — enabled). A pure narrowing pass: it never introduces a ticker the
+    quant scanner didn't already surface. On any failure (LLM down, malformed
+    response) run_weekly_curation() persists nothing and the previous week's
+    curated set, if any, remains in effect.
     """
     cfg = load_config()
     if not cfg.get("enabled", False) or not cfg.get("llm_universe_curation_enabled", False):

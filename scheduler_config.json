@@ -34,7 +34,6 @@
   "min_score": 70,
   "forecast_days": 30,
   "telegram": true,
-  "auto_watchlist_scan": true,
   "max_daily_loss_pct": 0.02,
   "max_positions": 10,
   "news_catalyst_max_article_age_minutes": 45,
@@ -44,6 +43,10 @@
   "long_setups_top_n": 5,
   "alert_monitor_time": "09:40",
   "weekly_rotation_time": "08:15",
+  "forward_outcomes_time": "18:00",
+  "forward_digest_time": "20:00",
+  "opportunity_outcomes_time": "18:00",
+  "opportunity_digest_time": "20:00",
   "llm_universe_curation_enabled": true,
   "llm_universe_curation_time": "07:45",
   "catalyst_alert_time": "08:05",
@@ -69,8 +72,6 @@
   },
   "auto_watchlist": {
     "enabled": true,
-    "default_min_score": 60,
-    "default_max_results": 20,
     "sources": {
       "squeeze": {
         "enabled": true,

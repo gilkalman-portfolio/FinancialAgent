@@ -96,8 +96,8 @@ def _format_submitted_message(
                 avg_cost = float(row["avg_cost"])
                 current_shares = float(row["shares"])
                 position_found = True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"{ticker}: position lookup for SELL P&L message failed: {e}")
 
     if position_found and avg_cost > 0:
         pnl = (entry_price - avg_cost) * shares

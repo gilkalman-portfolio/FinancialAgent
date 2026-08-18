@@ -79,7 +79,8 @@ def _massive_get(url: str, params: dict) -> Tuple[int, Optional[dict]]:
     try:
         r = requests.get(url, params=params, timeout=8)
         return r.status_code, (r.json() if r.status_code == 200 else None)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Massive API request failed: {url}: {e}")
         return 0, None
 
 

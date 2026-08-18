@@ -397,8 +397,8 @@ def check_hard_vetos(
                     passed=False,
                     reason=f"Liquidity ${dollar_vol/1e6:.1f}M < ${_MIN_DAILY_DOLLAR_VOL/1e6:.0f}M daily"
                 )
-        except Exception:
-            pass  # skip liquidity check if data missing
+        except Exception as e:
+            logger.warning(f"{ticker}: liquidity check skipped, data missing/malformed: {e}")
 
     # Gap-down / R:R checks below are entry-quality — skip entirely for SELL exits.
     if is_sell:
