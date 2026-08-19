@@ -10,6 +10,7 @@ Covers:
 
 import sys
 import pytest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -24,6 +25,7 @@ from src.catalyst_scanner import (
     explosion_score,
     score_label,
     scan_catalysts,
+    fetch_sec_8k_events,
 )
 
 
@@ -313,26 +315,27 @@ def _make_yf_info(market_cap=800_000_000, float_shares=20_000_000, si_pct=0.18, 
     }
 
 
+def _mock_ticker(info, hist_len=30):
+    import pandas as pd
+    import numpy as np
+
+    mock_ticker = MagicMock()
+    mock_ticker.info = info
+
+    dates  = pd.date_range(end=pd.Timestamp.now(), periods=hist_len, freq="B")
+    prices = 10 + np.random.rand(hist_len) * 5
+    volume = np.full(hist_len, 1_000_000, dtype=float)
+    # Spike last 5 days to create vol_ratio > 1
+    volume[-5:] = 2_500_000
+    hist = pd.DataFrame({
+        "Close":  prices,
+        "Volume": volume,
+    }, index=dates)
+    mock_ticker.history.return_value = hist
+    return mock_ticker
+
+
 class TestScanCatalysts:
-    def _mock_ticker(self, info, hist_len=30):
-        import pandas as pd
-        import numpy as np
-
-        mock_ticker = MagicMock()
-        mock_ticker.info = info
-
-        dates  = pd.date_range(end=pd.Timestamp.now(), periods=hist_len, freq="B")
-        prices = 10 + np.random.rand(hist_len) * 5
-        volume = np.full(hist_len, 1_000_000, dtype=float)
-        # Spike last 5 days to create vol_ratio > 1
-        volume[-5:] = 2_500_000
-        hist = pd.DataFrame({
-            "Close":  prices,
-            "Volume": volume,
-        }, index=dates)
-        mock_ticker.history.return_value = hist
-        return mock_ticker
-
     @patch("src.catalyst_scanner.get_earnings_calendar")
     @patch("yfinance.Ticker")
     def test_returns_sorted_by_score(self, mock_yf, mock_earnings):
@@ -346,8 +349,8 @@ class TestScanCatalysts:
 
         def side_effect(ticker):
             if ticker == "AAA":
-                return self._mock_ticker(info_high)
-            return self._mock_ticker(info_low)
+                return _mock_ticker(info_high)
+            return _mock_ticker(info_low)
 
         mock_yf.side_effect = side_effect
 
@@ -367,8 +370,8 @@ class TestScanCatalysts:
 
         def side_effect(ticker):
             if ticker == "BIG":
-                return self._mock_ticker(_make_yf_info(market_cap=50_000_000_000))
-            return self._mock_ticker(_make_yf_info(market_cap=500_000_000))
+                return _mock_ticker(_make_yf_info(market_cap=50_000_000_000))
+            return _mock_ticker(_make_yf_info(market_cap=500_000_000))
 
         mock_yf.side_effect = side_effect
 
@@ -388,8 +391,8 @@ class TestScanCatalysts:
 
         def side_effect(ticker):
             if ticker == "HSI":
-                return self._mock_ticker(_make_yf_info(si_pct=0.25))   # 25%
-            return self._mock_ticker(_make_yf_info(si_pct=0.02))       # 2%
+                return _mock_ticker(_make_yf_info(si_pct=0.25))   # 25%
+            return _mock_ticker(_make_yf_info(si_pct=0.02))       # 2%
 
         mock_yf.side_effect = side_effect
 
@@ -405,7 +408,7 @@ class TestScanCatalysts:
         mock_earnings.return_value = [_make_earnings_event("ZZZ", days_offset=20)]
         # Far-away event + big float + no SI = low score
         info = _make_yf_info(market_cap=500_000_000, float_shares=500_000_000, si_pct=0.0)
-        mock_yf.return_value = self._mock_ticker(info)
+        mock_yf.return_value = _mock_ticker(info)
 
         results = scan_catalysts(days_ahead=30, min_explosion_score=50.0, check_insider=False)
         assert len(results) == 0
@@ -432,7 +435,7 @@ class TestScanCatalysts:
                 m.info = {}   # no price → should be skipped
                 m.history.return_value = MagicMock(__len__=lambda s: 0)
                 return m
-            return self._mock_ticker(_make_yf_info())
+            return _mock_ticker(_make_yf_info())
 
         mock_yf.side_effect = side_effect
 
@@ -446,7 +449,7 @@ class TestScanCatalysts:
     def test_result_fields_present(self, mock_yf, mock_earnings):
         """Every result dict contains the required keys."""
         mock_earnings.return_value = [_make_earnings_event("TST", days_offset=2)]
-        mock_yf.return_value = self._mock_ticker(_make_yf_info(si_pct=0.20))
+        mock_yf.return_value = _mock_ticker(_make_yf_info(si_pct=0.20))
 
         results = scan_catalysts(check_insider=False, min_explosion_score=0)
         assert len(results) == 1
@@ -467,7 +470,7 @@ class TestScanCatalysts:
             _make_earnings_event("DUP", days_offset=1),
             _make_earnings_event("DUP", days_offset=2),   # same ticker, different day
         ]
-        mock_yf.return_value = self._mock_ticker(_make_yf_info())
+        mock_yf.return_value = _mock_ticker(_make_yf_info())
 
         results = scan_catalysts(check_insider=False, min_explosion_score=0)
         assert len([r for r in results if r["ticker"] == "DUP"]) == 1
@@ -480,7 +483,7 @@ class TestScanCatalysts:
             _make_earnings_event("A1"),
             _make_earnings_event("A2"),
         ]
-        mock_yf.return_value = self._mock_ticker(_make_yf_info())
+        mock_yf.return_value = _mock_ticker(_make_yf_info())
 
         calls = []
         def cb(current, total, ticker):
@@ -490,3 +493,194 @@ class TestScanCatalysts:
         assert len(calls) == 2
         assert calls[0][0] == 1
         assert calls[1][0] == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# sec_8k fallback in calendar mode (tickers=None) — CLAUDE.md Incident Archive
+# 2026-08-19: scan_catalysts(tickers=None, catalyst_types=[..., "sec_8k"]) used
+# to silently never call fetch_sec_8k_events at all, since that branch was
+# gated on `if tickers and (...)`. The daily scheduled Catalyst+SI job
+# (scheduler.py::run_catalyst_alert) never passes tickers, so "8-K" in its own
+# docstring ("biotech/pharma catalysts (earnings, PDUFA, 8-K)") was dead.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestScanCatalystsSec8kFallback:
+    @patch("src.catalyst_scanner.fetch_sec_8k_events")
+    @patch("src.catalyst_scanner.get_earnings_calendar")
+    @patch("yfinance.Ticker")
+    def test_calendar_mode_checks_8k_for_earnings_discovered_tickers(
+        self, mock_yf, mock_earnings, mock_8k
+    ):
+        """tickers=None: sec_8k must fall back to tickers earnings/PDUFA already found."""
+        mock_earnings.return_value = [_make_earnings_event("AAA", days_offset=3)]
+        mock_yf.return_value = _mock_ticker(_make_yf_info())
+        mock_8k.return_value = [{
+            "ticker": "AAA", "type": "SEC 8-K", "date": "Mon Aug 03", "time": "",
+            "detail": "Acquisition Agreement", "ts": 0, "mcap_val": None,
+        }]
+
+        results = scan_catalysts(
+            catalyst_types=["earnings", "sec_8k"], tickers=None,
+            check_insider=False, min_explosion_score=0,
+        )
+
+        mock_8k.assert_called_once()
+        called_tickers = mock_8k.call_args[0][0]
+        assert list(called_tickers) == ["AAA"]
+
+        assert len(results) == 1
+        # Earnings stays the primary catalyst (forward-looking date drives
+        # days_to_event/urgency) — 8-K enriches the detail, doesn't replace it.
+        assert results[0]["catalyst"] == "Earnings"
+        assert "8-K: Acquisition Agreement" in results[0]["catalyst_detail"]
+
+    @patch("src.catalyst_scanner.fetch_sec_8k_events")
+    @patch("src.catalyst_scanner.get_earnings_calendar")
+    def test_calendar_mode_skips_8k_call_when_nothing_to_check(self, mock_earnings, mock_8k):
+        """tickers=None and no earnings/PDUFA found → no pointless network call."""
+        mock_earnings.return_value = []
+
+        results = scan_catalysts(
+            catalyst_types=["earnings", "sec_8k"], tickers=None,
+            check_insider=False, min_explosion_score=0,
+        )
+
+        mock_8k.assert_not_called()
+        assert results == []
+
+    @patch("src.catalyst_scanner.fetch_sec_8k_events")
+    @patch("src.catalyst_scanner.get_earnings_calendar")
+    @patch("yfinance.Ticker")
+    def test_explicit_tickers_unaffected_by_fallback(self, mock_yf, mock_earnings, mock_8k):
+        """Dashboard/manual/watchlist mode (explicit tickers=) keeps its exact
+        prior behavior — 8-K checks exactly the passed list, not the calendar."""
+        mock_earnings.return_value = []  # no calendar events for this ticker
+        mock_yf.return_value = _mock_ticker(_make_yf_info())
+        mock_8k.return_value = []
+
+        scan_catalysts(
+            catalyst_types=["sec_8k"], tickers=["ZZZ", "YYY"],
+            check_insider=False, min_explosion_score=0,
+        )
+
+        mock_8k.assert_called_once()
+        called_tickers = mock_8k.call_args[0][0]
+        assert list(called_tickers) == ["ZZZ", "YYY"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fetch_sec_8k_events (HTTP layer) — rewritten 2026-08-19 to call Massive/
+# Polygon's classified disclosures endpoint, batched via tickers.any_of,
+# instead of one bare requests.get() per ticker inside a ThreadPoolExecutor
+# (the pattern that caused gap_scanner.py's STATUS_HEAP_CORRUPTION crash on
+# 2026-08-18 — see CLAUDE.md Incident Archive). Mocks requests.Session.get,
+# same convention as tests/test_gap_scanner.py::TestMassiveHttpHelpers.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _disclosure(ticker, filing_date, primary="a", secondary="b", tertiary="c", text="details"):
+    return {
+        "tickers": [ticker], "filing_date": filing_date,
+        "primary_category": primary, "secondary_category": secondary,
+        "tertiary_category": tertiary, "supporting_text": text,
+    }
+
+
+class TestFetchSec8kEvents:
+    def test_no_api_key_returns_empty_without_network_call(self, monkeypatch):
+        monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+        with patch("requests.Session.get") as mock_get:
+            events = fetch_sec_8k_events(["AAPL"], days=7)
+        mock_get.assert_not_called()
+        assert events == []
+
+    def test_parses_classification_into_detail(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        today = datetime.now().strftime("%Y-%m-%d")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "results": [_disclosure("AAPL", today, tertiary="acquisition_agreement",
+                                     text="Company X acquired Company Y")],
+        }
+        with patch("requests.Session.get", return_value=mock_resp):
+            events = fetch_sec_8k_events(["AAPL"], days=7)
+
+        assert len(events) == 1
+        assert events[0]["ticker"] == "AAPL"
+        assert events[0]["type"] == "SEC 8-K"
+        assert "Acquisition Agreement" in events[0]["detail"]
+        assert "Company X acquired Company Y" in events[0]["detail"]
+
+    def test_one_event_per_ticker_keeps_first(self, monkeypatch):
+        """Multiple disclosures for the same ticker in one filing → only the
+        first (most recent, per the endpoint's default desc sort) is kept."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        today = datetime.now().strftime("%Y-%m-%d")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "results": [
+                _disclosure("LUNR", today, tertiary="acquisition_agreement"),
+                _disclosure("LUNR", today, tertiary="acquisition_completion"),
+            ],
+        }
+        with patch("requests.Session.get", return_value=mock_resp):
+            events = fetch_sec_8k_events(["LUNR"], days=7)
+
+        assert len(events) == 1
+        assert "Acquisition Agreement" in events[0]["detail"]
+
+    def test_ignores_disclosures_for_untracked_tickers(self, monkeypatch):
+        """A batch call can return rows for tickers outside our ticker_set
+        (e.g. an unrelated co-filer) — those must not leak into results."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        today = datetime.now().strftime("%Y-%m-%d")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [_disclosure("UNTRACKED", today)]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            events = fetch_sec_8k_events(["AAPL"], days=7)
+        assert events == []
+
+    def test_batches_large_ticker_lists(self, monkeypatch):
+        """More than BATCH_SIZE tickers → multiple sequential calls, not one
+        per ticker (the whole point of the fix — no per-ticker fan-out)."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        tickers = [f"T{i:04d}" for i in range(250)]  # 3 batches of ≤100
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": []}
+        with patch("requests.Session.get", return_value=mock_resp) as mock_get:
+            fetch_sec_8k_events(tickers, days=7)
+        assert mock_get.call_count == 3
+
+    def test_http_error_on_one_batch_does_not_raise(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=500)
+        with patch("requests.Session.get", return_value=mock_resp):
+            events = fetch_sec_8k_events(["AAPL"], days=7)  # must not raise
+        assert events == []
+
+    def test_follows_pagination_via_next_url(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        today = datetime.now().strftime("%Y-%m-%d")
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "results": [_disclosure("AAPL", today)],
+            "next_url": "https://api.polygon.io/stocks/filings/8-K/vX/disclosures?cursor=abc",
+        }
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {"results": [_disclosure("MSFT", today)]}
+
+        with patch("requests.Session.get", side_effect=[page1, page2]) as mock_get:
+            events = fetch_sec_8k_events(["AAPL", "MSFT"], days=7)
+
+        assert mock_get.call_count == 2
+        assert {e["ticker"] for e in events} == {"AAPL", "MSFT"}
+
+    def test_excludes_filings_older_than_cutoff(self, monkeypatch):
+        """Defense in depth: even if the server-side filing_date.gte filter
+        were ever wrong, the client re-checks the cutoff itself."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        old_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [_disclosure("AAPL", old_date)]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            events = fetch_sec_8k_events(["AAPL"], days=7)
+        assert events == []

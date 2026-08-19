@@ -318,7 +318,7 @@ Win rate 7D:   XX.X%
 ### Catalyst Types
 - `earnings` — Nasdaq API earnings calendar
 - `analyst` — Finnhub upgrades (requires FINNHUB_API_KEY)
-- `sec_8k` — EDGAR 8-K filings, 8 parallel workers (item-number classification, e.g. 1.01 bullish / 1.03 bearish, is NOT implemented — still open, see backlog)
+- `sec_8k` — Massive/Polygon classified 8-K disclosures (`fetch_sec_8k_events()`, rewritten 2026-08-19), batched via `tickers.any_of` (~100 tickers/call, sequential — no concurrency, no ThreadPoolExecutor). Item-number classification (primary/secondary/tertiary taxonomy, e.g. `strategic_transactions > deal_agreements > acquisition_agreement`) comes from the endpoint directly — the old "not implemented" limitation is closed. In calendar mode (`tickers=None`, the scheduled Catalyst+SI job) this checks whatever `earnings`/`pdufa` already found that run, not a separate ticker list.
 - `pdufa` — BioPharma Catalyst FDA calendar (no key; cache 6h → `data/pdufa_cache.json`; reads `<thead>` headers to validate column order, falls back to hardcoded indices)
 
 ### Source Modes
@@ -392,10 +392,10 @@ Migration via `_migrate()` in `database.py` — adds columns without breaking da
 | Scan + Auto-Watchlist + Breakout | 08:30, 15:00 | `run_scan()` |
 | Portfolio | 09:15 | `run_portfolio_scan()` |
 | Market Digest | 09:30 | `run_market_digest()` |
-| Long Setups | 09:30 | `run_long_setups()` — `long_setups_enabled` |
-| Alert Monitor Health Check | 09:30 | `run_alert_monitor()` |
+| Long Setups | 09:35 | `run_long_setups()` — `long_setups_enabled` |
+| Alert Monitor Health Check | 09:40 | `run_alert_monitor()` |
 | Watchlist | 12:00 | `run_watchlist_scan()` |
-| Squeeze + SI Alert | 12:00 | `run_squeeze_scan()` |
+| Squeeze + SI Alert | 12:05 | `run_squeeze_scan()` |
 | Weekly Rotation | Monday 08:15 | `run_weekly_rotation()` — replaces the single weakest auto-added ticker if a momentum candidate scores ≥75 and beats it |
 | Forward Outcomes Update | 18:00 daily | `run_forward_outcomes_update()` |
 | Opportunity Outcomes Update | 18:00 daily | `run_opportunity_outcomes()` |
@@ -415,8 +415,8 @@ Auto-added tickers (notes prefix `"Auto:"` or `"Auto ["`) with score ≤ 40 are 
 ### LLM Universe Curation (`src/llm_universe_curator.py`, currently **enabled**)
 Weekly (07:45), gated by `llm_universe_curation_enabled` in config. Curates the top-150-by-score digest down to ~80 tickers worth active monitoring — an LLM-judged **narrowing**, not a discovery mechanism (never introduces a ticker the quant scanner didn't already surface, enforced by an allowlist check on the response). Low-turnover by design (last week's list given as an anchor). Persisted to `llm_curated_universe`; stale (>10 days) curation is ignored, not enforced.
 
-### Squeeze Scan — 1 combined message
-`🚨 High SI+DTC Alert` (SI>20% AND DTC>15, 24h cooldown) + `🔥 Top Squeeze Candidates` (top 10), one Telegram.
+### Squeeze Scan — DB-only, not Telegram
+`🚨 High SI+DTC Alert` (SI>20% AND DTC>15, 24h cooldown) + `🔥 Top Squeeze Candidates` (top 10) are built into one combined message, but that message is never sent — `run_squeeze_scan()` assigns it to a throwaway variable with the comment "Telegram suppressed 2026-05-20 — user wants only IBKR real-time + catalyst alerts. DB kept." Matches the `squeeze_si_alert` row in the Alert Types table below (DB-only); this section previously said "one Telegram" and was stale.
 
 ### Catalyst + High-SI Alert — 1 combined message
 `scan_catalysts(days_ahead=7)`. Filters: SI≥10% AND event≤7d AND price≥$5.00 AND explosion_score≥40. Top 5 combined into one message, 24h cooldown.
@@ -524,7 +524,6 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — src/gap_scanner.py::sc
 - [ ] Fear & Greed Index widget — `page_market.py` shows VIX text description only
 - [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static
 - [ ] Russell 2000 support in main Scan page — works in Catalyst Scanner + scheduler, not wired into `page_scan.py`
-- [ ] SEC 8-K item classification (1.01 bullish / 1.03 bearish) — `catalyst_scanner.py` fetches 8-K but doesn't classify by item number
 - [ ] `supertrend_triple_bull/bear` — consider routing through `signal_combiner.evaluate()` for the same cap+dedup discipline `combined_buy/sell` gets (currently DB-only, uncapped)
 - [ ] `news_catalyst` threshold tuning — consider lowering `catalyst_threshold` from 3 to 2 if forward-paper-trading shows missed catalysts
 - [ ] `modify_stop_order()` matches the first STP SELL by ticker — ambiguous if multiple STPs exist for one ticker; needs a `stop_order_id` column in `order_log` to fully fix
@@ -644,3 +643,14 @@ The Watchlist page's first-load auto-scan was measured live at ~6-7 minutes for 
 Before parallelizing scoring, an audit of `score_stock()`'s full call graph for shared mutable state found `src/sec_api_client.py` (module-level `_session = requests.Session()`) and `src/insider_tracker.py` (a `self.session = requests.Session()` on `InsiderTracker`, which `stock_scorer.py` instantiates once as a process-wide singleton) both held an unguarded shared Session — the exact same class of bug as the 2026-08-18 gap_scanner `STATUS_HEAP_CORRUPTION` crash above, this time reachable from every `score_stock()` call via the insider-score component. Confirmed live and not theoretical: sec-api.io was already 429-rate-limited at the time, meaning every ticker was already falling through to `InsiderTracker`'s EDGAR-XML path — the one touching the shared session — at zero concurrency. Fixed both with the same `threading.local()`-per-thread-session pattern as `gap_scanner.py::_thread_session()`, as a hard prerequisite before any parallel scoring shipped (`tests/test_thread_local_sessions.py`). Everything else in the call graph (`score_cache.py`, `google_trends.py`, `edgar_fcf.py`, `earnings_sentiment.py`, `finnhub_client.py`, fresh-per-call `yf.Ticker()`/`StockForecaster`) was already thread-safe by existing design (lock-guarded caches or no shared state).
 
 Live load test against the real production watchlist/portfolio: `scan_watchlist()` — 50 tickers in 118.4s (down from ~6-7min); `scan_portfolio()` — 5 tickers in 15.8s. Zero crashes, `logs/watchdog.log` showed no new crash entries, background daemon threads kept logging normally throughout. `tests/test_watchlist_parallel_scan.py` (new, 7 tests) covers result parity with sequential execution, output-order preservation independent of completion order, single-ticker failure isolation, an actual-speedup assertion, and a worker-count-never-exceeded assertion.
+
+### 2026-08-19 — Deep audit + SEC 8-K rewritten onto Massive/Polygon (last unmigrated heap-corruption-class call site)
+A fresh audit (test suite, headless `AppTest` render of all 11 pages, and a read-through of the highest-risk paths) found the 2026-08-18 gap_scanner/sec_api_client/insider_tracker fix pass had missed one call site: `catalyst_scanner.py::fetch_sec_8k_events()` still made a bare `requests.get()` per ticker inside `ThreadPoolExecutor(max_workers=4)` — same shape as the crash, just not yet triggered (dashboard-only, capped at whatever ticker list the user picks, vs. gap_scanner's full 2,463-ticker scheduled sweep). A second, independent bug in the same function: the daily scheduled Catalyst+SI job (`scheduler.py::run_catalyst_alert`, 08:05) calls `scan_catalysts(catalyst_types=["earnings","pdufa","sec_8k"], ...)` without a `tickers=` argument, and the old `sec_8k` branch was gated on `if tickers and (...)` — with `tickers=None` that's always false, so the job's own docstring ("biotech/pharma catalysts (earnings, PDUFA, **8-K**)") was not true; 8-K never actually ran there.
+
+Rather than patch the old EDGAR-full-text-search implementation with a thread-local session (the minimal fix), the whole function was rewritten onto Massive/Polygon's `/stocks/filings/8-K/vX/disclosures` endpoint — confirmed live and reachable on the project's existing paid Starter plan (`MASSIVE_API_KEY`, no upgrade needed) by probing 26 endpoints with the real key. This endpoint accepts a `tickers.any_of` filter that batches many tickers per call, so ~2,000 tickers becomes ~20 sequential calls instead of ~2,000 concurrent ones — the concurrency risk is eliminated by removing the need for concurrency, not mitigated with a thread-local `requests.Session()`. It also returns primary/secondary/tertiary disclosure classification (e.g. `strategic_transactions > deal_agreements > acquisition_agreement`) for free, closing the "SEC 8-K item classification ... not implemented" backlog item that had been open since the Catalyst Scanner was built.
+
+The `tickers=None` gap was fixed by moving the `sec_8k` check to run after `pdufa` in `scan_catalysts()` and falling back to `list(events_by_ticker.keys())` (whatever `earnings`/`pdufa` already discovered that run) when no explicit ticker list was passed — explicit-ticker dashboard calls (manual/watchlist/index-sector modes) are unaffected, since they still pass their own list straight through. When a ticker already has an earnings/PDUFA event, the 8-K result enriches that event's `detail` string instead of replacing it — replacing would have thrown away the forward-looking date that `days_to_event`/urgency scoring needs, in favor of the 8-K's own backward-looking filing date.
+
+Two other Massive/Polygon endpoints were evaluated as replacements for the current SI%/float source (`yfinance`'s `shortPercentOfFloat`/`floatShares`, used identically across `stock_scorer.py`, `squeeze_scanner.py`, `catalyst_scanner.py`) and **rejected**: a side-by-side pull on 8 real watchlist/portfolio tickers showed the underlying short-share count is identical between sources (both ultimately report the same FINRA figure — verified exactly matching on BIIB), so the ~0.1–3pp SI% deltas and the DTC gap (Massive's `days_to_cover` reads higher than yfinance's `shortRatio` on 8/8 tickers, a systematic bias) come entirely from differing float/volume-window methodology, not from one source being more correct. Massive's float additionally carries an explicit `effective_date` that was 3–4 months stale on every ticker checked. Switching without a third, independent ground truth to validate against would have silently shifted scores across real positions (e.g. NOG crosses the `stock_scorer.py` `high_short >= 0.20` boundary on one source's number and not the other's) for no demonstrated accuracy gain — exactly the failure mode this project has been burned by before (mismatched-scale comparisons). Not changed.
+
+Tests: `tests/test_catalyst_scanner.py` — 10 new (3 for the `scan_catalysts()` fallback behavior, 7 for the `fetch_sec_8k_events()` HTTP layer: batching, pagination via `next_url`, classification parsing, graceful no-key/HTTP-error handling, client-side cutoff as defense in depth). Full suite 645 passed / 2 skipped / 0 failed (both skips environment-only). All 11 pages re-verified via `AppTest`.

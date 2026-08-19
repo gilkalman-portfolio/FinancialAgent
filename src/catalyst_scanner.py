@@ -5,7 +5,8 @@ Finds small/mid-cap stocks with upcoming catalysts that have high explosion pote
 Catalyst types supported:
   - Earnings     (Nasdaq API)
   - Analyst      (Finnhub upgrade/downgrade in last N days)
-  - SEC 8-K      (EDGAR recent material filings in last N days)
+  - SEC 8-K      (Massive/Polygon classified disclosures, last N days — see
+                  fetch_sec_8k_events() for why this isn't raw EDGAR anymore)
   - FDA/PDUFA    (BioPharma Catalyst public calendar — no API key required)
 
 Ticker sources supported:
@@ -33,7 +34,6 @@ import yfinance as yf
 from src.yf_cache import get_info as _yf_info, get_history as _yf_hist
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional, Callable, List, Dict
 from loguru import logger
@@ -532,61 +532,92 @@ def fetch_analyst_events(tickers: List[str], days: int = 7) -> List[Dict]:
 
 def fetch_sec_8k_events(tickers: List[str], days: int = 7) -> List[Dict]:
     """
-    Check SEC EDGAR for recent 8-K filings (material events) for each ticker.
-    Uses the free EDGAR full-text search API — requests run in parallel (8 workers).
-    Only returns tickers that filed an 8-K in the last `days` days.
-    """
-    email   = os.getenv("SEC_USER_AGENT_EMAIL", "agent@example.com")
-    headers = {"User-Agent": f"FinancialAgent ({email})"}
-    cutoff  = datetime.now() - timedelta(days=days)
-    start   = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    end     = datetime.now().strftime("%Y-%m-%d")
+    Check Massive/Polygon's classified SEC 8-K disclosures feed for material
+    events filed by any of `tickers` in the last `days` days. One event per
+    ticker (the most recent), same contract as before.
 
-    def _fetch_one(ticker: str) -> Optional[Dict]:
-        try:
-            import time as _t
-            _t.sleep(0.15)   # ≤10 req/sec SEC policy (4 workers × 0.15s = ~27 req/sec max without sleep)
-            r = requests.get(
-                f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
-                f"&dateRange=custom&startdt={start}&enddt={end}&forms=8-K",
-                headers=headers,
-                timeout=8,
-            )
+    Replaces the old raw-EDGAR-full-text-search implementation (removed
+    2026-08-19): that version made one bare requests.get() per ticker inside
+    a ThreadPoolExecutor(max_workers=4) — the same pattern that caused a
+    native STATUS_HEAP_CORRUPTION crash in gap_scanner.py on 2026-08-18 (see
+    CLAUDE.md Incident Archive). This version batches many tickers into each
+    call via the `tickers.any_of` filter instead of fanning out per-ticker —
+    ~2,000 tickers becomes ~20 sequential calls instead of ~2,000 concurrent
+    ones, so there's no concurrency risk left to fix. It also gets
+    primary/secondary/tertiary disclosure classification for free instead of
+    an unclassified "a filing happened" signal (closes the CLAUDE.md Open
+    Backlog item "SEC 8-K item classification ... not implemented").
+    """
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        logger.debug("MASSIVE_API_KEY not set — skipping SEC 8-K scan")
+        return []
+    base_url = os.getenv("MASSIVE_BASE_URL", "https://api.polygon.io")
+
+    cutoff = datetime.now() - timedelta(days=days)
+    start  = cutoff.strftime("%Y-%m-%d")
+
+    ticker_set  = {t.upper() for t in tickers if t}
+    events_by_ticker: Dict[str, Dict] = {}
+    session = requests.Session()
+
+    BATCH_SIZE = 100
+    ticker_list = sorted(ticker_set)
+    for i in range(0, len(ticker_list), BATCH_SIZE):
+        batch = ticker_list[i:i + BATCH_SIZE]
+        url = f"{base_url}/stocks/filings/8-K/vX/disclosures"
+        params = {
+            "tickers.any_of": ",".join(batch),
+            "filing_date.gte": start,
+            "limit": 1000,
+            "apiKey": api_key,
+        }
+        pages_left = 3  # defensive cap — a week of 8-Ks for 100 tickers never gets close
+        while url and pages_left > 0:
+            try:
+                r = session.get(url, params=params, timeout=15)
+            except Exception as e:
+                logger.debug(f"sec_8k_events(batch starting {batch[0]}): {e}")
+                break
             if r.status_code != 200:
-                return None
-            hits = r.json().get("hits", {}).get("hits", [])
-            for hit in hits[:5]:
-                src             = hit.get("_source", {})
-                tickers_filed   = [t.upper() for t in src.get("entity_name", "").split(",")]
-                filing_date_str = src.get("file_date", "")
+                logger.warning(f"sec_8k_events: batch starting {batch[0]} got HTTP {r.status_code}")
+                break
+            body = r.json()
+            for rec in body.get("results", []) or []:
+                rec_tickers = rec.get("tickers") or []
+                filing_date_str = rec.get("filing_date", "")
                 try:
                     filing_dt = datetime.strptime(filing_date_str, "%Y-%m-%d")
                 except Exception:
                     continue
                 if filing_dt < cutoff:
                     continue
-                form_type     = src.get("form_type", "8-K")
-                display_names = src.get("display_names", [""])[0]
-                if ticker.upper() in display_names.upper() or ticker.upper() in str(tickers_filed).upper():
-                    return {
-                        "ticker":   ticker,
+                category = (
+                    rec.get("tertiary_category")
+                    or rec.get("secondary_category")
+                    or rec.get("primary_category")
+                    or "8-K"
+                ).replace("_", " ").title()
+                excerpt = (rec.get("supporting_text") or "")[:180]
+                for tk in rec_tickers:
+                    tk = tk.upper()
+                    if tk not in ticker_set or tk in events_by_ticker:
+                        continue  # one (the most recent) event per ticker
+                    events_by_ticker[tk] = {
+                        "ticker":   tk,
                         "type":     "SEC 8-K",
                         "date":     filing_dt.strftime("%a %b %d"),
                         "time":     "",
-                        "detail":   f"{form_type} filing — material event",
+                        "detail":   f"{category} — {excerpt}" if excerpt else category,
                         "ts":       filing_dt.timestamp(),
                         "mcap_val": None,
                     }
-        except Exception as e:
-            logger.debug(f"sec_8k_events({ticker}): {e}")
-        return None
+            # next_url omits apiKey by Polygon convention — re-attach it.
+            url = body.get("next_url")
+            params = {"apiKey": api_key} if url else None
+            pages_left -= 1
 
-    events: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for ev in pool.map(_fetch_one, tickers):
-            if ev:
-                events.append(ev)
-    return events
+    return list(events_by_ticker.values())
 
 
 # ── Ticker source resolvers ───────────────────────────────────────────────────
@@ -689,13 +720,6 @@ def scan_catalysts(
             if sym not in events_by_ticker:
                 events_by_ticker[sym] = ev
 
-    if tickers and ("sec_8k" in catalyst_types):
-        _phase(f"סורק הגשות SEC 8-K ({len(tickers)} מניות במקביל)…")
-        for ev in fetch_sec_8k_events(tickers, days=days_ahead):
-            sym = ev["ticker"]
-            if sym not in events_by_ticker:
-                events_by_ticker[sym] = ev
-
     if "pdufa" in catalyst_types:
         _phase("מאתר תאריכי PDUFA/AdCom מ-BioPharma Catalyst…")
         tickers_filter_pdufa = set(tickers) if tickers else None
@@ -703,6 +727,31 @@ def scan_catalysts(
             sym = ev["ticker"]
             if sym not in events_by_ticker:
                 events_by_ticker[sym] = ev
+
+    if "sec_8k" in catalyst_types:
+        # Explicit ticker list (dashboard: manual/watchlist/index-sector modes)
+        # keeps its exact prior behavior. Calendar mode (tickers=None — the
+        # scheduled Catalyst+SI job) used to silently skip this block entirely
+        # since `tickers` was never provided; it now checks whatever earnings/
+        # PDUFA already surfaced this run, so the daily job's own docstring
+        # promise ("earnings, PDUFA, 8-K") is actually true. See CLAUDE.md
+        # Incident Archive 2026-08-19.
+        sec8k_tickers = tickers if tickers else list(events_by_ticker.keys())
+        if sec8k_tickers:
+            _phase(f"סורק הגשות SEC 8-K ({len(sec8k_tickers)} מניות)…")
+            for ev in fetch_sec_8k_events(sec8k_tickers, days=days_ahead):
+                sym = ev["ticker"]
+                if sym not in events_by_ticker:
+                    events_by_ticker[sym] = ev
+                elif events_by_ticker[sym].get("type") != "SEC 8-K":
+                    # Ticker already has an earnings/PDUFA event — keep its
+                    # forward-looking date (that's what days_to_event/urgency
+                    # scoring needs) and enrich the detail line instead of
+                    # overwriting it with the 8-K's own (backward-looking)
+                    # filing date.
+                    events_by_ticker[sym]["detail"] = (
+                        f"{events_by_ticker[sym].get('detail', '')} | 8-K: {ev.get('detail', '')}"
+                    ).strip(" |")
 
     # If ticker list provided but no earnings found, still include all tickers
     # for analyst/8-K modes — they may have no upcoming earnings but still have events
