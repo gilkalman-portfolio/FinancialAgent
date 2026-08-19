@@ -1,5 +1,5 @@
 """
-Tests: InsiderTracker + sec_api_client
+Tests: InsiderTracker + sec_api_client + massive_insider_client
 Run: python -m pytest tests/test_insider_sec_api.py -v
 """
 import sys
@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.insider_tracker import InsiderTracker, InsiderScore
 from src.sec_api_client import get_insider_transactions, get_recent_insider_buyers
+import src.massive_insider_client as massive_insider_client
 
 
 # ── Fixtures — flat transactions (post-parse) ─────────────────────────────────
@@ -135,7 +136,51 @@ class TestBuildScore:
 # InsiderTracker routing
 # ══════════════════════════════════════════════════════════════════════════════
 
+class TestCalculateConvictionScoreMassive:
+    """Massive/Polygon is now the top priority tier — CLAUDE.md Incident
+    Archive 2026-08-19 (sec-api.io's free tier was observed hitting 429s
+    under normal scan load)."""
+
+    @patch("src.insider_tracker._MASSIVE_AVAILABLE", True)
+    @patch("src.insider_tracker.InsiderTracker._score_via_massive")
+    def test_uses_massive_when_available(self, mock_massive):
+        mock_massive.return_value = InsiderScore("AAPL", 90.0, 5, 0, 5, True, 3, 900_000, [])
+        tracker = InsiderTracker()
+        result  = tracker.calculate_conviction_score("AAPL")
+        mock_massive.assert_called_once_with("AAPL")
+        assert result.conviction_score == 90.0
+
+    @patch("src.massive_insider_client.get_insider_transactions", return_value=MOCK_TRANSACTIONS)
+    def test_massive_path_returns_correct_score(self, mock_get):
+        tracker = InsiderTracker()
+        result  = tracker._score_via_massive("GME")
+        mock_get.assert_called_once_with("GME", days=90)
+        assert result.total_purchases_90d == 3
+        assert result.clustered_buying is True
+
+    @patch("src.insider_tracker._SEC_API_AVAILABLE", True)
+    @patch("src.massive_insider_client.get_insider_transactions", side_effect=Exception("Massive down"))
+    @patch("src.insider_tracker.InsiderTracker._score_via_sec_api")
+    def test_falls_back_to_sec_api_on_massive_error(self, mock_sec, mock_get):
+        mock_sec.return_value = InsiderScore("GME", 70.0, 3, 1, 2, True, 1, 300_000, [])
+        tracker = InsiderTracker()
+        result  = tracker._score_via_massive("GME")
+        mock_sec.assert_called_once_with("GME")
+        assert result.conviction_score == 70.0
+
+    @patch("src.insider_tracker._SEC_API_AVAILABLE", False)
+    @patch("src.massive_insider_client.get_insider_transactions", side_effect=Exception("Massive down"))
+    @patch("src.insider_tracker.InsiderTracker._score_via_edgar_xml")
+    def test_falls_back_to_edgar_when_both_massive_and_sec_api_fail(self, mock_edgar, mock_get):
+        mock_edgar.return_value = InsiderScore("GME", 50.0, 2, 2, 0, False, 1, 200_000, [])
+        tracker = InsiderTracker()
+        result  = tracker._score_via_massive("GME")
+        mock_edgar.assert_called_once_with("GME")
+        assert result.conviction_score == 50.0
+
+
 class TestCalculateConvictionScoreSecApi:
+    @patch("src.insider_tracker._MASSIVE_AVAILABLE", False)
     @patch("src.insider_tracker._SEC_API_AVAILABLE", True)
     @patch("src.insider_tracker.InsiderTracker._score_via_sec_api")
     def test_uses_sec_api_when_available(self, mock_sec):
@@ -166,6 +211,7 @@ class TestCalculateConvictionScoreSecApi:
 
 
 class TestCalculateConvictionScoreEdgar:
+    @patch("src.insider_tracker._MASSIVE_AVAILABLE", False)
     @patch("src.insider_tracker._SEC_API_AVAILABLE", False)
     @patch("src.insider_tracker.InsiderTracker._score_via_edgar_xml")
     def test_uses_edgar_when_no_api_key(self, mock_edgar):
@@ -175,6 +221,7 @@ class TestCalculateConvictionScoreEdgar:
         mock_edgar.assert_called_once_with("TSLA")
         assert result.conviction_score == 60.0
 
+    @patch("src.insider_tracker._MASSIVE_AVAILABLE", False)
     @patch("src.insider_tracker._SEC_API_AVAILABLE", False)
     @patch("src.insider_tracker.InsiderTracker._load_ticker_map", return_value={})
     def test_unknown_ticker_returns_zero(self, mock_map):
@@ -439,3 +486,158 @@ class TestMissingPrice:
         }
         result = _extract_transactions(filing, {"P"})
         assert result[0]["price"] == 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# massive_insider_client (HTTP layer) — mocks requests.Session.get, same
+# convention as tests/test_gap_scanner.py::TestMassiveHttpHelpers and
+# tests/test_catalyst_scanner.py::TestFetchSec8kEvents.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_massive_form4(ticker, code, shares, price, owner="CEO Name",
+                         is_officer=True, title="CEO", is_director=False,
+                         record_type="transaction", security_type="non_derivative",
+                         date="2026-08-01"):
+    return {
+        "tickers": [ticker],
+        "owner_name": owner,
+        "is_officer": is_officer,
+        "officer_title": title,
+        "is_director": is_director,
+        "is_ten_percent_owner": False,
+        "record_type": record_type,
+        "security_type": security_type,
+        "transaction_code": code,
+        "transaction_shares": shares,
+        "transaction_price_per_share": price,
+        "transaction_value": shares * price,
+        "transaction_date": date,
+    }
+
+
+class TestMassiveGetInsiderTransactions:
+    def test_no_api_key_returns_empty_without_network_call(self, monkeypatch):
+        monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+        with patch("requests.Session.get") as mock_get:
+            result = massive_insider_client.get_insider_transactions("AAPL")
+        mock_get.assert_not_called()
+        assert result == []
+
+    def test_buy_and_sell_parsed_correctly(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [
+            _make_massive_form4("AAPL", "P", 1000, 50.0, owner="CEO"),
+            _make_massive_form4("AAPL", "S", 500, 52.0, owner="CFO"),
+        ]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_insider_transactions("AAPL", days=90)
+        assert len(result) == 2
+        assert result[0]["type"] == "BUY"
+        assert result[1]["type"] == "SELL"
+        assert result[0]["value"] == 50_000.0
+
+    def test_holding_records_excluded(self, monkeypatch):
+        """record_type='holding' is a reported position, not a trade."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [
+            _make_massive_form4("AAPL", "P", 1000, 50.0, record_type="holding"),
+        ]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_insider_transactions("AAPL")
+        assert result == []
+
+    def test_derivative_records_excluded(self, monkeypatch):
+        """Only non_derivative matches sec_api_client's nonDerivativeTable-only scope."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [
+            _make_massive_form4("AAPL", "P", 1000, 50.0, security_type="derivative"),
+        ]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_insider_transactions("AAPL")
+        assert result == []
+
+    def test_vesting_code_filtered_out(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [
+            _make_massive_form4("GME", "M", 5000, 0.0),  # M = vesting
+        ]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_insider_transactions("GME")
+        assert result == []
+
+    def test_role_parsing(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [
+            _make_massive_form4("AAPL", "P", 100, 10.0, is_officer=True, title="CFO"),
+        ]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_insider_transactions("AAPL")
+        assert "CFO" in result[0]["role"]
+
+    def test_http_error_returns_empty(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=500)
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_insider_transactions("AAPL")
+        assert result == []
+
+    def test_uses_tickers_param_not_singular_ticker(self, monkeypatch):
+        """The endpoint's own docs say `ticker` (singular) — verified live
+        2026-08-19 that this is wrong and silently returns unfiltered
+        results. Must use `tickers` (plural)."""
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": []}
+        with patch("requests.Session.get", return_value=mock_resp) as mock_get:
+            massive_insider_client.get_insider_transactions("AAPL")
+        called_params = mock_get.call_args.kwargs["params"]
+        assert called_params.get("tickers") == "AAPL"
+        assert "ticker" not in called_params
+
+
+class TestMassiveGetRecentInsiderBuyers:
+    def test_no_api_key_returns_empty(self, monkeypatch):
+        monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+        assert massive_insider_client.get_recent_insider_buyers() == []
+
+    def test_filters_below_min_value(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [_make_massive_form4("GME", "P", 100, 10.0)]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_recent_insider_buyers(days=1, min_value=50_000)
+        assert result == []
+
+    def test_returns_above_min_value(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [_make_massive_form4("GME", "P", 5000, 20.0)]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_recent_insider_buyers(days=1, min_value=50_000)
+        assert len(result) == 1
+        assert result[0]["ticker"] == "GME"
+        assert result[0]["value"] == 100_000.0
+
+    def test_excludes_sells(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [_make_massive_form4("GME", "S", 5000, 20.0)]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_recent_insider_buyers(days=1, min_value=0)
+        assert result == []
+
+    def test_sorted_descending_by_value(self, monkeypatch):
+        monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"results": [
+            _make_massive_form4("SMALL", "P", 100, 10.0),   # $1,000
+            _make_massive_form4("BIG", "P", 10000, 10.0),    # $100,000
+        ]}
+        with patch("requests.Session.get", return_value=mock_resp):
+            result = massive_insider_client.get_recent_insider_buyers(days=1, min_value=0)
+        assert [r["ticker"] for r in result] == ["BIG", "SMALL"]
