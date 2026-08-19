@@ -305,6 +305,7 @@ def scan_opening_prints(
         return []
 
     opens, closes, volumes = _split_fields(raw, tickers, ("Open", "Close", "Volume"))
+    today_et = datetime.now(_ET).date()
 
     results = []
     for ticker in tickers:
@@ -316,6 +317,18 @@ def scan_opening_prints(
                 continue
             o = opens[ticker].dropna() if ticker in opens.columns else pd.Series(dtype=float)
             if o.empty:
+                continue
+
+            # yfinance's period="1d" occasionally hands back more than one
+            # trading day of 1m bars (observed under rate-limiting / degraded
+            # service on 2026-08-19: MU, STX, PRAX and others got a stale
+            # multi-day-old bar as o.iloc[0], producing "moves" of 300-700%
+            # instead of the real ~10-25%). Restrict both series to today's
+            # ET session so a stale bar can never be mistaken for the 09:30
+            # open print, and so dollar_volume can't sum extra days either.
+            c = c[c.index.tz_convert(_ET).date == today_et]
+            o = o[o.index.tz_convert(_ET).date == today_et]
+            if c.empty or o.empty:
                 continue
 
             open_print = float(o.iloc[0])

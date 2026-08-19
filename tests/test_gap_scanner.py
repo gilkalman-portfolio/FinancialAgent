@@ -313,6 +313,35 @@ class TestScanOpeningPrints:
             results = scan_opening_prints(["THIN"], pct_move_min=10.0, min_dollar_volume=500_000)
         assert results == []
 
+    def test_ignores_stale_multi_day_bar_from_yfinance(self):
+        """Regression: yfinance's period="1d" occasionally hands back more than
+        one trading day of 1m bars under rate-limiting/degraded service. A
+        stale bar prepended before today's session must never be read as the
+        open print -- this produced 300-700% "moves" in production on
+        2026-08-19 for MU/STX/PRAX/ALMS/AMLX/MXL/SLS/MRNA."""
+        from src.gap_scanner import scan_opening_prints
+
+        today_idx = _opening_index(n_bars=4)
+        stale_idx = pd.DatetimeIndex([today_idx[0] - pd.Timedelta(days=20)])
+        full_idx = stale_idx.append(today_idx)
+
+        # Stale bar priced far below today's real open, mimicking a ticker
+        # that has since rallied hard -- if it leaks in as o.iloc[0], the
+        # computed move explodes into the hundreds of percent.
+        closes = [20.0, 116.245, 117.24, 118.9, 126.34]
+        frame = _make_frame(
+            full_idx,
+            closes_by_ticker={"MU": closes},
+            volumes_by_ticker={"MU": [500_000] * len(full_idx)},
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame):
+            results = scan_opening_prints(["MU"], pct_move_min=1.0, min_dollar_volume=1000)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["open_print"] == pytest.approx(116.245)  # today's real open, not the stale 20.0
+        assert r["move_pct"] == pytest.approx((126.34 - 116.245) / 116.245 * 100, abs=0.1)
+
     def test_download_failure_returns_empty(self):
         from src.gap_scanner import scan_opening_prints
         with patch("src.gap_scanner._download_with_retry", side_effect=RuntimeError("network down")):
