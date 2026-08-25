@@ -272,6 +272,33 @@ def scan_premarket_gaps(
     return results
 
 
+# Plausibility ceiling on top of the 2026-08-19 date filter. On 2026-08-21/24
+# six alerts fired with implausible readings (PDFS +136%, CGON +192.5%, HUBB
+# "$66.4B volume", SFNC "$6.1B volume", NWN "$3.2B volume", EIG "$2.5B
+# volume") even with that fix in place — none of the reported open_print
+# values appeared anywhere in the ticker's real trading history (verified
+# against Polygon), so this is a different, still-unconfirmed corruption
+# mechanism (leading theory: cross-ticker contamination inside the
+# ~2,463-ticker single yf.download batch). Root cause not found yet
+# (yfinance only retains 1m data ~7 days, so the failing batch couldn't be
+# replayed) — this is a guardrail on the output, not a fix for the input.
+#
+# $2B was chosen, not the $2.5B floor of the confirmed-bad readings, to
+# leave a safety margin while still comfortably rejecting all six. Verified
+# live (2026-08-25, after market close) that a FULL regular session's
+# dollar volume for the most liquid mega-caps (AAPL/MSFT/SPY/TSLA/NVDA) runs
+# $3-12B — so this ceiling is only safe because the job is meant to be
+# called ~7-10 min after the open (see docstring below), when even NVDA's
+# opening-minutes volume is a small fraction of its full-day figure. If this
+# function is ever called much later in the trading day (a delayed retry,
+# manual testing, etc.) a real mega-cap reading could legitimately approach
+# or exceed this ceiling and get silently dropped — the safe failure
+# direction for an alert (a missed alert, never a fabricated one), but
+# worth knowing if "why didn't X alert fire" ever comes up for a mega-cap.
+_MAX_PLAUSIBLE_MOVE_PCT = 80.0
+_MAX_PLAUSIBLE_DOLLAR_VOLUME = 2_000_000_000.0
+
+
 def scan_opening_prints(
     tickers: list,
     pct_move_min: float = 10.0,
@@ -340,6 +367,14 @@ def scan_opening_prints(
             v = (volumes[ticker].reindex(c.index).fillna(0.0)
                  if ticker in volumes.columns else pd.Series(0.0, index=c.index))
             dollar_volume = float((c * v).sum())
+
+            if move_pct > _MAX_PLAUSIBLE_MOVE_PCT or dollar_volume > _MAX_PLAUSIBLE_DOLLAR_VOLUME:
+                logger.warning(
+                    f"Opening print scan {ticker}: implausible reading discarded "
+                    f"(move={move_pct:.1f}%, $vol={dollar_volume:,.0f}) — treating as "
+                    f"corrupted intraday data, not a real move"
+                )
+                continue
 
             if move_pct >= pct_move_min and dollar_volume >= min_dollar_volume:
                 results.append({

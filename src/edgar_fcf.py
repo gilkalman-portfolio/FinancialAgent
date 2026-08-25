@@ -16,6 +16,7 @@ import threading
 import time
 import statistics
 import requests
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Optional
 from loguru import logger
@@ -31,9 +32,14 @@ _TICKER_CIK: dict       = {}
 _CIK_LOADED_AT: Optional[datetime] = None
 _CIK_TTL = timedelta(days=1)
 
-# Per-ticker facts cache: 24h TTL — shared by all helpers to avoid duplicate SEC requests
-_FACTS_CACHE: dict = {}   # ticker -> (loaded_at: datetime, facts: dict)
+# Per-ticker facts cache: 24h TTL — shared by all helpers to avoid duplicate SEC requests.
+# Each entry holds the full raw SEC companyfacts payload (observed 1.7-4.9MB per ticker
+# as JSON, several times that once parsed into nested Python dicts/lists) — capped with
+# LRU eviction so the scan universe (thousands of distinct tickers/day) can't grow this
+# unbounded for the life of the process. See CLAUDE.md Incident Archive, 2026-08-25.
+_FACTS_CACHE: "OrderedDict[str, tuple]" = OrderedDict()   # ticker -> (loaded_at: datetime, facts: dict)
 _FACTS_TTL = timedelta(hours=24)
+_FACTS_CACHE_MAX_SIZE = 100
 
 # Single lock protecting both _FACTS_CACHE and _TICKER_CIK/_CIK_LOADED_AT.
 # Scanner runs ~946 tickers across multiple threads; without a lock, concurrent
@@ -48,7 +54,9 @@ def _fetch_facts(ticker: str) -> Optional[dict]:
         if ticker in _FACTS_CACHE:
             cached_at, facts = _FACTS_CACHE[ticker]
             if now - cached_at < _FACTS_TTL:
+                _FACTS_CACHE.move_to_end(ticker)   # mark as recently used for LRU eviction
                 return facts
+            del _FACTS_CACHE[ticker]   # expired — evict now rather than waiting to be overwritten
     cik = _get_cik(ticker)
     if not cik:
         return None
@@ -60,6 +68,9 @@ def _fetch_facts(ticker: str) -> Optional[dict]:
         facts = r.json().get("facts", {})
         with _CACHE_LOCK:
             _FACTS_CACHE[ticker] = (now, facts)
+            _FACTS_CACHE.move_to_end(ticker)
+            while len(_FACTS_CACHE) > _FACTS_CACHE_MAX_SIZE:
+                _FACTS_CACHE.popitem(last=False)   # evict least-recently-used
         return facts
     except Exception as exc:
         logger.debug(f"[EDGAR] {ticker}: {exc}")

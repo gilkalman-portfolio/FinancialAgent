@@ -342,6 +342,58 @@ class TestScanOpeningPrints:
         assert r["open_print"] == pytest.approx(116.245)  # today's real open, not the stale 20.0
         assert r["move_pct"] == pytest.approx((126.34 - 116.245) / 116.245 * 100, abs=0.1)
 
+    def test_implausible_move_pct_discarded(self):
+        """Regression, 2026-08-25: even with the 2026-08-19 stale-bar date
+        filter in place, PDFS fired a live opening_print_alert on 2026-08-21
+        showing open_print=$19.04 -> $44.95 (+136.1%) -- $19.04 never
+        appeared in PDFS's real trading history even 3.5 months back
+        (verified against Polygon), so this was corrupted input from an
+        unconfirmed mechanism, not a real move. A move this large must be
+        discarded outright regardless of how the bad open_print got there."""
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            closes_by_ticker={"PDFS": [19.04, 30.0, 38.0, 44.95]},
+            volumes_by_ticker={"PDFS": [50_000] * 4},
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame):
+            results = scan_opening_prints(["PDFS"], pct_move_min=10.0, min_dollar_volume=1000)
+        assert results == []
+
+    def test_implausible_dollar_volume_discarded(self):
+        """Regression, 2026-08-25: HUBB fired a live alert on 2026-08-21 with
+        a plausible-looking +11.9% move but "volume since open" of $66.4B --
+        more than HUBB's entire real dollar volume over several months. A
+        reading like this is a data-corruption signature on its own, even
+        when move_pct alone looks sane."""
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            closes_by_ticker={"HUBB": [423.00, 450.0, 465.0, 473.38]},
+            volumes_by_ticker={"HUBB": [1_200_000] * 4},   # ~$2.2B dollar_volume at these prices
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame):
+            results = scan_opening_prints(["HUBB"], pct_move_min=5.0, min_dollar_volume=1000)
+        assert results == []
+
+    def test_legitimate_large_move_under_ceiling_still_included(self):
+        """The clamp must not swallow a real, large-but-plausible move --
+        it should only reject readings past the implausibility ceiling."""
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            closes_by_ticker={"REAL": [10.0, 13.0, 15.0, 16.5]},  # +65%, under the 80% ceiling
+            volumes_by_ticker={"REAL": [100_000] * 4},             # modest, realistic $ volume
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame):
+            results = scan_opening_prints(["REAL"], pct_move_min=10.0, min_dollar_volume=1000)
+        assert len(results) == 1
+        assert results[0]["ticker"] == "REAL"
+        assert results[0]["move_pct"] == pytest.approx(65.0, abs=0.1)
+
     def test_download_failure_returns_empty(self):
         from src.gap_scanner import scan_opening_prints
         with patch("src.gap_scanner._download_with_retry", side_effect=RuntimeError("network down")):

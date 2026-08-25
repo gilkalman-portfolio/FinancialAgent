@@ -21,6 +21,7 @@ Algorithm:
     SELL : trend[-1] == -1 and trend[-2] ==  1
 """
 
+import gc
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -209,4 +210,10 @@ def scan_supertrend_universe(
 
     results.sort(key=lambda r: r["ticker"])
     logger.info(f"Supertrend universe scan complete: {len(results)}/{len(tickers)} fresh bullish flips")
+
+    # Same mitigation as momentum_scanner.scan_momentum -- this runs every 30
+    # min (staggered 15 min after the momentum monitor) against the full
+    # scan universe. See CLAUDE.md Incident Archive, 2026-08-25.
+    del raw, highs, lows, closes, volumes
+    gc.collect()
     return results

@@ -10,6 +10,7 @@ Components:
   Volume Surge 5d/30d  0–15
 """
 
+import gc
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -215,4 +216,14 @@ def scan_momentum(
         f"Momentum scan complete: {len(results)}/{len(tickers)} above {min_score:.0f} | "
         f"SPY ROC 20d={spy_roc_20d:+.1f}%"
     )
+
+    # This runs every 30 min as a daemon thread against the full scan universe
+    # (~2,463 tickers x 1y daily bars). `raw`/closes/volumes are large pandas
+    # objects with internal reference cycles (BlockManager) that the cyclic
+    # GC won't necessarily collect promptly under sustained background-thread
+    # churn -- explicit del + gc.collect() here is a mitigation for the
+    # scheduler.py memory-growth investigation, not a confirmed leak fix.
+    # See CLAUDE.md Incident Archive, 2026-08-25.
+    del raw, closes, volumes
+    gc.collect()
     return results
