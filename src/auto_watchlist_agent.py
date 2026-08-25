@@ -9,7 +9,7 @@ Usage:
     added = aw_run(results, source="squeeze", cfg=load_config())
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from loguru import logger
 
@@ -198,26 +198,42 @@ def _build_notes(r: dict, source: str) -> str:
     return f"Auto [{source}] on {today}"
 
 
-def _build_telegram_line(r: dict, source: str) -> str:
+def _news_catalyst_suffix(news: Optional[dict]) -> str:
+    """Formats fetch_recent_news_catalyst()'s result as an appendable Telegram
+    line -- '' when there's nothing to show, never raises. Momentum/supertrend
+    only (see _build_telegram_line): those two sources run full-universe every
+    30 min with no "why" otherwise. See CLAUDE.md Incident Archive, 2026-08-25."""
+    if not news or not news.get("title"):
+        return ""
+    age_min = max(0, int((datetime.now(timezone.utc) - news["published_utc"]).total_seconds() / 60))
+    sentiment = news.get("sentiment")
+    tag = f" [{sentiment}]" if sentiment else ""
+    title = news["title"][:90]
+    return f"\n  \U0001F4F0 {title}{tag} ({age_min}m ago)"
+
+
+def _build_telegram_line(r: dict, source: str, news: Optional[dict] = None) -> str:
     ticker = r["ticker"]
     if source == "squeeze":
-        return (
+        base = (
             f"{ticker} | Score {r.get('score', 0):.0f} | "
             f"SI {r.get('si_pct', 0):.1f}% | DTC {r.get('dtc', 0):.1f} | "
             f"RVOL {r.get('rvol', 0):.1f}x"
         )
-    if source == "catalyst":
+    elif source == "catalyst":
         event = r.get("catalyst_detail") or r.get("catalyst", "Event")
         days  = r.get("days_to_event", "?")
-        return f"{ticker} | Score {r.get('explosion_score', 0):.0f} | {event} ({days}d)"
-    if source == "supertrend":
-        return f"{ticker} | Bullish flip @ ${r.get('price', 0):.2f} | Stop ${r.get('level', 0):.2f}"
-    # momentum
-    return (
-        f"{ticker} | Score {r.get('score', 0):.0f} | "
-        f"ROC {r.get('roc_20d', 0):+.1f}% | Vol {r.get('vol_ratio', 0):.1f}x | "
-        f"RSI {r.get('rsi', 0):.0f}"
-    )
+        base = f"{ticker} | Score {r.get('explosion_score', 0):.0f} | {event} ({days}d)"
+    elif source == "supertrend":
+        base = f"{ticker} | Bullish flip @ ${r.get('price', 0):.2f} | Stop ${r.get('level', 0):.2f}"
+    else:
+        # momentum
+        base = (
+            f"{ticker} | Score {r.get('score', 0):.0f} | "
+            f"ROC {r.get('roc_20d', 0):+.1f}% | Vol {r.get('vol_ratio', 0):.1f}x | "
+            f"RSI {r.get('rsi', 0):.0f}"
+        )
+    return base + _news_catalyst_suffix(news)
 
 
 # ── Capacity rotation ────────────────────────────────────────────────────────
@@ -503,7 +519,24 @@ def run(results: list, source: str, cfg: dict) -> list:
 
     if added and cfg.get("telegram", True):
         emoji = _EMOJI.get(source, "➕")
-        lines = [_build_telegram_line(r, source) for r in added]
+        # Momentum/supertrend only: these two run full-universe every 30 min
+        # with no catalyst context otherwise (squeeze/catalyst already carry
+        # their own). `added` is the small, already-filtered final list, not
+        # the raw scan results, so this stays cheap. Soft enrichment — never
+        # blocks the add or the Telegram send on a lookup failure.
+        news_by_ticker = {}
+        if source in ("momentum", "supertrend"):
+            from src.gap_scanner import fetch_recent_news_catalyst
+            for r in added:
+                try:
+                    news = fetch_recent_news_catalyst(r["ticker"])
+                    if news:
+                        news_by_ticker[r["ticker"]] = news
+                except Exception as e:
+                    logger.debug(
+                        f"auto_watchlist [{source}]: news enrichment failed for {r['ticker']}: {e}"
+                    )
+        lines = [_build_telegram_line(r, source, news_by_ticker.get(r["ticker"])) for r in added]
         msg = (
             f"{emoji} Auto-Watchlist [{source.upper()}] "
             f"— {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"

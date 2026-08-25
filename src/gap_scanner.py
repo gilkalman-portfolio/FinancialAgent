@@ -30,7 +30,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -104,6 +104,72 @@ def _massive_get(url: str, params: dict) -> Tuple[int, Optional[dict]]:
     except Exception as e:
         logger.debug(f"Massive API request failed: {url}: {e}")
         return 0, None
+
+
+def fetch_recent_news_catalyst(ticker: str, max_age_hours: float = 24.0) -> Optional[Dict]:
+    """Most recent Massive/Polygon news article for `ticker` published within
+    the last `max_age_hours`, with that ticker's own precomputed sentiment.
+
+    Closes a coverage gap identified 2026-08-25: the full-universe technical
+    scanners (momentum_scanner, supertrend) run every 30 min across the whole
+    scan universe but attach no "why" to a hit, and the existing SEC 8-K
+    enrichment in scheduler.py's gap alerts (i) only covers 8-K filings and
+    (ii) only has DATE resolution, not time (`file_date`, no timestamp) — see
+    CLAUDE.md Incident Archive. Polygon's `/v2/reference/news` gives second-
+    precision `published_utc` plus a per-ticker sentiment/reasoning pair
+    already computed, at no extra cost (same MASSIVE_API_KEY tier already in
+    use — the higher-tier Benzinga real-time feed was evaluated and rejected
+    as a paid upgrade).
+
+    Never raises — returns None on any failure or when nothing is found in
+    the window, matching the _fetch_prior_close/_fetch_sec_8k_events
+    graceful-degradation precedent. Intentionally soft: callers are expected
+    to treat a missing catalyst as "omit the line", never as a scan failure.
+    """
+    if not MASSIVE_API_KEY:
+        return None
+    status, data = _massive_get(
+        f"{MASSIVE_BASE_URL}/v2/reference/news",
+        {"ticker": ticker, "limit": 5, "order": "desc", "sort": "published_utc",
+         "apiKey": MASSIVE_API_KEY},
+    )
+    if status != 200 or not data:
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    for item in results:
+        published = item.get("published_utc")
+        if not published:
+            continue
+        try:
+            pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if pub_dt < cutoff:
+            continue
+
+        # Insights carries this ticker's OWN sentiment, not the article's
+        # overall framing -- a multi-ticker article (e.g. a sector roundup)
+        # can be bullish for one name and neutral/bearish for another
+        # mentioned only in passing.
+        sentiment = None
+        for insight in (item.get("insights") or []):
+            if str(insight.get("ticker", "")).upper() == ticker.upper():
+                sentiment = insight.get("sentiment")
+                break
+
+        publisher = item.get("publisher") or {}
+        return {
+            "title":          item.get("title", ""),
+            "published_utc":  pub_dt,
+            "sentiment":      sentiment,
+            "publisher_name": publisher.get("name", ""),
+            "url":            item.get("article_url", ""),
+        }
+    return None
 
 
 def _fetch_prior_close(ticker: str) -> Optional[float]:
