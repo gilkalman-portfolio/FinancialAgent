@@ -518,6 +518,85 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — src/gap_scanner.py::sc
 
 ---
 
+## PLANNED (not yet built): News-Catalyst Event-Study Measurement
+
+Designed 2026-08-25/26, not started. Goal: measure whether a momentum/supertrend
+technical hit *plus* fresh news of a given sentiment direction predicts forward
+returns differently than a hit with no news — a prerequisite research step before
+ever considering a news-driven entry trigger (see the parked IBKR item below).
+This is now scoped as a small event-study framework, in the same family as
+`trigger_backtest.py`/`exit_simulation.py`/`signal_library.py` — reuse their
+patterns, don't reinvent. A general-purpose research agent surveyed academic
+event-study literature and open-source prior art for this design; citations below.
+
+**Data capture** — reuse `forward_signals.py`'s existing `SignalRecord`/`record_signal()`/
+`update_outcomes()` API, no new table:
+- Log `signal_type="WATCH"` for every momentum/supertrend hit (both scanners, both
+  with and without attached news — the no-news group is the control, not noise to discard).
+- `catalyst_summary` carries the news title + Polygon sentiment label when present
+  (via `gap_scanner.fetch_recent_news_catalyst()`, already built and live).
+- **Dedup key: (ticker, sentiment_direction)**, not (ticker, time_window) and not
+  (ticker, article_id). A hit repeating with the *same* sentiment direction (or the
+  same no-news state) is the same observation, not a new one — logging every
+  same-direction repeat inflates the sample with correlated, non-independent points
+  (this is exactly the clustering bug `exit_simulation.py` already got burned by
+  once — see its Incident Archive entry). A **direction change** (positive→negative,
+  or news appearing/disappearing) is a genuinely new observation.
+
+**Horizons** — extend `forward_signals` with new nullable columns via `database.py`'s
+existing auto-migration (`price_after_1d`/`2d`/`3d`, `return_1d_pct`/`2d_pct`/`3d_pct`),
+additive to the existing 7/14/30d columns, not a replacement — harmless to existing
+BUY/SELL rows (NULL for those). Research justification: Chan (2003, JFE) and Tetlock
+(2007, JF) both find news-driven price action can differ in *shape*, not just
+magnitude, from a technical trend signal at short horizons — Tetlock specifically
+found short-horizon sentiment-driven moves that *reverse* within days. Reusing the
+Supertrend-tuned 7/14/30d horizons alone would not have caught this. PEAD (the
+closest academic analogue) uses 60-90 trading days, but its drift is concentrated
+around the *next* related event, not a smooth decay — informative context, not a
+directly applicable horizon for a general (non-earnings) catalyst.
+
+**Methodology upgrades this design needs before the numbers can be trusted** (do not
+skip — each one is a documented way this exact kind of measurement goes wrong):
+1. **Abnormal returns, not raw returns** — measure return *relative to* SPY or sector
+   benchmark, reusing the same "excess vs benchmark" pattern already implemented in
+   `trigger_backtest.py`/the 2026-08-05 Live-Readiness Audit, not a new calculation.
+2. **Cross-sectional clustering correction** — when multiple tickers share a catalyst
+   date (earnings season, a market-wide event), their abnormal returns are correlated
+   and naive per-observation t-tests overstate significance (Kolari & Pynnonen 2010).
+   `trigger_backtest.py` already solves an analogous same-ticker-overlapping-holding-period
+   version of this ("always use the clustered figure, not the naive t-stat") — extend
+   that pattern to cross-ticker date-clustering here, don't build a separate solution.
+3. **Placebo/control-date test** — compare the measured effect against random
+   non-catalyst dates (excluding a buffer window around real events) to confirm the
+   signal isn't just generic market drift that would show up on any day. Pattern
+   observed in `matthias-wyss/iti-8k-analysis` (GitHub) — not currently done anywhere
+   in this codebase, worth adding here first.
+4. **Documented, uncorrectable caveat**: Polygon's per-article sentiment label is a
+   third-party black box we don't validate independently — treat "does sentiment
+   predict returns" results as "does *Polygon's sentiment model* predict returns."
+   Separately, LLM-computed sentiment on published news carries a theoretical
+   look-ahead-bias risk if the underlying model's training data includes the
+   article's aftermath (arXiv:2309.17322) — unverifiable from our side, document
+   and move on, don't try to solve it.
+
+**Explicitly out of scope for this pass**: tickers with news but no technical hit
+(that's the bigger, separately-parked full-universe listener question); wiring
+anything to `order_manager`/IBKR (see the parked item immediately below — this
+measurement is the prerequisite *research*, not the trading decision itself).
+
+**Build with tests + live verification**, matching this session's practice
+throughout: unit tests for the dedup/horizon logic, plus at least one live check
+against real Massive/Polygon data and a live `forward_signals` row before calling
+it done.
+
+**Separately parked, still not decided — do not build without a separate explicit
+go-ahead**: whether a validated version of this signal should ever drive an actual
+`order_manager`/IBKR BUY decision. Needs its own conversation once (if) this
+measurement shows a real, clustering-corrected, benchmark-relative effect — not
+before. See the fuller parked-item writeup in the Incident Archive, 2026-08-25.
+
+---
+
 ## Open Backlog
 
 - [ ] Sector-level sub-scanning in main Scan page — currently only in Squeeze; `page_scan.py` scans all sectors uniformly
@@ -687,3 +766,9 @@ Evaluated three data sources live: Massive/Polygon's `/v2/reference/news` works 
 Shipped the free option: `gap_scanner.py::fetch_recent_news_catalyst()` (new) wraps `/v2/reference/news` on the existing `_massive_get`/`_thread_session` infrastructure — soft enrichment, never raises, filters to a configurable freshness window (default 24h), reads the *specific ticker's* sentiment from the article's `insights` array (not the article's overall framing, which can differ per ticker in a multi-ticker roundup). Wired into `auto_watchlist_agent.py::run()` for momentum/supertrend sources only (squeeze/catalyst already carry their own context), and only for the final, already-filtered `added` list — never the raw scan results — to keep the extra API calls cheap; a lookup failure never blocks the DB add or Telegram send. `tests/test_news_catalyst_enrichment.py` (new, 13 tests) covers the fetch helper (stale-article filtering, per-ticker sentiment selection in a multi-ticker article, graceful degradation on bad status/malformed timestamps) and the `run()` wiring (enrichment called for momentum, never called for squeeze, a fetch exception doesn't block the add). Live-verified against real AAPL/NVDA/TSLA articles — correct titles, sentiment, and second-precision ages. 661/0 suite.
 
 Deliberately did **not** touch the timing cadence itself this session (still two one-shot snapshots + 30-min technical sweeps) — this closes the "no why" gap on the existing full-universe cadence, not the blind-spot window identified above. If the 23h gap needs closing next, the options discussed were: more frequent premarket snapshots (closes the pre-open edge case), or reusing this same enrichment inside the 30-min Momentum/Supertrend threads more proactively (already partially true — this fix). See Open Backlog.
+
+**Follow-up same day — scope expansion, NOT yet decided/built:** discussed enriching every Momentum/Supertrend *hit* (~270-290/cycle), not just the small `added` subset (0-10/cycle) shipped above. Confirmed live that Massive/Polygon's Starter plan is **unlimited API calls** (soft 100 req/sec guidance, not a daily quota) — a 20-call burst test hit no rate limit — so the volume itself is not a blocker; sequential fetch would take ~3.5 min/cycle, parallelized (`ThreadPoolExecutor`, same pattern as `scan_premarket_gaps`) would take ~20-30s. **Open, unresolved:** what happens to a hit-with-fresh-news that doesn't clear the `auto_watchlist_agent` filters — DB-only (safe, no new Telegram volume) vs. a new Telegram alert type (higher-signal than raw `auto_wl_momentum` since it's pre-filtered to hits with an actual catalyst, but adds a new noisy-alert risk class). Not decided — do not build either direction without re-confirming, the conversation moved on before this was settled.
+
+Also researched, both informational only: (1) a true push/WebSocket "listener" for news — no such endpoint found in Massive/Polygon's accessible catalog at the current tier (everything indexed is REST/poll-based, including Benzinga); tighter polling (e.g. every 1-2 min on a narrow scope) was the only concrete alternative identified, not a confirmed push mechanism. (2) Sector/sub-sector scoping — already exists, no new work needed: `index_loader.py::get_sectors()` + `catalyst_scanner.py`'s existing "Index/Sector" source mode (`get_tickers_by_sector`, e.g. "Russell 2000 + Health Care" for biotech).
+
+**Explicitly parked, NOT decided — do not implement without a separate, explicit go-ahead:** user asked whether a sector-scoped news-catalyst trigger could also drive `order_manager`/IBKR BUY decisions, i.e. a new trading signal source, not just an informational alert. Flagged this as categorically different from everything else in this entry (money-moving, not informational) and inconsistent with this project's own established discipline — every existing trigger (Supertrend) went through `trigger_backtest.py`/`exit_simulation.py`/`signal_library.py` validation *before* being trusted, and even then showed ~0% net edge (see the 2026-08-05 research entries) — a news-catalyst signal currently has zero historical validation. Recommended sequence if this is ever picked back up: build informational-only first, accumulate real outcomes (similar to `forward_signals`), backtest, and only then consider wiring to execution — mirroring how every other signal in this codebase was introduced. No code exists for this; this paragraph exists so a future session doesn't have to re-derive why it wasn't built.
