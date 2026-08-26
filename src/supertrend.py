@@ -214,6 +214,12 @@ def scan_supertrend_universe(
     # Same mitigation as momentum_scanner.scan_momentum -- this runs every 30
     # min (staggered 15 min after the momentum monitor) against the full
     # scan universe. See CLAUDE.md Incident Archive, 2026-08-25.
+    #
+    # Instrumented 2026-08-26, same reasoning as momentum_scanner.scan_momentum
+    # -- see that function's comment. gc.collect()'s return value is direct
+    # evidence of whether real cyclic garbage was pending here too.
     del raw, highs, lows, closes, volumes
-    gc.collect()
+    collected = gc.collect()
+    if collected:
+        logger.info(f"Supertrend universe scan: gc.collect() freed {collected} unreachable object(s)")
     return results

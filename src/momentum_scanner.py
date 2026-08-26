@@ -224,6 +224,18 @@ def scan_momentum(
     # churn -- explicit del + gc.collect() here is a mitigation for the
     # scheduler.py memory-growth investigation, not a confirmed leak fix.
     # See CLAUDE.md Incident Archive, 2026-08-25.
+    #
+    # Instrumented 2026-08-26 per an external design review (IdeaDistill
+    # panel): gc.collect()'s return value is the number of unreachable
+    # objects it actually found and freed -- nonzero here is direct evidence
+    # that real cyclic garbage (e.g. pandas' own documented BlockManager
+    # cycles) was pending, not proof of a classic reference leak (a leaked
+    # object stays reachable and gc.collect() would never free it, no matter
+    # how many times it's called). A consistently-large nonzero count instead
+    # supports the "cyclic garbage accumulating faster than Python's
+    # threshold-based automatic collection" theory already documented above.
     del raw, closes, volumes
-    gc.collect()
+    collected = gc.collect()
+    if collected:
+        logger.info(f"Momentum scan: gc.collect() freed {collected} unreachable object(s)")
     return results
