@@ -456,12 +456,31 @@ class TestScanOpeningPrintsClampReporting:
 # ══════════════════════════════════════════════════════════════════════════
 
 class TestPremarketGapAlertNoOps:
-    def test_missing_config_key_is_noop(self):
+    def test_missing_gap_scanner_key_defaults_to_enabled(self):
+        """Pre-existing test bug, found and fixed 2026-08-26 during a
+        post-session reconciliation check -- this test asserted the OPPOSITE
+        of the actual, intentional behavior since the feature's original
+        commit (d9d879b): `gap_cfg.get("enabled", True)` deliberately
+        defaults a MISSING "gap_scanner" config key to enabled, the same
+        "missing key = on" convention used by _auto_watchlist_enabled() and
+        _event_study_enabled() elsewhere in this file -- so existing
+        deployments that predate a new config key keep the feature working
+        rather than silently losing it. It was never a real regression; it
+        only started failing loudly because the test also never mocked
+        _in_premarket_gap_window(), making it silently wall-clock-dependent
+        -- it happened to keep "passing" for the wrong reason (real time
+        outside the real premarket window) until a run inside that window
+        exposed the actual assertion mismatch. Both fixed here: the
+        assertion now matches the real intended behavior, and the window
+        check is mocked so this can't depend on when it happens to run."""
         with patch.object(scheduler, "load_config", return_value={"enabled": True, "telegram": True}), \
              patch.object(scheduler, "_is_trading_day", return_value=True), \
-             patch("src.gap_scanner.scan_premarket_gaps") as scan:
+             patch.object(scheduler, "_in_premarket_gap_window", return_value=True), \
+             patch.object(scheduler, "init_db"), \
+             patch("src.index_loader.get_index", return_value=pd.DataFrame({"ticker": ["AAPL"]})), \
+             patch("src.gap_scanner.scan_premarket_gaps", return_value=[]) as scan:
             scheduler.run_premarket_gap_alert()
-        scan.assert_not_called()
+        scan.assert_called_once()
 
     def test_globally_disabled_is_noop(self):
         cfg = {"enabled": False, "gap_scanner": {"enabled": True}}
