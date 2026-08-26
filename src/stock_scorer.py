@@ -221,7 +221,10 @@ def score_stock(ticker: str, forecast_days: int = 30) -> Optional[Dict[str, Any]
             if _fh_key:
                 from src.earnings_sentiment import get_earnings_sentiment
                 _es        = get_earnings_sentiment(ticker, _fh_key)
-                news_score     = _es["score"]
+                # Capped by WEIGHTS['news_sentiment'] so the weight is a live lever —
+                # previously news_score fed straight into `bonus` uncapped, so tuning
+                # WEIGHTS['news_sentiment'] had zero effect on the composite score.
+                news_score     = min(WEIGHTS['news_sentiment'], _es["score"])
                 news_sentiment = _es["sentiment"]
         except Exception:
             pass

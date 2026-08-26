@@ -75,6 +75,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `telegram_command_handler.py` | Two-way Telegram — polls `getUpdates` every 30s; commands: `/status`, `/positions`, `/pause`, `/resume`, `/cancel <TICKER>` (ticker validated `re.fullmatch(r"[A-Z]{1,6}")`); security: only responds to `TELEGRAM_CHAT_ID`; offset persisted to `telegram_command_state` DB table. `/status` reads queue size from `monitoring_queue_snapshot` and P&L from `daily_pnl` (no live IBKR call — avoids hangs). |
 | `finnhub_client.py` | Finnhub API wrapper — earnings surprises, transcript list/content |
 | `edgar_fcf.py` | SEC EDGAR XBRL provider — free, no API key. `get_edgar_fcf_median`, `get_revenue_cagr`, `get_interest_coverage` (zero-debt → 100.0 cap, not None), `get_current_ratio`, `get_eps_yoy_growth`. Shared `_FACTS_CACHE` (24h TTL) avoids duplicate SEC fetches; `OrderedDict` with LRU eviction + hard cap (`_FACTS_CACHE_MAX_SIZE=100`, added 2026-08-25) since each entry holds the full raw companyfacts payload (1.7-4.9MB/ticker observed) and the scan universe touches thousands of distinct tickers/day. Rate: 0.12s delay between requests. |
+| `weight_tuning_backtest.py` | Weight-tuning research tool for `stock_scorer.py`'s `WEIGHTS` dict (added 2026-08-26). Reads every historical `scan_results` row's `raw_data._scores` breakdown (no point-in-time reconstruction needed — it was already recorded live), attaches forward returns from yfinance on the SAME series used for entry (no DB-vs-yfinance price-basis mismatch to patch around, unlike `backtester.py`), and reports per-component Fama-MacBeth monthly IC plus a walk-forward comparison of candidate reweightings vs the current static WEIGHTS. See "Weight Tuning Backtest" section below. |
 
 ---
 
@@ -93,13 +94,19 @@ Base total = 145. Normalized 0–100, plus bonus band up to +20.
 | Short Interest | 10 | SI% of Float |
 | Institutional | 5 | |
 | Insider | 5 | SEC Form 4 |
-| Fundamentals | 10 | P/E, Revenue CAGR 5yr (EDGAR → yfinance fallback), Margin, Interest Coverage (EDGAR → D/E fallback) |
-| DCF | 15 | Margin of Safety vs intrinsic value |
-| News Sentiment | 5 | Earnings EPS surprise + LLM transcript analysis via `earnings_sentiment.py` |
+| Fundamentals | 10 | P/E, Revenue CAGR 5yr (EDGAR → yfinance fallback), Margin, Interest Coverage (EDGAR → D/E fallback) — **`_score_fundamentals()` caps at a hardcoded `min(score, 10)`, not `WEIGHTS['fundamentals']`** — see note below |
+| DCF | 15 | Margin of Safety vs intrinsic value — **`dcf_score`/`calculate_ps_valuation()` use hardcoded literal buckets (15/11/7/3/0, or 13/9/6/3/1), not `WEIGHTS['dcf']`** — see note below |
+| News Sentiment | 5 | Earnings EPS surprise + LLM transcript analysis via `earnings_sentiment.py`; capped by `min(WEIGHTS['news_sentiment'], _es["score"])` (fixed 2026-08-26 — previously uncapped, so the weight had zero effect) |
 | Squeeze Bonus | +15 | SI≥20% + vol spike + price up |
 | Google Trends | +5 | bonus |
 
 **Signals:** 75+ = STRONG BUY · 60–74 = BUY · 45–59 = WATCH · 35–44 = NEUTRAL · <35 = SKIP
+
+**⚠️ Not every `WEIGHTS` entry is actually a live lever (found 2026-08-26 while scoping the "weight tuning" backlog item):**
+- **`forecast`** — already known-inactive (see above): `forecast_score` hardcoded to 0, excluded from `core`/`core_max` entirely. Changing `WEIGHTS['forecast']` does nothing.
+- **`news_sentiment`** — was completely dead (see fix above); now a working cap.
+- **`fundamentals`** and **`dcf`** — their own component score is computed from hardcoded literals in `_score_fundamentals()` / `calculate_dcf()` / `calculate_ps_valuation()`, NOT scaled by `WEIGHTS['fundamentals']`/`WEIGHTS['dcf']`. The weight value still feeds into `core_max` (the normalization denominator), so raising it doesn't give that component more influence — it dilutes every OTHER component's relative share instead, the opposite of the intuitive effect. **Deliberately left unfixed**: `execution_engine.py::_score_fundamental_pillar()` (lines ~564-569) independently normalizes `fundamentals_score` and `dcf_score` against the SAME hardcoded maxima (`/10.0*15` and `/15.0*15`) for its own Track A/B confluence scoring, which feeds real (paper/live) trade decisions. Rescaling either component by its `WEIGHTS` value without also updating those two lines would silently corrupt the execution engine's confluence math the next time someone tunes `WEIGHTS['fundamentals']`/`WEIGHTS['dcf']` — so this needs a coordinated fix across both files, not a one-line change in `stock_scorer.py` alone. Any future weight-tuning work on these two components must update both call sites together.
+- **`momentum`** and **`insider`** — the weight only sets the cap ceiling (`min(weight, raw_points)`); the underlying point formula below the cap doesn't rescale with the weight. Not broken, just a different (still-legitimate) coupling than the fully-proportional components.
 
 ---
 
@@ -135,6 +142,49 @@ StockForecaster(data, point_in_time=datetime(...))   # truncates data to <= pit
 ```
 
 When `point_in_time` is set, all rows after it are dropped before any model fits — critical for any historical-replay or audit code path. **Live scanning** uses the default (`None`).
+
+---
+
+## Weight Tuning Backtest (`src/weight_tuning_backtest.py`, `run_weight_tuning_backtest.py`)
+
+Built 2026-08-26 for the Open Backlog item "weight tuning based on backtest data." Written and unit-tested (`tests/test_weight_tuning_backtest.py`, pure math, no network/DB) in a network-sandboxed session that could reach neither yfinance nor a populated `data/financial_agent.db` — **never executed against real data**. Run it yourself before trusting any of its output.
+
+### What it measures
+
+1. **Per-component IC** — does each of `stock_scorer.py`'s 12 scoring components, as currently computed, actually correlate with forward returns? Uses a Fama-MacBeth-style monthly cross-sectional Spearman rank IC (one scan per ticker per month, then mean/t-stat across independent months) — the panel-data analog of `trigger_backtest.py`'s month-clustering discipline, so a ticker scanned 20× in one month can't inflate that month's evidence.
+2. **Reweighting comparison** — a walk-forward test (fit on the first `--train-frac` of the date range, evaluate on the untouched remainder) of the current static `WEIGHTS` against an equal-weight split and an IC-proportional data-driven split, both restricted to the components that are actual live levers today (see below). Reports against the same Bonferroni-style multiple-comparison threshold `run_signal_panel.py` uses.
+
+### Why this doesn't need to reconstruct anything historically
+
+Unlike `trigger_backtest.py` (which has to replay OHLCV from scratch because the monitoring queue and composite score can't be reconstructed point-in-time), every historical `scan_results` row written by `score_stock()` already carries the full per-component breakdown in `raw_data._scores`, exactly as computed live at scan time. Only forward returns need fetching — and they're measured on the SAME yfinance daily-close series used for entry, so there's no split/spinoff basis mismatch for `backtester.py`'s `price_sig_adj` workaround to exist for in the first place.
+
+### Which components are actually reweightable
+
+Confirmed by reading `stock_scorer.py`'s code, not by running the backtest — this part is already true today, independent of any data:
+
+| Category | Components | Behavior |
+|---|---|---|
+| `EXACT_LINEAR` | rsi, macd, ma, volume, short, institutional | `score = weight × frac(inputs)` exactly — a reweighting candidate for these is exact |
+| `CAP_ONLY` | momentum, insider | weight only sets the ceiling on a hardcoded-formula raw point value — reweighting is a conservative approximation (never overstates) |
+| `HARDCODED` | fundamentals, dcf | computed from literals with **no** dependence on the weight at all today — see Scoring Engine section above. A candidate reweighting here is a "what if this were wired to scale with weight" hypothetical, not a preview of current behavior |
+| excluded entirely | forecast (inactive), news/trends (bonus-band, not part of `core`) | reported on for informational IC only |
+
+`run_weight_tuning_backtest.py`'s candidate reweightings only ever touch `EXACT_LINEAR ∪ CAP_ONLY` — never `fundamentals`/`dcf`, because wiring those up for real needs a coordinated fix in `execution_engine.py` too (it independently normalizes both against the same hardcoded maxima for Track A/B confluence scoring — see Scoring Engine section).
+
+### Running it
+
+```bash
+python run_weight_tuning_backtest.py                  # 30d horizon, default
+python run_weight_tuning_backtest.py --horizon 14
+python run_weight_tuning_backtest.py --no-cache        # force fresh yfinance downloads
+python run_weight_tuning_backtest.py --min-rows 200    # raise the "enough history" bar
+```
+
+Requires: the production `data/financial_agent.db` (months of accumulated `scan_results` — a fresh clone's empty DB raises "no `scan_results` table", not a false "no edge" result) and live yfinance access. Run it on the machine that runs `scheduler.py`.
+
+**Before trusting any output**, check the printed reconstruction sanity check first — it recomputes every row's composite score from `raw_data._scores` under the CURRENT `WEIGHTS` and compares to the score actually stored in the DB. If `pct_within_1pt` isn't ~100%, either `WEIGHTS` has changed since some of that history was scanned (this tool assumes it hasn't) or the formula in `weight_tuning_backtest.py` has drifted from `stock_scorer.py`'s — the script hard-fails on this rather than printing a misleading report.
+
+**Expected finding, not a bug**: the composite score was already found to carry no measurable edge (2026-08-05 Live-Readiness Audit) — a component-level null result (no component's IC survives, "control" wins the walk-forward comparison) would be the consistent, expected outcome, not evidence the tool is broken.
 
 ---
 
@@ -601,10 +651,9 @@ before. See the fuller parked-item writeup in the Incident Archive, 2026-08-25.
 
 - [ ] Sector-level sub-scanning in main Scan page — currently only in Squeeze; `page_scan.py` scans all sectors uniformly
 - [ ] Fear & Greed Index widget — `page_market.py` shows VIX text description only
-- [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static
+- [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static. 2026-08-26: found `forecast`/`news_sentiment` were dead weights (news_sentiment now fixed) and `fundamentals`/`dcf` are disconnected from their own weight value (see Scoring Engine section above) — tune those two only together with `execution_engine.py`'s hardcoded normalization. Built `run_weight_tuning_backtest.py` (see "Weight Tuning Backtest" section above) but **never ran it against real data** — no network egress to any market-data provider and no accumulated `scan_results` history were available in the session that wrote it. Still open: run it on the production machine and act on what it finds.
 - [ ] Russell 2000 support in main Scan page — works in Catalyst Scanner + scheduler, not wired into `page_scan.py`
 - [ ] `supertrend_triple_bull/bear` — consider routing through `signal_combiner.evaluate()` for the same cap+dedup discipline `combined_buy/sell` gets (currently DB-only, uncapped)
-- [ ] `news_catalyst` threshold tuning — consider lowering `catalyst_threshold` from 3 to 2 if forward-paper-trading shows missed catalysts
 - [ ] `modify_stop_order()` matches the first STP SELL by ticker — ambiguous if multiple STPs exist for one ticker; needs a `stop_order_id` column in `order_log` to fully fix
 - [ ] `record_fill()` is not idempotent on duplicate fill events — rare, but can corrupt an older `forward_signals` row
 - [ ] Track whether Supertrend-universe / capacity-rotation additions (2026-08-14) perform differently from the existing sources in `forward_signals` before treating the wider net as a return improvement, not just a coverage one
@@ -791,3 +840,6 @@ Deliberately did **not** touch the timing cadence itself this session (still two
 Also researched, both informational only: (1) a true push/WebSocket "listener" for news — no such endpoint found in Massive/Polygon's accessible catalog at the current tier (everything indexed is REST/poll-based, including Benzinga); tighter polling (e.g. every 1-2 min on a narrow scope) was the only concrete alternative identified, not a confirmed push mechanism. (2) Sector/sub-sector scoping — already exists, no new work needed: `index_loader.py::get_sectors()` + `catalyst_scanner.py`'s existing "Index/Sector" source mode (`get_tickers_by_sector`, e.g. "Russell 2000 + Health Care" for biotech).
 
 **Explicitly parked, NOT decided — do not implement without a separate, explicit go-ahead:** user asked whether a sector-scoped news-catalyst trigger could also drive `order_manager`/IBKR BUY decisions, i.e. a new trading signal source, not just an informational alert. Flagged this as categorically different from everything else in this entry (money-moving, not informational) and inconsistent with this project's own established discipline — every existing trigger (Supertrend) went through `trigger_backtest.py`/`exit_simulation.py`/`signal_library.py` validation *before* being trusted, and even then showed ~0% net edge (see the 2026-08-05 research entries) — a news-catalyst signal currently has zero historical validation. Recommended sequence if this is ever picked back up: build informational-only first, accumulate real outcomes (similar to `forward_signals`), backtest, and only then consider wiring to execution — mirroring how every other signal in this codebase was introduced. No code exists for this; this paragraph exists so a future session doesn't have to re-derive why it wasn't built.
+
+### 2026-08-26 — `news_catalyst_threshold` lowered 3 → 2
+Closed the Open Backlog item to consider this change. `catalyst_score()` (`src/news_fetcher.py::HIGH_IMPACT_KEYWORDS`) weights most keywords at 3 and only five at 2 (`ipo`, `spinoff`, `buyback`, `dividend`, `insider buy`). At threshold=3, a headline needed either one 3-point keyword or two 2-point keywords to ever reach the LLM stage — a standalone IPO/buyback/dividend/insider-buy headline with no second catalyst keyword was silently filtered pre-LLM and marked seen forever (`news_seen_add`), regardless of how material it was to the ticker. Threshold=2 lets those five keywords qualify a headline on their own; behavior for every 3-point keyword is unchanged (3 ≥ 2 either way). `page_scheduler.py`'s slider already allowed `min_value=2`, so this is a default-value change, not a new range. Updated in three places: `scheduler_config.json` (`news_catalyst_threshold`), `src/news_catalyst_monitor.py` (`DEFAULT_CATALYST_THRESHOLD`), and every `.get("news_catalyst_threshold", 3)` fallback in `page_scheduler.py`/`scheduler.py` (now falls back to 2, so a config missing the key matches the new default instead of the old one). `tests/test_news_catalyst_dedup.py` passes `catalyst_threshold=3` explicitly and is unaffected. Expected effect: more headlines reach the LLM stage (still capped by `news_catalyst_max_llm_per_cycle`), trading a small amount of extra LLM cost for catching standalone corporate-action catalysts that were previously invisible.
