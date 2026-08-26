@@ -75,6 +75,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `telegram_command_handler.py` | Two-way Telegram — polls `getUpdates` every 30s; commands: `/status`, `/positions`, `/pause`, `/resume`, `/cancel <TICKER>` (ticker validated `re.fullmatch(r"[A-Z]{1,6}")`); security: only responds to `TELEGRAM_CHAT_ID`; offset persisted to `telegram_command_state` DB table. `/status` reads queue size from `monitoring_queue_snapshot` and P&L from `daily_pnl` (no live IBKR call — avoids hangs). |
 | `finnhub_client.py` | Finnhub API wrapper — earnings surprises, transcript list/content |
 | `edgar_fcf.py` | SEC EDGAR XBRL provider — free, no API key. `get_edgar_fcf_median`, `get_revenue_cagr`, `get_interest_coverage` (zero-debt → 100.0 cap, not None), `get_current_ratio`, `get_eps_yoy_growth`. 24h in-memory cache, single shared cache (no duplicate SEC fetches). Rate: 0.12s delay between requests. |
+| `weight_tuning_backtest.py` | Weight-tuning research tool for `stock_scorer.py`'s `WEIGHTS` dict (added 2026-08-26). Reads every historical `scan_results` row's `raw_data._scores` breakdown (no point-in-time reconstruction needed — it was already recorded live), attaches forward returns from yfinance on the SAME series used for entry (no DB-vs-yfinance price-basis mismatch to patch around, unlike `backtester.py`), and reports per-component Fama-MacBeth monthly IC plus a walk-forward comparison of candidate reweightings vs the current static WEIGHTS. See "Weight Tuning Backtest" section below. |
 
 ---
 
@@ -141,6 +142,49 @@ StockForecaster(data, point_in_time=datetime(...))   # truncates data to <= pit
 ```
 
 When `point_in_time` is set, all rows after it are dropped before any model fits — critical for any historical-replay or audit code path. **Live scanning** uses the default (`None`).
+
+---
+
+## Weight Tuning Backtest (`src/weight_tuning_backtest.py`, `run_weight_tuning_backtest.py`)
+
+Built 2026-08-26 for the Open Backlog item "weight tuning based on backtest data." Written and unit-tested (`tests/test_weight_tuning_backtest.py`, pure math, no network/DB) in a network-sandboxed session that could reach neither yfinance nor a populated `data/financial_agent.db` — **never executed against real data**. Run it yourself before trusting any of its output.
+
+### What it measures
+
+1. **Per-component IC** — does each of `stock_scorer.py`'s 12 scoring components, as currently computed, actually correlate with forward returns? Uses a Fama-MacBeth-style monthly cross-sectional Spearman rank IC (one scan per ticker per month, then mean/t-stat across independent months) — the panel-data analog of `trigger_backtest.py`'s month-clustering discipline, so a ticker scanned 20× in one month can't inflate that month's evidence.
+2. **Reweighting comparison** — a walk-forward test (fit on the first `--train-frac` of the date range, evaluate on the untouched remainder) of the current static `WEIGHTS` against an equal-weight split and an IC-proportional data-driven split, both restricted to the components that are actual live levers today (see below). Reports against the same Bonferroni-style multiple-comparison threshold `run_signal_panel.py` uses.
+
+### Why this doesn't need to reconstruct anything historically
+
+Unlike `trigger_backtest.py` (which has to replay OHLCV from scratch because the monitoring queue and composite score can't be reconstructed point-in-time), every historical `scan_results` row written by `score_stock()` already carries the full per-component breakdown in `raw_data._scores`, exactly as computed live at scan time. Only forward returns need fetching — and they're measured on the SAME yfinance daily-close series used for entry, so there's no split/spinoff basis mismatch for `backtester.py`'s `price_sig_adj` workaround to exist for in the first place.
+
+### Which components are actually reweightable
+
+Confirmed by reading `stock_scorer.py`'s code, not by running the backtest — this part is already true today, independent of any data:
+
+| Category | Components | Behavior |
+|---|---|---|
+| `EXACT_LINEAR` | rsi, macd, ma, volume, short, institutional | `score = weight × frac(inputs)` exactly — a reweighting candidate for these is exact |
+| `CAP_ONLY` | momentum, insider | weight only sets the ceiling on a hardcoded-formula raw point value — reweighting is a conservative approximation (never overstates) |
+| `HARDCODED` | fundamentals, dcf | computed from literals with **no** dependence on the weight at all today — see Scoring Engine section above. A candidate reweighting here is a "what if this were wired to scale with weight" hypothetical, not a preview of current behavior |
+| excluded entirely | forecast (inactive), news/trends (bonus-band, not part of `core`) | reported on for informational IC only |
+
+`run_weight_tuning_backtest.py`'s candidate reweightings only ever touch `EXACT_LINEAR ∪ CAP_ONLY` — never `fundamentals`/`dcf`, because wiring those up for real needs a coordinated fix in `execution_engine.py` too (it independently normalizes both against the same hardcoded maxima for Track A/B confluence scoring — see Scoring Engine section).
+
+### Running it
+
+```bash
+python run_weight_tuning_backtest.py                  # 30d horizon, default
+python run_weight_tuning_backtest.py --horizon 14
+python run_weight_tuning_backtest.py --no-cache        # force fresh yfinance downloads
+python run_weight_tuning_backtest.py --min-rows 200    # raise the "enough history" bar
+```
+
+Requires: the production `data/financial_agent.db` (months of accumulated `scan_results` — a fresh clone's empty DB raises "no `scan_results` table", not a false "no edge" result) and live yfinance access. Run it on the machine that runs `scheduler.py`.
+
+**Before trusting any output**, check the printed reconstruction sanity check first — it recomputes every row's composite score from `raw_data._scores` under the CURRENT `WEIGHTS` and compares to the score actually stored in the DB. If `pct_within_1pt` isn't ~100%, either `WEIGHTS` has changed since some of that history was scanned (this tool assumes it hasn't) or the formula in `weight_tuning_backtest.py` has drifted from `stock_scorer.py`'s — the script hard-fails on this rather than printing a misleading report.
+
+**Expected finding, not a bug**: the composite score was already found to carry no measurable edge (2026-08-05 Live-Readiness Audit) — a component-level null result (no component's IC survives, "control" wins the walk-forward comparison) would be the consistent, expected outcome, not evidence the tool is broken.
 
 ---
 
@@ -528,7 +572,7 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — src/gap_scanner.py::sc
 
 - [ ] Sector-level sub-scanning in main Scan page — currently only in Squeeze; `page_scan.py` scans all sectors uniformly
 - [ ] Fear & Greed Index widget — `page_market.py` shows VIX text description only
-- [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static. Prerequisite work done 2026-08-26: found `forecast`/`news_sentiment` were dead weights (news_sentiment now fixed) and `fundamentals`/`dcf` are disconnected from their own weight value (see Scoring Engine section above) — tune those two only together with `execution_engine.py`'s hardcoded normalization. The actual backtest still needs to run against the production `data/financial_agent.db` (its `scan_results.raw_data` already stores the full `_scores` breakdown per historical scan — no point-in-time reconstruction needed) plus live yfinance access for forward returns — neither is available in a fresh/remote clone.
+- [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static. 2026-08-26: found `forecast`/`news_sentiment` were dead weights (news_sentiment now fixed) and `fundamentals`/`dcf` are disconnected from their own weight value (see Scoring Engine section above) — tune those two only together with `execution_engine.py`'s hardcoded normalization. Built `run_weight_tuning_backtest.py` (see "Weight Tuning Backtest" section above) but **never ran it against real data** — no network egress to any market-data provider and no accumulated `scan_results` history were available in the session that wrote it. Still open: run it on the production machine and act on what it finds.
 - [ ] Russell 2000 support in main Scan page — works in Catalyst Scanner + scheduler, not wired into `page_scan.py`
 - [ ] SEC 8-K item classification (1.01 bullish / 1.03 bearish) — `catalyst_scanner.py` fetches 8-K but doesn't classify by item number
 - [ ] `supertrend_triple_bull/bear` — consider routing through `signal_combiner.evaluate()` for the same cap+dedup discipline `combined_buy/sell` gets (currently DB-only, uncapped)
