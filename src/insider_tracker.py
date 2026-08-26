@@ -1,7 +1,8 @@
 """
 Insider Tracker — Form 4 conviction scoring
-Primary: sec-api.io (fast, single call)
-Fallback: SEC EDGAR XML scraper (original, slow)
+Primary: Massive/Polygon (paid, not rate-limited — see CLAUDE.md Incident Archive 2026-08-19)
+Fallback 1: sec-api.io (free tier, 100 req/query cap — degrades under normal scan load)
+Fallback 2: SEC EDGAR XML scraper (original, slow, always available)
 """
 
 import os
@@ -22,6 +23,7 @@ if not _email:
 HEADERS = {'User-Agent': f'FinancialAgent ({_email})'}
 
 _SEC_API_AVAILABLE = bool(os.getenv("SEC_API_KEY", ""))
+_MASSIVE_AVAILABLE = bool(os.getenv("MASSIVE_API_KEY", ""))
 
 _thread_local = threading.local()  # module-level, mirrors src/gap_scanner.py::_thread_session()
 
@@ -49,11 +51,13 @@ class InsiderTracker:
         # once score_stock() runs in parallel. See CLAUDE.md Incident
         # Archive, 2026-08-18 (the same class of bug crashed the scheduler
         # process via a shared requests.Session under concurrent load).
-        self._ticker_map = None  # lazy load — only needed for fallback
-        if _SEC_API_AVAILABLE:
-            logger.info("InsiderTracker: using sec-api.io (fast mode)")
+        self._ticker_map = None  # lazy load — only needed for EDGAR fallback
+        if _MASSIVE_AVAILABLE:
+            logger.info("InsiderTracker: using Massive/Polygon (primary)")
+        elif _SEC_API_AVAILABLE:
+            logger.info("InsiderTracker: Massive unavailable, using sec-api.io (fast mode)")
         else:
-            logger.info("InsiderTracker: sec-api.io unavailable, using EDGAR XML (slow mode)")
+            logger.info("InsiderTracker: Massive and sec-api.io unavailable, using EDGAR XML (slow mode)")
 
     @staticmethod
     def _thread_session() -> requests.Session:
@@ -70,11 +74,26 @@ class InsiderTracker:
 
     def calculate_conviction_score(self, ticker: str) -> InsiderScore:
         """Score 0-100 based on Form 4 transactions in the last 90 days."""
+        if _MASSIVE_AVAILABLE:
+            return self._score_via_massive(ticker)
         if _SEC_API_AVAILABLE:
             return self._score_via_sec_api(ticker)
         return self._score_via_edgar_xml(ticker)
 
-    # ── sec-api.io path (fast) ────────────────────────────────────────────────
+    # ── Massive/Polygon path (primary — paid, not rate-limited) ─────────────────
+
+    def _score_via_massive(self, ticker: str) -> InsiderScore:
+        from src.massive_insider_client import get_insider_transactions
+        try:
+            txns = get_insider_transactions(ticker, days=90)
+            return self._build_score(ticker, txns)
+        except Exception as e:
+            logger.debug(f"InsiderTracker Massive failed for {ticker}: {e}, falling back to sec-api.io")
+            if _SEC_API_AVAILABLE:
+                return self._score_via_sec_api(ticker)
+            return self._score_via_edgar_xml(ticker)
+
+    # ── sec-api.io path (fallback — free tier, rate-limited) ────────────────────
 
     def _score_via_sec_api(self, ticker: str) -> InsiderScore:
         from src.sec_api_client import get_insider_transactions

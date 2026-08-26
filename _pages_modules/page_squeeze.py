@@ -21,10 +21,23 @@ def _load_tickers_by_sector(index_name: str, sector: str, max_stocks: int) -> li
 
 
 def _fetch_insider_buyers(days: int, min_value: float) -> list:
-    """Fetch insider buyers — no cache here, cache handled via session_state key."""
+    """Fetch insider buyers — no cache here, cache handled via session_state key.
+
+    Massive/Polygon first (paid, not rate-limited), sec-api.io as fallback
+    (free tier caps at 100 req/query — see CLAUDE.md Incident Archive
+    2026-08-19). Same priority as src/insider_tracker.py's per-ticker path.
+    """
+    import os
+    # limit=200 to get enough P-code transactions after filtering vesting/awards
+    if os.getenv("MASSIVE_API_KEY", ""):
+        try:
+            from src.massive_insider_client import get_recent_insider_buyers
+            return get_recent_insider_buyers(days=days, min_value=min_value)
+        except Exception:
+            pass  # fall through to sec-api.io below — an empty (but successful)
+            # Massive result is a valid answer and returns above, not here.
     try:
         from src.sec_api_client import get_recent_insider_buyers
-        # limit=200 to get enough P-code transactions after filtering vesting/awards
         return get_recent_insider_buyers(days=days, min_value=min_value)
     except Exception:
         return []
