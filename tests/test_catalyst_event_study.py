@@ -213,6 +213,102 @@ class TestComputeAbnormalReturns:
                 pass
 
 
+class TestPromotedOnlyFilter:
+    """promoted_only=True, added 2026-08-26 per the IdeaDistill design
+    review's survivorship point: restrict WATCH rows to tickers that were
+    ALSO promoted to the watchlist (the only population that actually shows
+    the sentiment tag in a real Telegram message), to check whether a
+    measured sentiment/return relationship survives outside the full
+    (unfiltered) hit population."""
+
+    def _fresh_db(self, monkeypatch):
+        import tempfile, os as _os
+        from pathlib import Path
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _os.close(fd)
+        db_path = Path(path)
+        import src.database as db
+        monkeypatch.setattr(db, "DB_PATH", db_path)
+        db.init_db()
+        monkeypatch.setattr(ces, "get_connection", db.get_connection)
+        return db_path
+
+    def test_promoted_ticker_included_when_promoted_only(self, monkeypatch):
+        self._fresh_db(monkeypatch)
+        from src.database import watchlist_save_alert
+        conn = ces.get_connection()
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status) "
+            "VALUES ('PROMO', '2026-06-01T10:00:00', 'WATCH', 10.0, 'open')"
+        )
+        conn.commit()
+        conn.close()
+        watchlist_save_alert("PROMO", "auto_wl_momentum", "added",
+                             score=None, price=None)
+        # sent_at defaults to now(), not 2026-06-01 -- override it directly
+        # so it falls inside the +-30min match window around the WATCH row.
+        conn = ces.get_connection()
+        conn.execute("UPDATE watchlist_alerts SET sent_at = '2026-06-01T10:05:00' WHERE ticker='PROMO'")
+        conn.commit()
+        conn.close()
+
+        rows = ces._watch_rows(9000, promoted_only=True)
+        assert any(r["ticker"] == "PROMO" for r in rows)
+
+    def test_non_promoted_ticker_excluded_when_promoted_only(self, monkeypatch):
+        self._fresh_db(monkeypatch)
+        conn = ces.get_connection()
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status) "
+            "VALUES ('LONER', '2026-06-01T10:00:00', 'WATCH', 10.0, 'open')"
+        )
+        conn.commit()
+        conn.close()
+        # No matching watchlist_alerts row for LONER at all.
+
+        rows = ces._watch_rows(9000, promoted_only=True)
+        assert not any(r["ticker"] == "LONER" for r in rows)
+
+    def test_non_promoted_ticker_included_when_not_promoted_only(self, monkeypatch):
+        self._fresh_db(monkeypatch)
+        conn = ces.get_connection()
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status) "
+            "VALUES ('LONER', '2026-06-01T10:00:00', 'WATCH', 10.0, 'open')"
+        )
+        conn.commit()
+        conn.close()
+
+        rows = ces._watch_rows(9000, promoted_only=False)
+        assert any(r["ticker"] == "LONER" for r in rows)
+
+    def test_promotion_outside_time_window_does_not_count(self, monkeypatch):
+        self._fresh_db(monkeypatch)
+        from src.database import watchlist_save_alert
+        conn = ces.get_connection()
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status) "
+            "VALUES ('STALE', '2026-06-01T10:00:00', 'WATCH', 10.0, 'open')"
+        )
+        conn.commit()
+        conn.close()
+        watchlist_save_alert("STALE", "auto_wl_momentum", "added")
+        conn = ces.get_connection()
+        # 5 hours away from the WATCH row's signal_ts -- well outside the
+        # +-30min match window, e.g. an unrelated later re-promotion.
+        conn.execute("UPDATE watchlist_alerts SET sent_at = '2026-06-01T15:00:00' WHERE ticker='STALE'")
+        conn.commit()
+        conn.close()
+
+        rows = ces._watch_rows(9000, promoted_only=True)
+        assert not any(r["ticker"] == "STALE" for r in rows)
+
+    def test_direction_report_carries_promoted_only_flag(self):
+        with patch.object(ces, "compute_abnormal_returns", return_value=[]):
+            d = ces.direction_report(days=90, promoted_only=True)
+        assert d["promoted_only"] is True
+
+
 class TestDirectionReport:
     def test_no_data_returns_empty_directions(self):
         with patch.object(ces, "compute_abnormal_returns", return_value=[]):

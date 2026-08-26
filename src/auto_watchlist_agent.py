@@ -202,12 +202,22 @@ def _news_catalyst_suffix(news: Optional[dict]) -> str:
     """Formats fetch_recent_news_catalyst()'s result as an appendable Telegram
     line -- '' when there's nothing to show, never raises. Momentum/supertrend
     only (see _build_telegram_line): those two sources run full-universe every
-    30 min with no "why" otherwise. See CLAUDE.md Incident Archive, 2026-08-25."""
+    30 min with no "why" otherwise. See CLAUDE.md Incident Archive, 2026-08-25.
+
+    The sentiment tag always carries an explicit "unverified" label, added
+    2026-08-26 per an external design review (IdeaDistill panel): the
+    sentiment is a third-party vendor label this project has never validated
+    for this use case, and presenting it neutrally next to a technical alert
+    risks making a low-quality signal look more credible than it is. This is
+    a precaution, not an admission the tag actually changes anyone's
+    decision -- that's an open, unmeasured question (see CLAUDE.md), not a
+    settled one. Every enriched notification must carry the caveat, not just
+    a code comment nobody reading Telegram will ever see."""
     if not news or not news.get("title"):
         return ""
     age_min = max(0, int((datetime.now(timezone.utc) - news["published_utc"]).total_seconds() / 60))
     sentiment = news.get("sentiment")
-    tag = f" [{sentiment}]" if sentiment else ""
+    tag = f" [{sentiment}, unverified]" if sentiment else ""
     title = news["title"][:90]
     return f"\n  \U0001F4F0 {title}{tag} ({age_min}m ago)"
 

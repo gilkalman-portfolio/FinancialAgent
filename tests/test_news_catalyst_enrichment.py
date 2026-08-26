@@ -126,8 +126,23 @@ class TestTelegramLineNewsSuffix:
         }
         line = _build_telegram_line(r, "momentum", news=news)
         assert "FOO wins major contract" in line
-        assert "[positive]" in line
+        assert "[positive, unverified]" in line
         assert "30m ago" in line
+
+    def test_sentiment_tag_always_carries_unverified_caveat(self):
+        """External design review, 2026-08-26 (IdeaDistill panel): the
+        sentiment is an unvalidated third-party label -- every enriched
+        notification must say so explicitly, not just a code comment."""
+        from src.auto_watchlist_agent import _build_telegram_line
+        r = {"ticker": "FOO", "price": 50.0, "level": 46.0}
+        for sentiment in ("positive", "negative", "neutral"):
+            news = {
+                "title": "Some headline",
+                "published_utc": datetime.now(timezone.utc) - timedelta(minutes=1),
+                "sentiment": sentiment,
+            }
+            line = _build_telegram_line(r, "supertrend", news=news)
+            assert "unverified" in line, f"missing disclaimer for sentiment={sentiment}"
 
     def test_news_without_sentiment_omits_the_bracket_tag(self):
         from src.auto_watchlist_agent import _build_telegram_line
@@ -200,7 +215,7 @@ class TestRunWiresEnrichment:
         assert [r["ticker"] for r in added] == ["MOMCO"]
         mock_fetch.assert_called_once_with("MOMCO")
         assert "MOMCO beats earnings" in stub.sent
-        assert "[positive]" in stub.sent
+        assert "[positive, unverified]" in stub.sent
 
     def test_squeeze_add_never_calls_enrichment(self, temp_db, monkeypatch):
         """Cost control: only momentum/supertrend get the extra API call."""

@@ -61,11 +61,28 @@ bar-by-bar replay, rather than reinventing either concept:
      documented here rather than "fixed" because there is no fix available to
      this project.
 
+  5. Survivorship check (added 2026-08-26, same external design review as #4):
+     the Telegram enrichment in auto_watchlist_agent.py only ever shows for
+     tickers that already passed auto_watchlist_agent's own filters (0-10 of
+     the ~270-290 hits/cycle) -- so any sentiment/return relationship found
+     over the FULL WATCH population could be an artifact of that selection,
+     not evidence sentiment itself predicts anything. direction_report() and
+     compute_abnormal_returns() both take promoted_only=True to restrict to
+     exactly that promoted subset -- run both and compare before trusting
+     either one alone.
+
 Run (once enough WATCH rows have accumulated — this needs real history, not
 a single live-verification row):
     .venv\\Scripts\\python.exe -c \
         "from src.catalyst_event_study import direction_report, format_direction_report; \
          print(format_direction_report(direction_report(days=90)))"
+
+Run BOTH the full population and the promoted-only subset and compare, per
+the 2026-08-26 IdeaDistill review (see #5 below):
+    .venv\\Scripts\\python.exe -c \
+        "from src.catalyst_event_study import direction_report, format_direction_report; \
+         print(format_direction_report(direction_report(days=90))); \
+         print(format_direction_report(direction_report(days=90, promoted_only=True)))"
 """
 
 from __future__ import annotations
@@ -207,18 +224,62 @@ def _fetch_benchmark_close(benchmark: str, lookback_days: int):
 # Data access
 # ─────────────────────────────────────────────────────────────────────────
 
-def _watch_rows(days: int) -> list:
+_PROMOTED_ALERT_TYPES = ("auto_wl_momentum", "auto_wl_supertrend")
+_PROMOTED_MATCH_WINDOW_MINUTES = 30
+
+
+def _watch_rows(days: int, promoted_only: bool = False) -> list:
     """Raw WATCH rows (ticker, signal_ts, direction, return_Xd_pct...) within
     the lookback window. `direction` defaults to 'no_news' for any row
     somehow missing ai_verdict, so downstream grouping never silently drops
-    an observation into a NULL bucket."""
+    an observation into a NULL bucket.
+
+    `promoted_only=True` restricts to WATCH rows whose ticker was ALSO
+    promoted to the watchlist (an auto_wl_momentum/auto_wl_supertrend
+    watchlist_alerts row within +-30 min of the WATCH row's signal_ts) --
+    added 2026-08-26 per an external design review (IdeaDistill panel):
+    Claude's argument in that review was that any apparent sentiment/return
+    relationship measured over the full hit population is partly a
+    survivorship artifact, since the enriched Telegram notification only
+    ever shows for the small already-filtered promoted subset (0-10/cycle
+    out of ~270-290 hits) -- comparing direction_report(promoted_only=True)
+    against the unrestricted default is the direct way to check whether the
+    relationship holds, strengthens, or is an artifact of that selection.
+    """
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     cols = ", ".join(f"return_{h}d_pct" for h in HORIZONS)
+    promoted_clause = ""
+    if promoted_only:
+        placeholders = ", ".join("?" for _ in _PROMOTED_ALERT_TYPES)
+        # datetime(wa.sent_at) on the left is not cosmetic: SQLite's
+        # datetime()/'+N minutes' functions normalize their OUTPUT to a
+        # space-separated 'YYYY-MM-DD HH:MM:SS' form, but every timestamp
+        # this project stores comes from Python's datetime.isoformat() (a
+        # 'T' separator, e.g. '2026-06-01T10:05:00' -- see record_signal()/
+        # watchlist_save_alert()). Comparing that raw 'T' string against a
+        # datetime()-computed space-separated bound is a plain string
+        # comparison that silently returns the wrong answer (the 'T' vs ' '
+        # byte alone decides the ordering, before the actual time value is
+        # ever considered) -- caught by test_promoted_ticker_included_when_
+        # promoted_only failing during development, not a live incident.
+        # Wrapping wa.sent_at in datetime() too normalizes both sides to the
+        # same format before comparing.
+        promoted_clause = f"""
+            AND EXISTS (
+                SELECT 1 FROM watchlist_alerts wa
+                WHERE wa.ticker = forward_signals.ticker
+                  AND wa.alert_type IN ({placeholders})
+                  AND datetime(wa.sent_at) BETWEEN
+                      datetime(forward_signals.signal_ts, '-{_PROMOTED_MATCH_WINDOW_MINUTES} minutes')
+                      AND datetime(forward_signals.signal_ts, '+{_PROMOTED_MATCH_WINDOW_MINUTES} minutes')
+            )
+        """
+    params = (cutoff, *(_PROMOTED_ALERT_TYPES if promoted_only else ()))
     with get_connection() as conn:
         rows = conn.execute(
             f"SELECT ticker, signal_ts, ai_verdict AS direction, {cols} "
-            "FROM forward_signals WHERE signal_type = 'WATCH' AND signal_ts >= ?",
-            (cutoff,),
+            f"FROM forward_signals WHERE signal_type = 'WATCH' AND signal_ts >= ?{promoted_clause}",
+            params,
         ).fetchall()
     out = []
     for r in rows:
@@ -232,15 +293,22 @@ def _watch_rows(days: int) -> list:
 # Methodology upgrade #1: abnormal returns vs benchmark
 # ─────────────────────────────────────────────────────────────────────────
 
-def compute_abnormal_returns(days: int = 90, benchmark: str = DEFAULT_BENCHMARK) -> list:
+def compute_abnormal_returns(days: int = 90, benchmark: str = DEFAULT_BENCHMARK,
+                              promoted_only: bool = False) -> list:
     """One row per WATCH observation with abnormal (excess-vs-benchmark)
     return at each horizon in HORIZONS. This is the per-observation table
     every aggregate below is built from.
 
+    `promoted_only` — see _watch_rows() docstring: restricts to WATCH rows
+    for tickers that were also promoted to the watchlist, to directly test
+    whether a measured sentiment/return relationship survives outside the
+    full (unfiltered) hit population or is a survivorship artifact of that
+    selection.
+
     Returns [] when there is no WATCH data yet or the benchmark can't be
     fetched — callers must treat that as "not enough data", not an error.
     """
-    rows = _watch_rows(days)
+    rows = _watch_rows(days, promoted_only=promoted_only)
     if not rows:
         return []
 
@@ -277,23 +345,34 @@ def compute_abnormal_returns(days: int = 90, benchmark: str = DEFAULT_BENCHMARK)
 # ─────────────────────────────────────────────────────────────────────────
 
 def direction_report(days: int = 90, benchmark: str = DEFAULT_BENCHMARK,
-                      horizons=HORIZONS) -> dict:
+                      horizons=HORIZONS, promoted_only: bool = False) -> dict:
     """Per (sentiment direction, horizon): naive n/mean/t plus the
     cross-sectional date-clustered n/mean/t of the abnormal return.
 
     Always read the clustered figure, never the naive one — the same
     discipline trigger_backtest.py established for its own (time-axis)
     clustering problem applies here for the cross-sectional one.
+
+    Run this twice — once with promoted_only=False (the full hit
+    population) and once with promoted_only=True (only tickers that were
+    also promoted to the watchlist, i.e. the population that actually shows
+    the sentiment tag in a real Telegram message) — and compare. Per the
+    2026-08-26 IdeaDistill design review: if a sentiment/return relationship
+    only shows up in the promoted-only subset and not the full population,
+    that's evidence it's a survivorship artifact of the selection filters
+    rather than a real effect of sentiment itself.
     """
-    rows = compute_abnormal_returns(days, benchmark)
+    rows = compute_abnormal_returns(days, benchmark, promoted_only=promoted_only)
     if not rows:
-        return {"benchmark": benchmark, "window_days": days, "directions": {}}
+        return {"benchmark": benchmark, "window_days": days, "promoted_only": promoted_only,
+                "directions": {}}
 
     by_direction: dict = defaultdict(list)
     for r in rows:
         by_direction[r["direction"]].append(r)
 
-    result = {"benchmark": benchmark, "window_days": days, "directions": {}}
+    result = {"benchmark": benchmark, "window_days": days, "promoted_only": promoted_only,
+              "directions": {}}
     for direction, drows in by_direction.items():
         per_horizon = {}
         for h in horizons:
@@ -309,8 +388,9 @@ def format_direction_report(d: dict) -> str:
     directions = d.get("directions") or {}
     if not directions:
         return "no WATCH data in window"
+    scope = "PROMOTED-ONLY (watchlist-added)" if d.get("promoted_only") else "full hit population"
     lines = [f"===== News-Catalyst Event Study — abnormal return vs {d['benchmark']} "
-             f"({d['window_days']}d window) ====="]
+             f"({d['window_days']}d window, {scope}) ====="]
     for direction, per_horizon in sorted(directions.items()):
         lines.append(f"\n--- direction: {direction} ---")
         lines.append(f"{'horizon':>8}{'n(naive)':>10}{'t(naive)':>10}"
