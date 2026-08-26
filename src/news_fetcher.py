@@ -7,8 +7,10 @@ News Fetcher — מודול מרכזי לשליפת חדשות
   1. Google News RSS  — ללא API key, real-time, כיסוי מלא
   2. yfinance         — ללא API key, ticker-specific, delay ~15-30 דק'
   3. Finnhub          — API key, 60 req/min, איכות טובה
-  4. Alpha Vantage    — API key, 25 req/day (!), כולל sentiment מחושב
-  5. Marketaux        — API key (חינמי, 100 req/day), כולל sentiment
+  4. Massive/Polygon  — API key (בתשלום, כבר בשימוש בפרויקט), sentiment
+                        per-ticker אמיתי מהמקור (לא keyword heuristic)
+  5. Alpha Vantage    — API key, 25 req/day (!), כולל sentiment מחושב
+  6. Marketaux        — API key (חינמי, 100 req/day), כולל sentiment
 
 שימוש:
     from src.news_fetcher import get_ticker_news, get_market_news
@@ -24,9 +26,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-FINNHUB_KEY   = os.getenv("FINNHUB_API_KEY", "")
-AV_KEY        = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-MARKETAUX_KEY = os.getenv("MARKETAUX_API_KEY", "")
+FINNHUB_KEY      = os.getenv("FINNHUB_API_KEY", "")
+AV_KEY           = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+MARKETAUX_KEY    = os.getenv("MARKETAUX_API_KEY", "")
+MASSIVE_API_KEY  = os.getenv("MASSIVE_API_KEY", "")
+MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.polygon.io")
 
 _HEADERS = {
     "User-Agent": (
@@ -214,7 +218,70 @@ def fetch_finnhub_news(ticker: str = "", days: int = 7, limit: int = 20) -> List
         return []
 
 
-# ── Source 4: Alpha Vantage (25 req/day — use sparingly) ──────────────────────
+# ── Source 4: Massive/Polygon (paid, already in use elsewhere in the project) ──
+
+def fetch_massive_news(ticker: str = "", limit: int = 10) -> List[Dict]:
+    """Massive/Polygon /v2/reference/news. Real per-ticker sentiment from the
+    source (via `insights`), not a keyword heuristic like most other sources
+    here. Same MASSIVE_API_KEY already paid for and used by
+    src/gap_scanner.py::fetch_recent_news_catalyst — this just makes it
+    available to the general news aggregator (page_news_impact.py /
+    page_research.py) instead of only the momentum/supertrend Telegram path.
+    """
+    if not MASSIVE_API_KEY or not ticker:
+        return []
+    try:
+        params: Dict = {"limit": limit, "order": "desc", "sort": "published_utc",
+                         "apiKey": MASSIVE_API_KEY, "ticker": ticker}
+        r = requests.get(f"{MASSIVE_BASE_URL}/v2/reference/news", params=params, timeout=8)
+        if r.status_code != 200:
+            logger.debug(f"[NewsFetcher] Massive status {r.status_code}")
+            return []
+        results = []
+        for a in r.json().get("results", []):
+            pub_raw = a.get("published_utc", "")
+            ts      = _parse_ts(pub_raw) if pub_raw else 0.0
+
+            # `insights` carries this ticker's OWN sentiment, not the
+            # article's overall framing — a multi-ticker article can be
+            # bullish for one name and neutral for another mentioned in
+            # passing. Fall back to the keyword heuristic if this ticker
+            # has no insight entry (e.g. mentioned only in article body).
+            ticker_sentiment = None
+            for insight in a.get("insights") or []:
+                if str(insight.get("ticker", "")).upper() == ticker.upper():
+                    ticker_sentiment = insight.get("sentiment")
+                    break
+            title = a.get("title", "")
+            if ticker_sentiment == "positive":
+                sentiment, label, score, confidence = "positive", "Bullish", 0.6, "high"
+            elif ticker_sentiment == "negative":
+                sentiment, label, score, confidence = "negative", "Bearish", -0.6, "high"
+            elif ticker_sentiment == "neutral":
+                sentiment, label, score, confidence = "neutral", "Neutral", 0.0, "high"
+            else:
+                s = keyword_sentiment(title)
+                sentiment, label, score, confidence = s["sentiment"], s["label"], s["score"], s["confidence"]
+            results.append({
+                "headline":   title,
+                "url":        a.get("article_url", ""),
+                "source":     (a.get("publisher") or {}).get("name", ""),
+                "published":  datetime.fromtimestamp(ts).strftime("%b %d %H:%M") if ts else "",
+                "ts":         ts,
+                "sentiment":  sentiment,
+                "label":      label,
+                "score":      score,
+                "confidence": confidence,
+                "origin":     "massive",
+            })
+        logger.debug(f"[NewsFetcher] Massive '{ticker}': {len(results)} articles")
+        return results
+    except Exception as e:
+        logger.debug(f"[NewsFetcher] Massive '{ticker}' failed: {e}")
+        return []
+
+
+# ── Source 5: Alpha Vantage (25 req/day — use sparingly) ──────────────────────
 
 def fetch_alpha_vantage_news(
     ticker: str = "", topics: str = "", days: int = 7, limit: int = 20,
@@ -258,7 +325,7 @@ def fetch_alpha_vantage_news(
         return []
 
 
-# ── Source 5: Marketaux (100 req/day free) ────────────────────────────────────
+# ── Source 6: Marketaux (100 req/day free) ────────────────────────────────────
 
 def fetch_marketaux_news(ticker: str = "", limit: int = 10) -> List[Dict]:
     """Free 100 req/day. Register: https://www.marketaux.com/"""
@@ -323,6 +390,8 @@ def get_ticker_news(ticker: str, days: int = 7, limit: int = 30) -> List[Dict]:
     sources.extend(fetch_google_news_rss(f"{ticker} stock", limit=15))
     sources.extend(fetch_yfinance_news(ticker, limit=15))
     sources.extend(fetch_finnhub_news(ticker, days=days, limit=15))
+    if MASSIVE_API_KEY:
+        sources.extend(fetch_massive_news(ticker, limit=15))
     if MARKETAUX_KEY:
         sources.extend(fetch_marketaux_news(ticker, limit=10))
     if len(sources) < 5 and AV_KEY:
