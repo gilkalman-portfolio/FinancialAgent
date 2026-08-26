@@ -93,13 +93,19 @@ Base total = 145. Normalized 0–100, plus bonus band up to +20.
 | Short Interest | 10 | SI% of Float |
 | Institutional | 5 | |
 | Insider | 5 | SEC Form 4 |
-| Fundamentals | 10 | P/E, Revenue CAGR 5yr (EDGAR → yfinance fallback), Margin, Interest Coverage (EDGAR → D/E fallback) |
-| DCF | 15 | Margin of Safety vs intrinsic value |
-| News Sentiment | 5 | Earnings EPS surprise + LLM transcript analysis via `earnings_sentiment.py` |
+| Fundamentals | 10 | P/E, Revenue CAGR 5yr (EDGAR → yfinance fallback), Margin, Interest Coverage (EDGAR → D/E fallback) — **`_score_fundamentals()` caps at a hardcoded `min(score, 10)`, not `WEIGHTS['fundamentals']`** — see note below |
+| DCF | 15 | Margin of Safety vs intrinsic value — **`dcf_score`/`calculate_ps_valuation()` use hardcoded literal buckets (15/11/7/3/0, or 13/9/6/3/1), not `WEIGHTS['dcf']`** — see note below |
+| News Sentiment | 5 | Earnings EPS surprise + LLM transcript analysis via `earnings_sentiment.py`; capped by `min(WEIGHTS['news_sentiment'], _es["score"])` (fixed 2026-08-26 — previously uncapped, so the weight had zero effect) |
 | Squeeze Bonus | +15 | SI≥20% + vol spike + price up |
 | Google Trends | +5 | bonus |
 
 **Signals:** 75+ = STRONG BUY · 60–74 = BUY · 45–59 = WATCH · 35–44 = NEUTRAL · <35 = SKIP
+
+**⚠️ Not every `WEIGHTS` entry is actually a live lever (found 2026-08-26 while scoping the "weight tuning" backlog item):**
+- **`forecast`** — already known-inactive (see above): `forecast_score` hardcoded to 0, excluded from `core`/`core_max` entirely. Changing `WEIGHTS['forecast']` does nothing.
+- **`news_sentiment`** — was completely dead (see fix above); now a working cap.
+- **`fundamentals`** and **`dcf`** — their own component score is computed from hardcoded literals in `_score_fundamentals()` / `calculate_dcf()` / `calculate_ps_valuation()`, NOT scaled by `WEIGHTS['fundamentals']`/`WEIGHTS['dcf']`. The weight value still feeds into `core_max` (the normalization denominator), so raising it doesn't give that component more influence — it dilutes every OTHER component's relative share instead, the opposite of the intuitive effect. **Deliberately left unfixed**: `execution_engine.py::_score_fundamental_pillar()` (lines ~564-569) independently normalizes `fundamentals_score` and `dcf_score` against the SAME hardcoded maxima (`/10.0*15` and `/15.0*15`) for its own Track A/B confluence scoring, which feeds real (paper/live) trade decisions. Rescaling either component by its `WEIGHTS` value without also updating those two lines would silently corrupt the execution engine's confluence math the next time someone tunes `WEIGHTS['fundamentals']`/`WEIGHTS['dcf']` — so this needs a coordinated fix across both files, not a one-line change in `stock_scorer.py` alone. Any future weight-tuning work on these two components must update both call sites together.
+- **`momentum`** and **`insider`** — the weight only sets the cap ceiling (`min(weight, raw_points)`); the underlying point formula below the cap doesn't rescale with the weight. Not broken, just a different (still-legitimate) coupling than the fully-proportional components.
 
 ---
 
@@ -522,7 +528,7 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — src/gap_scanner.py::sc
 
 - [ ] Sector-level sub-scanning in main Scan page — currently only in Squeeze; `page_scan.py` scans all sectors uniformly
 - [ ] Fear & Greed Index widget — `page_market.py` shows VIX text description only
-- [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static
+- [ ] Weight tuning based on backtest data — `WEIGHTS` dict in `stock_scorer.py` is static. Prerequisite work done 2026-08-26: found `forecast`/`news_sentiment` were dead weights (news_sentiment now fixed) and `fundamentals`/`dcf` are disconnected from their own weight value (see Scoring Engine section above) — tune those two only together with `execution_engine.py`'s hardcoded normalization. The actual backtest still needs to run against the production `data/financial_agent.db` (its `scan_results.raw_data` already stores the full `_scores` breakdown per historical scan — no point-in-time reconstruction needed) plus live yfinance access for forward returns — neither is available in a fresh/remote clone.
 - [ ] Russell 2000 support in main Scan page — works in Catalyst Scanner + scheduler, not wired into `page_scan.py`
 - [ ] SEC 8-K item classification (1.01 bullish / 1.03 bearish) — `catalyst_scanner.py` fetches 8-K but doesn't classify by item number
 - [ ] `supertrend_triple_bull/bear` — consider routing through `signal_combiner.evaluate()` for the same cap+dedup discipline `combined_buy/sell` gets (currently DB-only, uncapped)
