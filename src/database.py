@@ -141,6 +141,27 @@ def _migrate(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE forward_signals ADD COLUMN {col} {definition}")
             logger.info(f"Migrated forward_signals: added column {col}")
 
+    # Short-horizon columns for the News-Catalyst Event-Study Measurement
+    # (signal_type='WATCH' rows, src/forward_signals.py::record_watch_signals).
+    # Additive to the existing 7/14/30d columns, not a replacement — existing
+    # BUY/SELL rows simply get NULL here like any other ALTER TABLE ADD COLUMN.
+    # Short horizons matter for this measurement specifically because a
+    # news-driven move can differ in *shape*, not just magnitude, from a
+    # technical trend signal — Tetlock (2007, JF) found short-horizon
+    # sentiment-driven moves that reverse within days, which the existing
+    # Supertrend-tuned 7/14/30d horizons alone would not catch. See CLAUDE.md.
+    for col, definition in [
+        ("price_after_1d",  "REAL"),
+        ("price_after_2d",  "REAL"),
+        ("price_after_3d",  "REAL"),
+        ("return_1d_pct",   "REAL"),
+        ("return_2d_pct",   "REAL"),
+        ("return_3d_pct",   "REAL"),
+    ]:
+        if col not in fs_cols:
+            conn.execute(f"ALTER TABLE forward_signals ADD COLUMN {col} {definition}")
+            logger.info(f"Migrated forward_signals: added column {col}")
+
     # telegram_command_state — persists getUpdates offset across restarts
     conn.execute("""
         CREATE TABLE IF NOT EXISTS telegram_command_state (

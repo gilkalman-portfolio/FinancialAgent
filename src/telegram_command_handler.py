@@ -210,8 +210,14 @@ class TelegramCommandHandler:
         last_signal = "N/A"
         try:
             with get_connection() as conn:
+                # signal_type filter: WATCH rows (News-Catalyst Event-Study
+                # Measurement, src/forward_signals.py::record_watch_signals)
+                # are written at full-scanner-hit frequency and are not trade
+                # signals — without this filter they'd dominate "last signal"
+                # here instead of the actual most recent BUY/SELL.
                 row = conn.execute(
                     "SELECT ticker, signal_type, signal_ts FROM forward_signals "
+                    "WHERE signal_type IN ('BUY', 'SELL') "
                     "ORDER BY signal_ts DESC LIMIT 1"
                 ).fetchone()
                 if row:

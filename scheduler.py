@@ -1315,6 +1315,38 @@ def run_opportunity_digest():
         logger.error(f"Opportunity digest failed: {e}")
 
 
+def _event_study_enabled(cfg: dict) -> bool:
+    """Normalize the "event_study" config value — same convention as
+    _auto_watchlist_enabled() above: bool True, string "true", or a dict with
+    enabled != False all enable it; a missing key defaults to enabled so
+    existing deployments (no "event_study" key at all yet) keep the feature
+    on rather than silently never recording WATCH signals."""
+    es_cfg = cfg.get("event_study", True)
+    return (es_cfg is True or es_cfg == "true" or
+            (isinstance(es_cfg, dict) and es_cfg.get("enabled", True)))
+
+
+def _record_watch_signals(results: list, source: str, cfg: dict):
+    """WATCH-signal data capture for the News-Catalyst Event-Study
+    Measurement (CLAUDE.md) — logs every momentum/supertrend hit to
+    forward_signals via src.forward_signals.record_watch_signals(), with or
+    without attached news. Deliberately independent of auto_watchlist_agent's
+    add/Telegram path below: a failure here must never block or affect the
+    watchlist add, and this never sends Telegram (that question — a new alert
+    type for hits-with-news — is explicitly still parked, not decided; see
+    CLAUDE.md Incident Archive 2026-08-25)."""
+    if not results or not _event_study_enabled(cfg):
+        return
+    try:
+        from src.forward_signals import record_watch_signals
+        es_cfg = cfg.get("event_study", {})
+        max_workers = int(es_cfg.get("max_workers", 10)) if isinstance(es_cfg, dict) else 10
+        stats = record_watch_signals(results, source, max_workers=max_workers)
+        _log(f"{source.capitalize()} monitor: WATCH signals {stats}")
+    except Exception as e:
+        _log(f"{source.capitalize()} monitor: WATCH signal recording failed: {e}")
+
+
 def _momentum_monitor_thread(interval_minutes: int, threshold: float, indices: list):
     """Background thread — scans indices for momentum breakouts every N min during market hours."""
     from src.momentum_scanner import scan_momentum
@@ -1343,6 +1375,11 @@ def _momentum_monitor_thread(interval_minutes: int, threshold: float, indices: l
                     lookback   = int(src_mo_cfg.get("breakout_lookback_days", 20))
                     results    = scan_momentum(tickers, min_score=threshold, breakout_lookback_days=lookback)
                     _log(f"Momentum monitor: {len(results)} hits above {threshold:.0f}")
+
+                    # Event-study data capture — EVERY hit, not just what
+                    # auto_watchlist_agent below ends up adding. See
+                    # _record_watch_signals() docstring.
+                    _record_watch_signals(results, "momentum", cfg)
 
                     if results:
                         from src.auto_watchlist_agent import run as aw_run
@@ -1396,6 +1433,11 @@ def _supertrend_universe_monitor_thread(interval_minutes: int, indices: list):
                 else:
                     results = scan_supertrend_universe(tickers)
                     _log(f"Supertrend universe monitor: {len(results)} fresh bullish flips")
+
+                    # Event-study data capture — EVERY hit, not just what
+                    # auto_watchlist_agent below ends up adding. See
+                    # _record_watch_signals() docstring.
+                    _record_watch_signals(results, "supertrend", cfg)
 
                     if results:
                         from src.auto_watchlist_agent import run as aw_run

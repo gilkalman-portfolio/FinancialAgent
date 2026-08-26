@@ -13,6 +13,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
@@ -25,7 +26,22 @@ logger = logging.getLogger(__name__)
 
 OPEN = "open"
 MATURED = "matured"
-HORIZONS_DAYS = (7, 14, 30)
+# 1/2/3d were added for the News-Catalyst Event-Study Measurement (WATCH
+# signals, see record_watch_signals() below) — short horizons a news-driven
+# move can reverse within, per Tetlock (2007, JF). Applied uniformly to every
+# signal_type here (not just WATCH) rather than special-cased, so an existing
+# open BUY/SELL row simply picks up two more (harmless, informational) data
+# points on its next update_outcomes() pass instead of the loop branching on
+# signal_type. See CLAUDE.md.
+HORIZONS_DAYS = (1, 2, 3, 7, 14, 30)
+# WATCH rows are a research/measurement observation, not a trade signal
+# (signal_type is one of BUY / SELL / WATCH — see SignalRecord below). They
+# must be excluded from every trading-relevant aggregate or "last signal"
+# lookup (see the `signal_type IN ('BUY', 'SELL')` filters in record_fill(),
+# weekly_digest(), and _llm_curation_comparison() below, plus
+# telegram_command_handler.py's /status handler) — with WATCH now written at
+# full-scanner-hit frequency (hundreds/cycle) they would otherwise dominate
+# any unfiltered "most recent forward_signals row" query.
 
 
 @dataclass
@@ -120,12 +136,20 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
 
     Targets the newest row where fill_price IS NULL and data_quality_flag != 'SUSPECT'.
     Returns True if a row was updated.
+
+    signal_type IN ('BUY','SELL') is required, not incidental: only a real
+    trade produces an IBKR fill callback, so the row this fill belongs to is
+    always a BUY/SELL row. Without this filter, a WATCH row recorded minutes
+    earlier for the same ticker (momentum/supertrend scan every 30 min, no
+    relation to order placement) could be newer than the real BUY/SELL row
+    and would wrongly receive the fill price instead of it.
     """
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT id FROM forward_signals
             WHERE ticker = ?
+              AND signal_type IN ('BUY', 'SELL')
               AND (data_quality_flag IS NULL OR data_quality_flag != 'SUSPECT')
               AND fill_price IS NULL
             ORDER BY signal_ts DESC LIMIT 1
@@ -187,16 +211,20 @@ def _fetch_price_at(ticker: str, target_dt: datetime) -> Optional[float]:
 def update_outcomes() -> dict:
     """
     Fill price_after_Xd / return_Xd_pct for signals whose horizons have matured.
-    A row is marked 'matured' once all three horizons are populated.
+    A row is marked 'matured' once every horizon in HORIZONS_DAYS is populated.
+    Applies uniformly to BUY/SELL/WATCH rows — WATCH rows need the 1/2/3d
+    columns backfilled here exactly the same way BUY/SELL rows always got
+    7/14/30d backfilled (see HORIZONS_DAYS).
     """
     now = datetime.now()
     stats = {"checked": 0, "filled": 0, "matured": 0}
 
     # ── Phase 1: read open signals into memory, then close the connection ────
+    price_cols = ", ".join(f"price_after_{h}d" for h in HORIZONS_DAYS)
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, ticker, signal_ts, entry_price, price_after_7d, "
-            "price_after_14d, price_after_30d FROM forward_signals WHERE status = ?",
+            f"SELECT id, ticker, signal_ts, entry_price, {price_cols} "
+            "FROM forward_signals WHERE status = ?",
             (OPEN,),
         ).fetchall()
 
@@ -332,7 +360,14 @@ def benchmark_excess(lookback_days: int = 90, benchmark: str = "IWM") -> dict | 
 
 
 def weekly_digest(days: int = 7) -> dict:
-    """Aggregate stats over the last `days` days of signals."""
+    """Aggregate stats over the last `days` days of BUY/SELL signals.
+
+    WATCH rows (the News-Catalyst Event-Study Measurement, see
+    record_watch_signals()) are excluded — they are a research observation,
+    not a trade signal, and the win/loss logic below has no meaningful
+    direction for them. With WATCH rows now written at full-scanner-hit
+    frequency they would otherwise dwarf and corrupt this trading digest.
+    """
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     with get_connection() as conn:
         rows = conn.execute(
@@ -340,7 +375,7 @@ def weekly_digest(days: int = 7) -> dict:
             SELECT signal_type, return_7d_pct, return_14d_pct, return_30d_pct,
                    composite_score, ticker
             FROM forward_signals
-            WHERE signal_ts >= ?
+            WHERE signal_ts >= ? AND signal_type IN ('BUY', 'SELL')
             """,
             (cutoff,),
         ).fetchall()
@@ -440,9 +475,12 @@ def _llm_curation_comparison(days: int = 7) -> dict | None:
             return None
 
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        # signal_type filter for the same reason as weekly_digest() above —
+        # WATCH rows are not trade signals and must not enter this comparison.
         rows = conn.execute(
             "SELECT ticker, signal_type, return_7d_pct FROM forward_signals "
-            "WHERE signal_ts >= ? AND return_7d_pct IS NOT NULL",
+            "WHERE signal_ts >= ? AND return_7d_pct IS NOT NULL "
+            "AND signal_type IN ('BUY', 'SELL')",
             (cutoff,),
         ).fetchall()
 
@@ -540,3 +578,173 @@ def format_digest_message(d: dict) -> str:
             lines.append("  Quant-only:  no measured signals this window")
 
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# News-Catalyst Event-Study Measurement — WATCH signal capture
+# ─────────────────────────────────────────────────────────────────────────
+# Designed in CLAUDE.md ("PLANNED: News-Catalyst Event-Study Measurement").
+# Goal: measure whether a momentum/supertrend technical hit *plus* fresh news
+# of a given sentiment direction predicts forward returns differently than a
+# hit with no news at all — a prerequisite research step before ever
+# considering a news-driven trading signal (that decision is explicitly
+# parked, see CLAUDE.md Incident Archive, 2026-08-25). This module only
+# records data; nothing here touches order_manager, execution_engine, or
+# ibkr_worker.
+#
+# CAVEAT (documented, not "fixed" — there is no fix): Polygon's per-article
+# sentiment label is a third-party black box this project does not
+# independently validate. Every direction-based result this data produces
+# should be read as "does Polygon's sentiment model predict returns", not
+# "does news sentiment predict returns" in some model-independent sense.
+# Separately, an LLM-computed sentiment label on already-published news
+# carries a theoretical look-ahead-bias risk if the underlying model's
+# training data included the article's aftermath (arXiv:2309.17322) — this is
+# unverifiable from our side and is not something this project can correct
+# for; it is only something every consumer of this data must keep in mind.
+
+def _sentiment_direction(news: Optional[dict]) -> str:
+    """Normalize a gap_scanner.fetch_recent_news_catalyst() result to a
+    dedup/study bucket: 'positive' / 'negative' / 'neutral' / 'no_news'.
+
+    'no_news' covers both "nothing published in the freshness window" (news
+    is None) and "an article was found but has no ticker-specific sentiment"
+    (fetch_recent_news_catalyst() can return sentiment=None when the ticker
+    isn't in the article's own `insights` array) — both carry zero directional
+    information for this study, so they belong in the same control bucket
+    rather than a third bucket nothing downstream is designed to interpret.
+    """
+    if not news:
+        return "no_news"
+    sentiment = (news.get("sentiment") or "").strip().lower()
+    return sentiment or "no_news"
+
+
+def _last_watch_direction(ticker: str) -> Optional[str]:
+    """Most recent WATCH signal's sentiment_direction for `ticker`, or None if
+    this ticker has never had a WATCH row recorded.
+
+    Direction is stored in the existing `ai_verdict` column — that column is
+    otherwise unpopulated for WATCH rows (signal_combiner.py never sets it for
+    BUY/SELL either), so this reuses an existing nullable TEXT column instead
+    of adding a new one beyond what CLAUDE.md's PLANNED section specified
+    (only the 1/2/3d price/return columns were called out as new).
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT ai_verdict FROM forward_signals "
+            "WHERE ticker = ? AND signal_type = 'WATCH' "
+            "ORDER BY signal_ts DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+    return row["ai_verdict"] if row else None
+
+
+def _build_watch_catalyst_summary(source: str, news: Optional[dict]) -> str:
+    """Human-readable catalyst_summary for a WATCH row — source tag plus
+    either the news title or an explicit 'control' marker, so a later read of
+    the raw table can tell a no-news control observation apart from a lookup
+    that simply hadn't been wired up."""
+    if news and news.get("title"):
+        return f"[{source}] {news['title'][:200]}"
+    return f"[{source}] no fresh news (control)"
+
+
+def record_watch_signals(hits: list, source: str, max_workers: int = 10) -> dict:
+    """
+    Log a signal_type='WATCH' forward_signals row for every momentum/
+    supertrend hit — the data-capture step of the News-Catalyst Event-Study
+    Measurement. `hits` is the raw result list from
+    src.momentum_scanner.scan_momentum() or
+    src.supertrend.scan_supertrend_universe() (every hit, not just what
+    auto_watchlist_agent ends up adding to the watchlist) — tickers with fresh
+    news attached AND tickers with none are both logged; the no-news group is
+    the control, not something to skip.
+
+    Dedup key is (ticker, sentiment_direction) — NOT (ticker, time_window) and
+    NOT (ticker, article_id). A hit repeating with the same direction (or the
+    same no-news state) is the same observation and is skipped; a direction
+    change (positive->negative, or news appearing/disappearing) is logged as a
+    new one. Logging every same-direction repeat would inflate the sample with
+    correlated, non-independent points — the same clustering failure mode
+    exit_simulation.py already hit once (see CLAUDE.md Incident Archive,
+    2026-08-05, "Exit Simulation").
+
+    News lookups are fanned out via ThreadPoolExecutor (same pattern as
+    gap_scanner.scan_premarket_gaps / catalyst_scanner.fetch_sec_8k_events).
+    Confirmed live 2026-08-25 that Massive/Polygon's Starter plan has no daily
+    quota (soft 100 req/sec guidance only, a 20-call burst test hit no rate
+    limit), so scanning the full ~270-290 hits/cycle this way is not a cost or
+    rate-limit concern (see CLAUDE.md Incident Archive). A lookup failure for
+    one ticker never blocks the others and never blocks recording that
+    ticker's row — it just falls back to the no_news bucket, matching
+    fetch_recent_news_catalyst()'s own never-raises contract.
+
+    DB writes happen sequentially after the concurrent fetch phase completes
+    (same two-phase split as watchlist_manager.py's scan_watchlist() —
+    concurrent I/O, then sequential writes — see CLAUDE.md Incident Archive,
+    2026-08-18), so there is no concurrent-write risk here despite the
+    parallel news fetch.
+
+    Returns {"checked", "recorded", "deduped", "news_found"}.
+    """
+    from src.gap_scanner import fetch_recent_news_catalyst
+
+    stats = {"checked": 0, "recorded": 0, "deduped": 0, "news_found": 0}
+    if not hits:
+        return stats
+
+    tickers = [h["ticker"] for h in hits if h.get("ticker")]
+    if not tickers:
+        return stats
+
+    def _lookup(ticker: str):
+        try:
+            return ticker, fetch_recent_news_catalyst(ticker)
+        except Exception as e:
+            logger.debug(f"[forward_signals] WATCH news lookup failed for {ticker}: {e}")
+            return ticker, None
+
+    news_by_ticker: dict = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for ticker, news in pool.map(_lookup, tickers):
+            news_by_ticker[ticker] = news
+
+    for hit in hits:
+        ticker = (hit.get("ticker") or "").upper()
+        price = hit.get("price")
+        if not ticker or not price:
+            continue
+        stats["checked"] += 1
+
+        news = news_by_ticker.get(ticker)
+        if news:
+            stats["news_found"] += 1
+        direction = _sentiment_direction(news)
+
+        try:
+            last_direction = _last_watch_direction(ticker)
+        except Exception as e:
+            # Fail-open: worst case this produces one extra correlated row
+            # (the same non-independence record_watch_signals otherwise
+            # guards against), not a silently lost observation.
+            logger.warning(f"[forward_signals] WATCH dedup check failed for {ticker}: {e}")
+            last_direction = None
+
+        if last_direction == direction:
+            stats["deduped"] += 1
+            continue
+
+        record_signal(SignalRecord(
+            ticker=ticker,
+            signal_type="WATCH",
+            entry_price=float(price),
+            composite_score=hit.get("score"),
+            catalyst_summary=_build_watch_catalyst_summary(source, news),
+            supertrend_level=hit.get("level"),
+            ai_verdict=direction,
+        ))
+        stats["recorded"] += 1
+
+    logger.info(f"[forward_signals] WATCH signals [{source}]: {stats}")
+    return stats

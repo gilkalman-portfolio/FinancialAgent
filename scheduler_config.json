@@ -57,6 +57,10 @@
   "supertrend_universe_enabled": true,
   "supertrend_universe_interval_minutes": 30,
   "supertrend_universe_indices": ["Russell 2000", "S&P 500"],
+  "event_study": {
+    "enabled": true,
+    "max_workers": 10
+  },
   "gap_scanner": {
     "enabled": true,
     "indices": ["Russell 2000", "S&P 500"],

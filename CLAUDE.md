@@ -6,7 +6,7 @@ AI-powered stock scanner & financial analysis dashboard.
 - **Stack:** Python 3.14, Streamlit 1.52.2, SQLite, yfinance, Finnhub, Alpha Vantage, SEC EDGAR
 - **LLMs:** Gemini 2.0 Flash (primary) → Groq Qwen3.6 27B (fallback, `reasoning_effort="none"`) via `src/llm_client.py`
 - **Run:** `streamlit run dashboard.py` → http://localhost:8501
-- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **661 passed, 0 failed** (2026-08-25; skips seen on some runs are environment-only — `ib_async` needs `.venv313`, one test needs live `.env` credentials). This number moves every sprint — re-run it rather than trusting this line for long. The old "5 pre-existing failures in test_pnl_digest_fixes.py" were test rot (helpers seeded with literal dates against a relative-date filter), fixed by using relative dates. **Never seed a time-filtered query with a literal date.**
+- **Tests:** `python -m pytest tests/ --ignore=tests/test_new_apis.py --ignore=tests/test_ibkr_connection.py --ignore=tests/test_ibkr_worker_once.py` → **767 passed, 0 failed** (2026-08-26; skips seen on some runs are environment-only — `ib_async` needs `.venv313`, one test needs live `.env` credentials). This number moves every sprint — re-run it rather than trusting this line for long. The old "5 pre-existing failures in test_pnl_digest_fixes.py" were test rot (helpers seeded with literal dates against a relative-date filter), fixed by using relative dates. **Never seed a time-filtered query with a literal date.**
 
 ---
 
@@ -57,7 +57,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `order_manager.py` | Wraps IBKR order calls; runs execution_engine veto checks before submission; logs every attempt to `order_log` DB table. `submit()` fetches live `portfolio_value` from `position_tracker` (falls back to $100k) and `portfolio_tickers` from `ibkr_positions` for the sector veto. SELL always closes the FULL held position (never a partial risk-sized exit). `submit_exit()` is the single funnel all software-driven exits (time stop, tiered exit, score deterioration) must go through — enforces the trading pause, `shares ≤ held − already-working`, and `order_log` written before the broker call. paper_mode=True default; live requires `IBKR_LIVE=true`. Module-level `_trading_paused` flag, toggled by Telegram `/pause`/`/resume`. |
 | `position_tracker.py` | Syncs IBKR positions (including **short/negative-share rows — never filtered**) to `ibkr_positions` every 5 min; records `daily_pnl` once per day (gated to after 09:30 ET, `INSERT OR REPLACE`). `_account_is_ready()` requires `net_liquidation > 0` before an empty position list is trusted to mean "flat" (see IBKR operational trap below). `_raise_short_alarm()` — a short in this long-only bot pauses trading (re-applied every cycle) and sends a throttled Telegram alarm; never auto-covers. `get_current_exposure()` is long-only by contract (returns 0.0 for a short). `get_portfolio_value()` / `get_daily_pnl()` try IBKR first, fall back to DB (`ORDER BY date DESC LIMIT 1`); a paper→live NLV jump >50% is discarded as a fallback delta. |
 | `signal_combiner.py` | Supertrend 1H flip → BUY/SELL alert; enforces daily cap (10), 24h dedup. BUY and SELL both have **no composite-score gate** — any monitoring-queue ticker alerts on a bullish flip; SELL is gated only on an open position (`ibkr_positions WHERE shares > 0`). `_try_claim_dedup()` does SELECT+INSERT atomically in one DB connection. |
-| `forward_signals.py` | Records every fired alert with entry price + data quality check (`data_quality_flag='SUSPECT'` for the IBKR $105 placeholder or >20% divergence from scan price). `record_fill()` cross-checks `order_log.status` and skips CANCELLED orders. Daily 18:00 job fills `price_after_{7,14,30}d`; weekly Friday 20:00 Telegram digest with win-rate metrics — **raw win rate only, not benchmarked against SPY**, see [Live-Readiness Audit](#2026-08-05--live-readiness-audit-no-measurable-alpha). |
+| `forward_signals.py` | Records every fired alert with entry price + data quality check (`data_quality_flag='SUSPECT'` for the IBKR $105 placeholder or >20% divergence from scan price). `record_fill()` cross-checks `order_log.status`, skips CANCELLED orders, and (added 2026-08-26) only ever targets `signal_type IN ('BUY','SELL')` — see below. Daily 18:00 job fills `price_after_{1,2,3,7,14,30}d`; weekly Friday 20:00 Telegram digest with win-rate metrics — **raw win rate only, not benchmarked against SPY**, see [Live-Readiness Audit](#2026-08-05--live-readiness-audit-no-measurable-alpha). `weekly_digest()`/the LLM-curation comparison both filter to `signal_type IN ('BUY','SELL')`. **`record_watch_signals()`** (added 2026-08-26) is the data-capture layer for the News-Catalyst Event-Study Measurement — logs `signal_type='WATCH'` rows for every momentum/supertrend hit (wired into `scheduler.py`'s two monitor threads), with or without attached news (`gap_scanner.fetch_recent_news_catalyst()`); dedup key is `(ticker, sentiment_direction)`, stored in the otherwise-unused `ai_verdict` column. Read-side analysis (abnormal returns vs benchmark, cross-sectional date-clustering correction, placebo/control-date test) lives in `src/catalyst_event_study.py`, run on demand like `trigger_backtest.py` — see Incident Archive, 2026-08-26. |
 | `earnings_sentiment.py` | Tier 1 = Finnhub EPS surprise history (free), Tier 2 = LLM transcript analysis (paid). Score 0–5 added to `stock_scorer.py` bonus band. EDGAR fallback when Finnhub is empty (`get_eps_yoy_growth()`, `source='edgar_eps_yoy'`). |
 | `hysteresis.py` | Central helper `passes_hysteresis(current, in_set, entry, exit)` + threshold constants (composite, SI, liquidity, watchlist score) — see [Hysteresis Bands](#hysteresis-bands-srchysteresispy) below |
 | `stock_forecaster.py` | Ensemble forecaster (ARIMA/MA/ES/MLP). Constructor accepts `point_in_time: datetime` — strictly truncates input to ≤ point-in-time to prevent backtest look-ahead bias. `MLPRegressor.early_stopping=True` uses a shuffled validation split — non-ideal for time series, intentionally unchanged (flagged in code). |
@@ -408,10 +408,14 @@ scan_results:                 ...raw_data (JSON including dcf dict)
 alert_trades:                 ticker, entry_alert_type, entry_price, entry_time, hold_days_min,
                               hold_days_max, exit_price, exit_time, exit_reason, exit_alert_type,
                               pnl_pct, status (open/closed)
-forward_signals:              ticker, signal_ts, signal_type, entry_price, composite_score,
+forward_signals:              ticker, signal_ts, signal_type (BUY/SELL/WATCH), entry_price, composite_score,
                               catalyst_summary, supertrend_level, supertrend_atr, ai_verdict,
-                              telegram_sent_at, price_after_{7,14,30}d, return_{7,14,30}d_pct,
+                              telegram_sent_at, price_after_{1,2,3,7,14,30}d, return_{1,2,3,7,14,30}d_pct,
                               status (open/matured), data_quality_flag, fill_price, fill_source
+                              — WATCH rows (added 2026-08-26, News-Catalyst Event-Study Measurement) reuse
+                              ai_verdict to hold sentiment_direction ('positive'/'negative'/'neutral'/'no_news'),
+                              not an AI verdict text; every trading-relevant reader (weekly_digest,
+                              record_fill, /status "last signal") filters to signal_type IN ('BUY','SELL')
 monitoring_queue_snapshot:    ticker, saved_at — persists accepted monitoring queue across restarts
 ibkr_positions:               ticker (PK), shares, avg_cost, unrealized_pnl, market_value, last_synced,
                               exit_tier — synced every 5 min from IBKR; shares can be negative (shorts)
@@ -452,8 +456,8 @@ Migration via `_migrate()` in `database.py` — adds columns without breaking da
 | Forward Signals Digest | Friday 20:00 | `run_forward_digest()` |
 | Opportunity Digest | Friday 20:00 | `run_opportunity_digest()` |
 | Price Monitor + Supertrend | every 5 min (thread) | `_price_monitor_thread()` |
-| Momentum Monitor | every 30 min (thread), market hours | `_momentum_monitor_thread()` — scans `momentum_indices`, auto-adds via `auto_watchlist_agent` |
-| Supertrend Universe Monitor | every 30 min (thread), market hours, **staggered 15 min after Momentum Monitor** | `_supertrend_universe_monitor_thread()` (added 2026-08-14) — scans `supertrend_universe_indices` via `scan_supertrend_universe()`, auto-adds every fresh bullish flip with no score gate (only price ≥ $5 + optional liquidity). The stagger exists because both threads do a full-universe `yf.download()` and hit `YFRateLimitError` when they land in the same instant. |
+| Momentum Monitor | every 30 min (thread), market hours | `_momentum_monitor_thread()` — scans `momentum_indices`, auto-adds via `auto_watchlist_agent`. Also calls `_record_watch_signals()` (added 2026-08-26, `"event_study"` config gate) on EVERY hit before `auto_watchlist_agent` filters run — see forward_signals.py's `record_watch_signals()` above and the 2026-08-26 Incident Archive entry. |
+| Supertrend Universe Monitor | every 30 min (thread), market hours, **staggered 15 min after Momentum Monitor** | `_supertrend_universe_monitor_thread()` (added 2026-08-14) — scans `supertrend_universe_indices` via `scan_supertrend_universe()`, auto-adds every fresh bullish flip with no score gate (only price ≥ $5 + optional liquidity). The stagger exists because both threads do a full-universe `yf.download()` and hit `YFRateLimitError` when they land in the same instant. Also calls `_record_watch_signals()` (same as Momentum Monitor above). |
 | News Catalyst Monitor | every 15 min (thread) | `catalyst_monitor_thread()` |
 
 ### Auto-Watchlist (`run_scan`)
@@ -565,85 +569,7 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — src/gap_scanner.py::sc
 - **The `combined_buy`/Supertrend trigger itself has no demonstrated statistical edge net of a realistic exit** — see [Live-Readiness Audit](#2026-08-05--live-readiness-audit-no-measurable-alpha) and [Exit Simulation](#2026-08-05--exit-simulation-supersedes-the-horizon-result-above). Coverage-expanding features (Supertrend Universe Monitor, capacity rotation) close information gaps, not this gap.
 - Multi-agent audits found and fixed a long tail of mechanical issues (connection leaks, XSS, thread-safety, cache TTL bugs, NaN handling) across 2026-05/06 — see git history for `CLAUDE.md` at those dates if a specific one needs to be traced; current-state facts from those fixes are folded into the module descriptions above rather than re-listed here.
 - `gap_scanner.py`'s Premarket Gap Alert / Opening Print Alert (added 2026-08-15) are informational-only and **unvalidated for edge** — unlike `combined_buy`/Supertrend signals they don't write to `forward_signals` (they're not a trade signal), so there's no automated win-rate tracking. Manually review actual hit quality over a few weeks of live Telegram output before ever considering wiring either into `auto_watchlist_agent` or the IBKR pipeline. (This caveat is about trading-signal usefulness, not data correctness — the premarket half's underlying data source, Massive/Polygon since 2026-08-16, is a paid, verified-accurate real-premarket-volume feed; see Incident Archive.)
-
----
-
-## PLANNED (not yet built): News-Catalyst Event-Study Measurement
-
-Designed 2026-08-25/26, not started. Goal: measure whether a momentum/supertrend
-technical hit *plus* fresh news of a given sentiment direction predicts forward
-returns differently than a hit with no news — a prerequisite research step before
-ever considering a news-driven entry trigger (see the parked IBKR item below).
-This is now scoped as a small event-study framework, in the same family as
-`trigger_backtest.py`/`exit_simulation.py`/`signal_library.py` — reuse their
-patterns, don't reinvent. A general-purpose research agent surveyed academic
-event-study literature and open-source prior art for this design; citations below.
-
-**Data capture** — reuse `forward_signals.py`'s existing `SignalRecord`/`record_signal()`/
-`update_outcomes()` API, no new table:
-- Log `signal_type="WATCH"` for every momentum/supertrend hit (both scanners, both
-  with and without attached news — the no-news group is the control, not noise to discard).
-- `catalyst_summary` carries the news title + Polygon sentiment label when present
-  (via `gap_scanner.fetch_recent_news_catalyst()`, already built and live).
-- **Dedup key: (ticker, sentiment_direction)**, not (ticker, time_window) and not
-  (ticker, article_id). A hit repeating with the *same* sentiment direction (or the
-  same no-news state) is the same observation, not a new one — logging every
-  same-direction repeat inflates the sample with correlated, non-independent points
-  (this is exactly the clustering bug `exit_simulation.py` already got burned by
-  once — see its Incident Archive entry). A **direction change** (positive→negative,
-  or news appearing/disappearing) is a genuinely new observation.
-
-**Horizons** — extend `forward_signals` with new nullable columns via `database.py`'s
-existing auto-migration (`price_after_1d`/`2d`/`3d`, `return_1d_pct`/`2d_pct`/`3d_pct`),
-additive to the existing 7/14/30d columns, not a replacement — harmless to existing
-BUY/SELL rows (NULL for those). Research justification: Chan (2003, JFE) and Tetlock
-(2007, JF) both find news-driven price action can differ in *shape*, not just
-magnitude, from a technical trend signal at short horizons — Tetlock specifically
-found short-horizon sentiment-driven moves that *reverse* within days. Reusing the
-Supertrend-tuned 7/14/30d horizons alone would not have caught this. PEAD (the
-closest academic analogue) uses 60-90 trading days, but its drift is concentrated
-around the *next* related event, not a smooth decay — informative context, not a
-directly applicable horizon for a general (non-earnings) catalyst.
-
-**Methodology upgrades this design needs before the numbers can be trusted** (do not
-skip — each one is a documented way this exact kind of measurement goes wrong):
-1. **Abnormal returns, not raw returns** — measure return *relative to* SPY or sector
-   benchmark, reusing the same "excess vs benchmark" pattern already implemented in
-   `trigger_backtest.py`/the 2026-08-05 Live-Readiness Audit, not a new calculation.
-2. **Cross-sectional clustering correction** — when multiple tickers share a catalyst
-   date (earnings season, a market-wide event), their abnormal returns are correlated
-   and naive per-observation t-tests overstate significance (Kolari & Pynnonen 2010).
-   `trigger_backtest.py` already solves an analogous same-ticker-overlapping-holding-period
-   version of this ("always use the clustered figure, not the naive t-stat") — extend
-   that pattern to cross-ticker date-clustering here, don't build a separate solution.
-3. **Placebo/control-date test** — compare the measured effect against random
-   non-catalyst dates (excluding a buffer window around real events) to confirm the
-   signal isn't just generic market drift that would show up on any day. Pattern
-   observed in `matthias-wyss/iti-8k-analysis` (GitHub) — not currently done anywhere
-   in this codebase, worth adding here first.
-4. **Documented, uncorrectable caveat**: Polygon's per-article sentiment label is a
-   third-party black box we don't validate independently — treat "does sentiment
-   predict returns" results as "does *Polygon's sentiment model* predict returns."
-   Separately, LLM-computed sentiment on published news carries a theoretical
-   look-ahead-bias risk if the underlying model's training data includes the
-   article's aftermath (arXiv:2309.17322) — unverifiable from our side, document
-   and move on, don't try to solve it.
-
-**Explicitly out of scope for this pass**: tickers with news but no technical hit
-(that's the bigger, separately-parked full-universe listener question); wiring
-anything to `order_manager`/IBKR (see the parked item immediately below — this
-measurement is the prerequisite *research*, not the trading decision itself).
-
-**Build with tests + live verification**, matching this session's practice
-throughout: unit tests for the dedup/horizon logic, plus at least one live check
-against real Massive/Polygon data and a live `forward_signals` row before calling
-it done.
-
-**Separately parked, still not decided — do not build without a separate explicit
-go-ahead**: whether a validated version of this signal should ever drive an actual
-`order_manager`/IBKR BUY decision. Needs its own conversation once (if) this
-measurement shows a real, clustering-corrected, benchmark-relative effect — not
-before. See the fuller parked-item writeup in the Incident Archive, 2026-08-25.
+- **News-Catalyst Event-Study Measurement** (`record_watch_signals()` in `forward_signals.py`, analysis in `src/catalyst_event_study.py`, built 2026-08-26) has **essentially zero accumulated WATCH-row history as of ship date** — it was just wired into the two monitor threads, so `direction_report()`/`placebo_test()` will report `n` too small to trust for real weeks. This is expected, not a bug: the whole point of building the data-capture layer first is to let real history accumulate before drawing any conclusion, the same sequencing `weight_tuning_backtest.py` and `trigger_backtest.py` both followed. Do not treat an early low-n run as a null result.
 
 ---
 
@@ -661,6 +587,7 @@ before. See the fuller parked-item writeup in the Incident Archive, 2026-08-25.
 - [x] Plausibility clamp added to `scan_opening_prints()` 2026-08-25 (rejects `move_pct`/`dollar_volume` outliers) — root cause of the underlying corruption is still unconfirmed; if it recurs a third time with the clamp in place, revisit the cross-ticker-contamination theory in the Incident Archive
 - [x] Deployed the 2026-08-25 `edgar_fcf._FACTS_CACHE` LRU-cap + `gc.collect()` fixes to the live `scheduler.py` process same day (restart via watchdog crash-recovery) — 30-min post-restart sampling showed memory oscillating flat, not climbing. Full-day validation (across the 08:30/15:00 main scan's DCF/EDGAR-heavy path) still outstanding; see Incident Archive
 - [ ] Full-universe catalyst coverage still has a ~23h blind spot (09:37 ET → next day 08:50 ET) — only two one-shot snapshots + 30-min technical-only sweeps exist; the 2026-08-25 news enrichment fix adds "why" to existing hits but doesn't add more frequent full-universe checks. Options discussed: more frequent premarket snapshots, or extending real-time News Catalyst Monitor beyond portfolio+watchlist (rejected as too costly at full-universe scale). See Incident Archive
+- [ ] Run `src.catalyst_event_study.direction_report()` / `placebo_test()` once a few weeks of real WATCH-row history has accumulated (built 2026-08-26, see Incident Archive) — same "needs real history first" sequencing as `weight_tuning_backtest.py`. Also still open from the 2026-08-25 entry: whether a hit-with-fresh-news that doesn't clear `auto_watchlist_agent`'s filters should ever get its own Telegram alert type — explicitly not decided, do not build without re-confirming.
 
 ---
 
@@ -859,3 +786,29 @@ Reconstruction sanity check passed clean: 5,116 rows, 100.0% within 1pt of the s
 **No action taken on `WEIGHTS`** — correct call given the above: the one test designed to answer the reweighting question doesn't have enough out-of-sample data yet to trust either way. This first run is also consistent with, not contradicted by, the 2026-08-05 Live-Readiness Audit's "no measurable composite edge" finding — no component or candidate reweighting produced the kind of broad, robust signal that would justify overriding that earlier result. The isolated negative MA-trend signal at 14d is worth remembering but not acting on with only 5 months of history behind it.
 
 **Re-run this in a few months**, once `scan_results` has accumulated enough additional months to push the walk-forward test past 2 out-of-sample months — that's the actual blocker, not a data quality or tool problem.
+
+### 2026-08-26 — News-Catalyst Event-Study Measurement: built the data-capture + analysis layer designed 2026-08-25/26
+
+Implemented the design from the (now-removed) "PLANNED: News-Catalyst Event-Study Measurement" section, in the same family as `trigger_backtest.py`/`run_exit_simulation.py`/`signal_library.py`/`weight_tuning_backtest.py` — a standalone research tool, not a scheduled job, that measures whether a momentum/supertrend technical hit plus fresh news of a given sentiment direction predicts forward returns differently than a hit with no news at all. Nothing in this feature touches `order_manager.py`, `execution_engine.py`, or `ibkr_worker.py` — the parked "should this ever drive a real BUY" question from the 2026-08-25 entry is unchanged and still not decided.
+
+**Data capture** (`src/forward_signals.py::record_watch_signals()`): logs a `signal_type='WATCH'` row for every momentum/supertrend hit — not just the small subset `auto_watchlist_agent` ends up adding (0-10/cycle out of ~270-290 hits) — via `gap_scanner.fetch_recent_news_catalyst()`, fanned out over a `ThreadPoolExecutor` the same way `scan_premarket_gaps()` does. Wired into `scheduler.py`'s `_momentum_monitor_thread()`/`_supertrend_universe_monitor_thread()` through a new `_record_watch_signals()` helper, gated by a new `"event_study"` config block (`scheduler_config.json`, `enabled`/`max_workers`, defaults to enabled — same "missing key defaults to on" convention as `_auto_watchlist_enabled()`) and completely independent of the `auto_watchlist_agent` call next to it: a failure here is logged and swallowed, never blocks the watchlist add or its Telegram. No new Telegram traffic of any kind — this is DB-only, matching the fact that the "should hits-with-news get their own alert type" question from 2026-08-25 was explicitly left unresolved.
+
+**Dedup key is `(ticker, sentiment_direction)`**, exactly as designed — not time-window, not article ID. `_sentiment_direction()` normalizes a `fetch_recent_news_catalyst()` result to `'positive'`/`'negative'`/`'neutral'`/`'no_news'` (the last covers both "nothing published" and "an article was found but has no ticker-specific sentiment" — both carry zero directional information). The direction is stored in the existing `ai_verdict` column — repurposed rather than adding a new one, since that column was never populated for BUY/SELL rows either (`signal_combiner.py` never sets it) — and `_last_watch_direction()` checks it before every insert; a same-direction repeat (including a repeated no-news state) is skipped, a direction change inserts a new row. Live-verified end to end (see below).
+
+**Horizons**: `price_after_1d/2d/3d` + `return_1d_pct/2d_pct/3d_pct` added to `forward_signals` via `database.py`'s existing `_migrate()` pattern, additive to 7/14/30d. `HORIZONS_DAYS` in `forward_signals.py` is now `(1,2,3,7,14,30)` applied uniformly (not signal-type-branched) — an existing open BUY/SELL row simply picks up two more harmless backfilled columns on its next `update_outcomes()` pass instead of the loop special-casing WATCH rows. Confirmed live: the same production `update_outcomes()` run that matured the live-verification row (below) also backfilled 1d/2d/3d on 112 of 115 real open rows in the production DB with no errors.
+
+**A pre-existing-code correctness issue this surfaced and fixed**: four call sites read `forward_signals` with no `signal_type` filter, implicitly assuming every row was BUY/SELL. With WATCH now written at full-scanner-hit frequency (hundreds/cycle vs. BUY/SELL's much lower rate) those would have been dominated/corrupted by WATCH rows: `weekly_digest()`'s main query (would have polluted `avg_return_7d_pct`/win-rate with non-trade observations, treating a WATCH row's `return>0` as a "win" the same as a BUY), `_llm_curation_comparison()`'s query (same class of bug), `record_fill()`'s "most recent row for this ticker" lookup (an IBKR fill callback could have attached a real fill price to a WATCH row instead of the BUY/SELL row it belongs to, if a WATCH row for the same ticker was recorded moments later — a real risk given the monitor threads run every 30 min), and `telegram_command_handler.py`'s `/status` "last signal" line (would almost always show a WATCH row instead of the actual last trade). All four now filter to `signal_type IN ('BUY','SELL')`. `tests/test_catalyst_event_study_watch_signals.py` pins all four with a real WATCH row present.
+
+**Methodology upgrades** (`src/catalyst_event_study.py`, new module, run on demand — not wired into the scheduler):
+1. **Abnormal returns vs benchmark** — `compute_abnormal_returns()` measures every WATCH row's return relative to a benchmark (default SPY, parameterizable) over the identical window, the same discipline `forward_signals.benchmark_excess()`/`trigger_backtest.py` already use.
+2. **Cross-sectional clustering correction** — `_date_clustered_stats()` averages same-calendar-date observations (across DIFFERENT tickers) into one point per date before computing a t-stat, extending `trigger_backtest.clustered_stats()`'s exact technique (bucket into a coarser group, run the t-stat on bucket means) from its own time-axis (same-ticker overlapping holds, bucketed by month) to the cross-sectional axis (same-date across tickers, bucketed by day) — per Kolari & Pynnonen (2010). `direction_report()` reports both the naive and clustered figures per (direction, horizon); always read the clustered one.
+3. **Placebo/control-date test** — `placebo_test()` compares real WATCH-event returns against random non-catalyst dates for the SAME tickers (excluding a buffer window around every real event), via a Welch's two-sample t-test. Pattern observed in `matthias-wyss/iti-8k-analysis` (GitHub), not previously done anywhere in this codebase.
+4. **Documented, uncorrectable caveat** — both `record_watch_signals()`'s and `catalyst_event_study.py`'s docstrings state explicitly: Polygon's per-article sentiment is a third-party black box this project doesn't independently validate (read every result as "does Polygon's sentiment model predict returns", not sentiment in general), and an LLM-computed sentiment label on already-published news carries a theoretical look-ahead-bias risk if the underlying model's training data included the article's aftermath (arXiv:2309.17322) — unverifiable from our side, not something to fix.
+
+**Live verification** (2026-08-26, real `MASSIVE_API_KEY`, real `data/financial_agent.db`): `fetch_recent_news_catalyst("AAPL")` returned a real live article ("SoundHound's Powerful No-Screen AI Opportunity Faces a High-Stakes Fight", sentiment `neutral`, `published_utc` 2026-08-25 21:15 UTC). `record_watch_signals()` wrote a real row (`catalyst_summary="[momentum] SoundHound's..."`, `ai_verdict="neutral"`, all six horizon columns correctly NULL pre-maturity). A second call with the identical hit correctly deduped (`recorded=0, deduped=1`, row count stayed at 1). Backdating the row's `signal_ts` by 2 days and running the real (unmocked) `update_outcomes()` correctly populated `price_after_1d`/`return_1d_pct` and `price_after_2d`/`return_2d_pct` from real yfinance history in the same call. The test row was deleted afterward (id logged, verified `AAPL` WATCH-row count back to 0) so the live event-study dataset isn't seeded with a synthetic observation whose timestamp didn't come from an actual scheduler cycle — the migration and `weekly_digest()`/`update_outcomes()` side effects on the real 115 pre-existing open rows were left in place, since those are the intended, correct, production behavior of the shipped feature, not test artifacts.
+
+**Tests**: `tests/test_catalyst_event_study_watch_signals.py` (32 tests — migration, `_sentiment_direction()`, dedup on direction repeat/change/no-news-control, robustness on missing price/lookup failure, the four downstream signal_type-filter fixes, `update_outcomes()` short-horizon backfill) + `tests/test_catalyst_event_study.py` (18 tests — `_t_stat`/`_welch_t` primitives, cross-sectional clustering including a naive-vs-clustered significance-inflation demonstration, abnormal-return computation, `direction_report()`/`format_direction_report()`, `placebo_test()` including seed-reproducibility and missing-price-data handling) + `tests/test_event_study_scheduler_wiring.py` (10 tests — `_event_study_enabled()` config normalization, `_record_watch_signals()` call-through/disabled/empty/exception-swallowed). Full suite: 767 passed, 0 failed (up from 711 immediately before this session's changes — the 661 recorded a day earlier in this file predates several since-merged sessions' work, see the "Two phone/cloud sessions" entry above).
+
+**Design decisions made that weren't fully pinned down in the design doc**: (1) direction stored in the existing `ai_verdict` column rather than a new one — the design only specified new 1/2/3d price/return columns, not where the dedup key's direction value itself should live; (2) `HORIZONS_DAYS` extended globally to `(1,2,3,7,14,30)` for every signal type rather than branching WATCH vs BUY/SELL, since an existing open BUY/SELL row picking up two extra real, accurate backfilled columns is harmless (explicitly permitted by the design's "harmless to existing BUY/SELL rows" language) and keeps `update_outcomes()` simple; (3) single configurable benchmark (default SPY) rather than a per-ticker sector benchmark, matching what `trigger_backtest.py`/`benchmark_excess()` actually do today (the design said "SPY or sector benchmark", not a mandate for true sector-level granularity, and a ticker→sector→ETF mapping doesn't exist anywhere in this codebase yet); (4) the four unfiltered `forward_signals` queries (`weekly_digest`, `_llm_curation_comparison`, `record_fill`, `/status` last-signal) were not called out in the design doc at all — found by auditing every `forward_signals` read site for an implicit "every row is BUY/SELL" assumption once WATCH rows were about to start arriving at high frequency, and fixed as a required correctness fix rather than a design choice.
+
+**Known limitation, by design, not a bug**: `direction_report()`/`placebo_test()` have essentially zero real history to work with immediately after this ships (see Known Limitations) — the data-capture layer needs real scheduler cycles to accumulate observations before either function's output means anything, the same sequencing `weight_tuning_backtest.py` followed (built and unit-tested one day, run against real data days-to-weeks later). See Open Backlog.
