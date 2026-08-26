@@ -197,6 +197,97 @@ def _alert_sent_recently(ticker: str, alert_type: str, hours: int = 24) -> bool:
     return any(a["alert_type"] == alert_type and a["sent_at"] > cutoff for a in alerts)
 
 
+# ── Data-quality clamp visibility + tripwire ───────────────────────────────
+# Added 2026-08-26 per an external design review (IdeaDistill panel) of the
+# 2026-08-25 opening-print plausibility clamp: a clamped (discarded)
+# implausible reading was previously only a DEBUG log line, invisible unless
+# someone went looking — "silent clamping converts a data quality problem
+# into an invisible pipeline degradation." Every clamp now gets a real
+# Telegram notification, and _CLAMP_HALT_THRESHOLD clamps within
+# _CLAMP_HALT_WINDOW_DAYS halts the job (skips scanning, sends one escalation
+# notice, does not auto-resume) until a human investigates — this only stops
+# the informational alert job, never trading. See CLAUDE.md Incident Archive.
+_CLAMP_ALERT_TYPE = "data_quality_clamp"
+_CLAMP_HALT_THRESHOLD = 3
+_CLAMP_HALT_WINDOW_DAYS = 7
+
+
+def _recent_clamp_count(job_name: str, days: int = _CLAMP_HALT_WINDOW_DAYS) -> int:
+    """COUNT of data_quality_clamp alerts for `job_name` within the last
+    `days` days, across ALL tickers — watchlist_get_alerts() is per-ticker or
+    capped at a small default limit, neither fits a cross-ticker rolling
+    count, so this queries directly."""
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM watchlist_alerts "
+            "WHERE alert_type = ? AND sent_at >= ? AND message LIKE ?",
+            (_CLAMP_ALERT_TYPE, cutoff, f"[{job_name}]%"),
+        ).fetchone()
+    return row["n"] if row else 0
+
+
+def _job_halted_on_clamps(job_name: str, cfg: dict) -> bool:
+    """True if `job_name` should skip its scan this run because it has hit
+    _CLAMP_HALT_THRESHOLD data-quality clamps within the rolling window.
+    `gap_scanner.<job_name>_halt_override: true` in scheduler_config.json is
+    the manual escape hatch — investigate first, don't just flip this."""
+    gap_cfg = cfg.get("gap_scanner", {})
+    if gap_cfg.get(f"{job_name}_halt_override", False):
+        return False
+    count = _recent_clamp_count(job_name)
+    if count < _CLAMP_HALT_THRESHOLD:
+        return False
+    if not _alert_sent_recently("SYSTEM", f"{job_name}_halted", hours=24):
+        try:
+            sent = TelegramNotifier().send_message(
+                f"🛑 *{job_name}* halted — {count} data-quality clamp(s) in the last "
+                f"{_CLAMP_HALT_WINDOW_DAYS} days (threshold: {_CLAMP_HALT_THRESHOLD}).\n"
+                f"The underlying data corruption is still unexplained (see CLAUDE.md "
+                f"Incident Archive) — investigate before re-enabling. To resume without "
+                f"a fix, set gap_scanner.{job_name}_halt_override=true in "
+                f"scheduler_config.json."
+            )
+            if sent:
+                watchlist_save_alert("SYSTEM", f"{job_name}_halted",
+                                     f"{count} clamps in {_CLAMP_HALT_WINDOW_DAYS}d")
+        except Exception as e:
+            logger.warning(f"{job_name}: halt notice Telegram failed: {e}")
+    return True
+
+
+def _report_clamps(clamped: list, job_name: str) -> None:
+    """Writes a data_quality_clamp DB row per clamped reading and sends one
+    Telegram notice listing all of them for this run — every clamp is now
+    human-visible, never just a log line. Never raises: a notification
+    failure here must not take down the scan job that already produced real
+    results."""
+    if not clamped:
+        return
+    try:
+        lines = [
+            f"• {c['ticker']}: move={c['move_pct']:+.1f}% $vol=${c['dollar_volume']:,.0f}"
+            for c in clamped
+        ]
+        msg = (
+            f"⚠️ *{job_name}*: {len(clamped)} implausible reading(s) discarded "
+            f"(not sent as alerts — treated as corrupted data, see CLAUDE.md):\n"
+            + "\n".join(lines)
+        )
+        sent = TelegramNotifier().send_message(msg)
+        if not sent:
+            logger.warning(f"{job_name}: clamp notice Telegram failed, DB rows still written")
+        for c in clamped:
+            watchlist_save_alert(
+                c["ticker"], _CLAMP_ALERT_TYPE,
+                f"[{job_name}] move={c['move_pct']:+.1f}% $vol=${c['dollar_volume']:,.0f}",
+                score=c["move_pct"], price=c.get("price"),
+            )
+    except Exception as e:
+        logger.warning(f"{job_name}: clamp reporting failed: {e}")
+
+
 # ── Auto-watchlist re-entry cooldown ──────────────────────────────────────────
 # When an auto-added ticker is auto-exited, we write an `auto_exit_cooldown`
 # alert row. For AUTO_EXIT_COOLDOWN_DAYS after that, the ticker may NOT be
@@ -1052,6 +1143,9 @@ def run_opening_print_alert():
         return
     try:
         init_db()
+        if _job_halted_on_clamps("opening_print_alert", cfg):
+            logger.warning("run_opening_print_alert: halted — see the Telegram notice / CLAUDE.md")
+            return
         from src.gap_scanner import scan_opening_prints
         from src.index_loader import get_index
 
@@ -1067,11 +1161,12 @@ def run_opening_print_alert():
             return
 
         logger.info(f"Opening print alert: scanning {len(tickers)} tickers")
-        results = scan_opening_prints(
+        results, clamped = scan_opening_prints(
             tickers,
             pct_move_min=gap_cfg.get("opening_pct_min", 10.0),
             min_dollar_volume=gap_cfg.get("min_opening_dollar_volume", 500000),
         )
+        _report_clamps(clamped, "opening_print_alert")
 
         price_floor = gap_cfg.get("price_floor", 5.0)
         candidates = [

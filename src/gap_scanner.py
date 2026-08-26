@@ -369,7 +369,7 @@ def scan_opening_prints(
     tickers: list,
     pct_move_min: float = 10.0,
     min_dollar_volume: float = 500_000.0,
-) -> List[Dict]:
+) -> Tuple[List[Dict], List[Dict]]:
     """
     Batch-scan comparing each ticker's regular-session open print (09:30 ET)
     to its price a few minutes later, backed by a dollar-volume filter.
@@ -378,9 +378,18 @@ def scan_opening_prints(
     have caught NMAX on 2026-08-14: it had zero premarket signal but moved
     heavily (245K/69K/67K/57K shares in its first four 1-min bars) within
     minutes of the bell.
+
+    Returns (results, clamped) — `clamped` is every reading discarded by the
+    plausibility ceiling (see _MAX_PLAUSIBLE_MOVE_PCT/_MAX_PLAUSIBLE_DOLLAR_VOLUME
+    above), not just logged. Added 2026-08-26 per an external design review
+    (IdeaDistill panel): a silently-discarded clamp is invisible pipeline
+    degradation, not a solved problem — the caller (scheduler.py) surfaces
+    every clamp to a human channel and halts the job if clamps recur, rather
+    than clamping forever without anyone noticing the underlying corruption
+    is still happening. See CLAUDE.md Incident Archive.
     """
     if not tickers:
-        return []
+        return [], []
 
     try:
         # Regular session only, no prepost. Cheap by construction — called a
@@ -392,15 +401,16 @@ def scan_opening_prints(
         )
     except Exception as e:
         logger.error(f"Opening print scan: download failed: {e}")
-        return []
+        return [], []
     if raw is None or raw.empty:
         logger.warning("Opening print scan: empty data returned")
-        return []
+        return [], []
 
     opens, closes, volumes = _split_fields(raw, tickers, ("Open", "Close", "Volume"))
     today_et = datetime.now(_ET).date()
 
     results = []
+    clamped = []
     for ticker in tickers:
         if ticker not in closes.columns:
             continue
@@ -440,6 +450,13 @@ def scan_opening_prints(
                     f"(move={move_pct:.1f}%, $vol={dollar_volume:,.0f}) — treating as "
                     f"corrupted intraday data, not a real move"
                 )
+                clamped.append({
+                    "ticker": ticker,
+                    "move_pct": round(move_pct, 2),
+                    "dollar_volume": round(dollar_volume, 2),
+                    "open_print": round(open_print, 4),
+                    "price": round(latest_close, 4),
+                })
                 continue
 
             if move_pct >= pct_move_min and dollar_volume >= min_dollar_volume:
@@ -458,5 +475,6 @@ def scan_opening_prints(
     logger.info(
         f"Opening print scan complete: {len(results)}/{len(tickers)} qualify "
         f"(move>={pct_move_min}% | $vol>={min_dollar_volume:,.0f})"
+        + (f" | {len(clamped)} implausible reading(s) clamped" if clamped else "")
     )
-    return results
+    return results, clamped

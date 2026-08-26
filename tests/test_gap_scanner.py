@@ -281,9 +281,10 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"NMAX": [245016, 69234, 67817, 57442]},
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["NMAX"], pct_move_min=10.0, min_dollar_volume=500_000)
+            results, clamped = scan_opening_prints(["NMAX"], pct_move_min=10.0, min_dollar_volume=500_000)
 
         assert len(results) == 1
+        assert clamped == []
         r = results[0]
         assert r["open_print"] == pytest.approx(9.895)
         assert r["move_pct"] == pytest.approx((11.11 - 9.895) / 9.895 * 100, abs=0.1)
@@ -298,8 +299,9 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"FLAT": [100_000] * 4},
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["FLAT"], pct_move_min=10.0, min_dollar_volume=1000)
+            results, clamped = scan_opening_prints(["FLAT"], pct_move_min=10.0, min_dollar_volume=1000)
         assert results == []
+        assert clamped == []
 
     def test_below_dollar_volume_excluded(self):
         from src.gap_scanner import scan_opening_prints
@@ -310,8 +312,9 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"THIN": [5, 5, 5, 5]},              # but tiny volume
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["THIN"], pct_move_min=10.0, min_dollar_volume=500_000)
+            results, clamped = scan_opening_prints(["THIN"], pct_move_min=10.0, min_dollar_volume=500_000)
         assert results == []
+        assert clamped == []
 
     def test_ignores_stale_multi_day_bar_from_yfinance(self):
         """Regression: yfinance's period="1d" occasionally hands back more than
@@ -335,9 +338,10 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"MU": [500_000] * len(full_idx)},
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["MU"], pct_move_min=1.0, min_dollar_volume=1000)
+            results, clamped = scan_opening_prints(["MU"], pct_move_min=1.0, min_dollar_volume=1000)
 
         assert len(results) == 1
+        assert clamped == []
         r = results[0]
         assert r["open_print"] == pytest.approx(116.245)  # today's real open, not the stale 20.0
         assert r["move_pct"] == pytest.approx((126.34 - 116.245) / 116.245 * 100, abs=0.1)
@@ -358,8 +362,10 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"PDFS": [50_000] * 4},
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["PDFS"], pct_move_min=10.0, min_dollar_volume=1000)
+            results, clamped = scan_opening_prints(["PDFS"], pct_move_min=10.0, min_dollar_volume=1000)
         assert results == []
+        assert len(clamped) == 1
+        assert clamped[0]["ticker"] == "PDFS"
 
     def test_implausible_dollar_volume_discarded(self):
         """Regression, 2026-08-25: HUBB fired a live alert on 2026-08-21 with
@@ -375,8 +381,10 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"HUBB": [1_200_000] * 4},   # ~$2.2B dollar_volume at these prices
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["HUBB"], pct_move_min=5.0, min_dollar_volume=1000)
+            results, clamped = scan_opening_prints(["HUBB"], pct_move_min=5.0, min_dollar_volume=1000)
         assert results == []
+        assert len(clamped) == 1
+        assert clamped[0]["ticker"] == "HUBB"
 
     def test_legitimate_large_move_under_ceiling_still_included(self):
         """The clamp must not swallow a real, large-but-plausible move --
@@ -389,19 +397,20 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"REAL": [100_000] * 4},             # modest, realistic $ volume
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["REAL"], pct_move_min=10.0, min_dollar_volume=1000)
+            results, clamped = scan_opening_prints(["REAL"], pct_move_min=10.0, min_dollar_volume=1000)
         assert len(results) == 1
+        assert clamped == []
         assert results[0]["ticker"] == "REAL"
         assert results[0]["move_pct"] == pytest.approx(65.0, abs=0.1)
 
     def test_download_failure_returns_empty(self):
         from src.gap_scanner import scan_opening_prints
         with patch("src.gap_scanner._download_with_retry", side_effect=RuntimeError("network down")):
-            assert scan_opening_prints(["AAPL"]) == []
+            assert scan_opening_prints(["AAPL"]) == ([], [])
 
     def test_empty_tickers_returns_empty(self):
         from src.gap_scanner import scan_opening_prints
-        assert scan_opening_prints([]) == []
+        assert scan_opening_prints([]) == ([], [])
 
     def test_sorted_by_move_desc(self):
         from src.gap_scanner import scan_opening_prints
@@ -415,8 +424,31 @@ class TestScanOpeningPrints:
             volumes_by_ticker={"SMALL": [100_000] * 3, "BIG": [100_000] * 3},
         )
         with patch("src.gap_scanner._download_with_retry", return_value=frame):
-            results = scan_opening_prints(["SMALL", "BIG"], pct_move_min=5.0, min_dollar_volume=10_000)
+            results, clamped = scan_opening_prints(["SMALL", "BIG"], pct_move_min=5.0, min_dollar_volume=10_000)
         assert [r["ticker"] for r in results] == ["BIG", "SMALL"]
+        assert clamped == []
+
+
+class TestScanOpeningPrintsClampReporting:
+    """New 2026-08-26 test coverage for the plausibility-clamp fields in the
+    clamped list itself (the visibility/tripwire behavior built on top of
+    this is covered separately against scheduler._report_clamps /
+    _job_halted_on_clamps)."""
+
+    def test_clamped_entry_carries_move_and_dollar_volume(self):
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            closes_by_ticker={"PDFS": [19.04, 30.0, 38.0, 44.95]},
+            volumes_by_ticker={"PDFS": [50_000] * 4},
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame):
+            _, clamped = scan_opening_prints(["PDFS"], pct_move_min=10.0, min_dollar_volume=1000)
+        assert len(clamped) == 1
+        c = clamped[0]
+        assert c["move_pct"] > 80.0
+        assert "dollar_volume" in c and "open_print" in c and "price" in c
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -602,7 +634,7 @@ class TestOpeningPrintAlertDbBehavior:
              patch.object(scheduler, "_in_opening_print_window", return_value=True), \
              patch.object(scheduler, "init_db"), \
              patch("src.index_loader.get_index", return_value=pd.DataFrame({"ticker": ["NMAX"]})), \
-             patch("src.gap_scanner.scan_opening_prints", return_value=fake_results), \
+             patch("src.gap_scanner.scan_opening_prints", return_value=(fake_results, [])), \
              patch("src.catalyst_scanner.fetch_sec_8k_events", return_value=[]), \
              patch.object(scheduler, "TelegramNotifier") as tg:
             tg.return_value.send_message.return_value = True
@@ -622,7 +654,7 @@ class TestOpeningPrintAlertDbBehavior:
              patch.object(scheduler, "_in_opening_print_window", return_value=True), \
              patch.object(scheduler, "init_db"), \
              patch("src.index_loader.get_index", return_value=pd.DataFrame({"ticker": ["NMAX"]})), \
-             patch("src.gap_scanner.scan_opening_prints", return_value=fake_results), \
+             patch("src.gap_scanner.scan_opening_prints", return_value=(fake_results, [])), \
              patch("src.catalyst_scanner.fetch_sec_8k_events", return_value=[]), \
              patch.object(scheduler, "TelegramNotifier") as tg:
             tg.return_value.send_message.return_value = False
@@ -644,7 +676,7 @@ class TestOpeningPrintAlertDbBehavior:
              patch.object(scheduler, "_in_opening_print_window", return_value=True), \
              patch.object(scheduler, "init_db"), \
              patch("src.index_loader.get_index", return_value=pd.DataFrame({"ticker": ["NMAX"]})), \
-             patch("src.gap_scanner.scan_opening_prints", return_value=fake_results), \
+             patch("src.gap_scanner.scan_opening_prints", return_value=(fake_results, [])), \
              patch.object(scheduler, "TelegramNotifier") as tg:
             scheduler.run_opening_print_alert()
 
@@ -663,7 +695,7 @@ class TestOpeningPrintAlertDbBehavior:
              patch.object(scheduler, "_in_opening_print_window", return_value=True), \
              patch.object(scheduler, "init_db"), \
              patch("src.index_loader.get_index", return_value=pd.DataFrame({"ticker": ["PENNY", "GOODCO"]})), \
-             patch("src.gap_scanner.scan_opening_prints", return_value=fake_results), \
+             patch("src.gap_scanner.scan_opening_prints", return_value=(fake_results, [])), \
              patch("src.catalyst_scanner.fetch_sec_8k_events", return_value=[]), \
              patch.object(scheduler, "TelegramNotifier") as tg:
             tg.return_value.send_message.return_value = True
@@ -673,6 +705,131 @@ class TestOpeningPrintAlertDbBehavior:
         assert not any(a["alert_type"] == "opening_print_alert" for a in alerts)
         alerts = watchlist_get_alerts(ticker="GOODCO", limit=10)
         assert any(a["alert_type"] == "opening_print_alert" for a in alerts)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Data-quality clamp visibility + tripwire — added 2026-08-26 per an
+# external design review (IdeaDistill panel) of the plausibility clamp:
+# silent clamping is invisible pipeline degradation, so every clamp must be
+# human-visible, and repeated clamps must halt the job. See CLAUDE.md
+# Incident Archive.
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestReportClamps:
+    def test_no_clamps_sends_nothing(self):
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            scheduler._report_clamps([], "opening_print_alert")
+        tg.assert_not_called()
+
+    def test_clamp_writes_db_row_and_sends_telegram(self, temp_db):
+        from src.database import watchlist_get_alerts
+        clamped = [{"ticker": "PDFS", "move_pct": 136.1, "dollar_volume": 5_000_000,
+                    "open_print": 19.04, "price": 44.95}]
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            tg.return_value.send_message.return_value = True
+            scheduler._report_clamps(clamped, "opening_print_alert")
+
+        assert tg.return_value.send_message.called
+        alerts = watchlist_get_alerts(ticker="PDFS", limit=10)
+        assert any(a["alert_type"] == "data_quality_clamp" for a in alerts)
+
+    def test_telegram_failure_does_not_prevent_db_write(self, temp_db):
+        """A notification failure must not silently lose the clamp record --
+        the DB row is the durable record even if nobody got pinged this time."""
+        from src.database import watchlist_get_alerts
+        clamped = [{"ticker": "HUBB", "move_pct": 12.0, "dollar_volume": 66_000_000_000,
+                    "open_print": 423.0, "price": 473.38}]
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            tg.return_value.send_message.return_value = False
+            scheduler._report_clamps(clamped, "opening_print_alert")
+
+        alerts = watchlist_get_alerts(ticker="HUBB", limit=10)
+        assert any(a["alert_type"] == "data_quality_clamp" for a in alerts)
+
+    def test_reporting_never_raises_on_bad_input(self):
+        """A malformed clamp dict must not take down the caller's scan job."""
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            tg.return_value.send_message.side_effect = RuntimeError("boom")
+            scheduler._report_clamps(
+                [{"ticker": "X", "move_pct": 1.0, "dollar_volume": 1.0}],
+                "opening_print_alert",
+            )  # must not raise
+
+
+class TestClampHaltTripwire:
+    def _write_clamps(self, n: int, job_name: str = "opening_print_alert"):
+        from src.database import watchlist_save_alert
+        for i in range(n):
+            watchlist_save_alert(
+                f"T{i}", scheduler._CLAMP_ALERT_TYPE,
+                f"[{job_name}] move=+999.0% $vol=$9,999,999",
+            )
+
+    def test_below_threshold_does_not_halt(self, temp_db):
+        self._write_clamps(2)
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            halted = scheduler._job_halted_on_clamps("opening_print_alert", {})
+        assert halted is False
+        tg.assert_not_called()
+
+    def test_at_threshold_halts_and_notifies(self, temp_db):
+        self._write_clamps(3)
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            tg.return_value.send_message.return_value = True
+            halted = scheduler._job_halted_on_clamps("opening_print_alert", {})
+        assert halted is True
+        assert tg.return_value.send_message.called
+
+    def test_halt_notice_only_sent_once_per_day(self, temp_db):
+        self._write_clamps(3)
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            tg.return_value.send_message.return_value = True
+            scheduler._job_halted_on_clamps("opening_print_alert", {})
+            scheduler._job_halted_on_clamps("opening_print_alert", {})
+        assert tg.return_value.send_message.call_count == 1
+
+    def test_override_config_bypasses_halt(self, temp_db):
+        self._write_clamps(5)
+        cfg = {"gap_scanner": {"opening_print_alert_halt_override": True}}
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            halted = scheduler._job_halted_on_clamps("opening_print_alert", cfg)
+        assert halted is False
+        tg.assert_not_called()
+
+    def test_clamps_older_than_window_do_not_count(self, temp_db):
+        import sqlite3
+        from src.database import get_connection
+        with get_connection() as conn:
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO watchlist_alerts (ticker, alert_type, message, sent_at) "
+                    "VALUES (?, ?, ?, datetime('now', '-10 days'))",
+                    (f"OLD{i}", scheduler._CLAMP_ALERT_TYPE, "[opening_print_alert] stale"),
+                )
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            halted = scheduler._job_halted_on_clamps("opening_print_alert", {})
+        assert halted is False
+        tg.assert_not_called()
+
+    def test_different_job_names_counted_separately(self, temp_db):
+        """A clamp streak on premarket_gap_alert must not halt opening_print_alert."""
+        self._write_clamps(3, job_name="premarket_gap_alert")
+        with patch.object(scheduler, "TelegramNotifier") as tg:
+            halted = scheduler._job_halted_on_clamps("opening_print_alert", {})
+        assert halted is False
+        tg.assert_not_called()
+
+    def test_run_opening_print_alert_skips_scan_when_halted(self, temp_db):
+        self._write_clamps(3)
+        with patch.object(scheduler, "load_config", return_value=_base_cfg()), \
+             patch.object(scheduler, "_is_trading_day", return_value=True), \
+             patch.object(scheduler, "_in_opening_print_window", return_value=True), \
+             patch.object(scheduler, "init_db"), \
+             patch("src.gap_scanner.scan_opening_prints") as scan, \
+             patch.object(scheduler, "TelegramNotifier") as tg:
+            tg.return_value.send_message.return_value = True
+            scheduler.run_opening_print_alert()
+        scan.assert_not_called()
 
 
 if __name__ == "__main__":
