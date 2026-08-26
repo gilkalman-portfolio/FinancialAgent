@@ -29,7 +29,7 @@ from src.news_fetcher import get_ticker_news, get_market_news, catalyst_score
 
 # ── Config defaults (overridden by scheduler_config.json) ─────────────────────
 DEFAULT_INTERVAL_MINUTES   = 15
-DEFAULT_CATALYST_THRESHOLD = 3    # catalyst_score ≥ this → send to LLM
+DEFAULT_CATALYST_THRESHOLD = 2    # catalyst_score ≥ this → send to LLM
 DEFAULT_MAX_LLM_PER_CYCLE  = 3    # max LLM calls per interval (cost control)
 DEFAULT_SCOPE              = "portfolio+watchlist"  # or "portfolio", "watchlist"
 DEFAULT_MAX_ARTICLE_AGE_MIN = 45  # skip articles published >45 min ago — avoids

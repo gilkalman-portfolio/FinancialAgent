@@ -1603,7 +1603,7 @@ def _main_body():
     # News Catalyst Monitor
     catalyst_enabled   = cfg.get("news_catalyst_enabled", True)
     catalyst_interval  = cfg.get("news_catalyst_interval_minutes", 15)
-    catalyst_threshold = cfg.get("news_catalyst_threshold", 3)
+    catalyst_threshold = cfg.get("news_catalyst_threshold", 2)
     catalyst_max_llm   = cfg.get("news_catalyst_max_llm_per_cycle", 3)
     catalyst_scope     = cfg.get("news_catalyst_scope", "portfolio+watchlist")
     catalyst_max_age   = cfg.get("news_catalyst_max_article_age_minutes", 45)

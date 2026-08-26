@@ -26,7 +26,7 @@ _DEFAULT_CFG = {
     "price_alert_interval_minutes":    5,
     "news_catalyst_enabled":           True,
     "news_catalyst_interval_minutes":  15,
-    "news_catalyst_threshold":         3,
+    "news_catalyst_threshold":         2,
     "news_catalyst_max_llm_per_cycle": 3,
     "news_catalyst_scope":             "portfolio+watchlist",
     "sectors":                         [],
@@ -165,7 +165,7 @@ def render():
         catalyst_threshold = st.slider(
             "Catalyst threshold",
             min_value=2, max_value=8,
-            value=cfg.get("news_catalyst_threshold", 3),
+            value=cfg.get("news_catalyst_threshold", 2),
             help="Higher = fewer but stronger alerts. 3=moderate, 6=major catalysts only"
         )
         catalyst_max_llm = st.slider(
@@ -321,7 +321,7 @@ def render():
                     from src.news_catalyst_monitor import run_catalyst_check
                     _cfg = json.loads(_CFG_FILE.read_text()) if _CFG_FILE.exists() else {}
                     alerts = run_catalyst_check(
-                        catalyst_threshold = _cfg.get("news_catalyst_threshold", 3),
+                        catalyst_threshold = _cfg.get("news_catalyst_threshold", 2),
                         max_llm_calls      = _cfg.get("news_catalyst_max_llm_per_cycle", 3),
                         scope              = _cfg.get("news_catalyst_scope", "portfolio+watchlist"),
                         force              = True,

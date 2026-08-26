@@ -12,7 +12,7 @@
   "price_alert_interval_minutes": 5,
   "news_catalyst_enabled": true,
   "news_catalyst_interval_minutes": 15,
-  "news_catalyst_threshold": 3,
+  "news_catalyst_threshold": 2,
   "news_catalyst_max_llm_per_cycle": 3,
   "news_catalyst_scope": "portfolio+watchlist",
   "sectors": [
