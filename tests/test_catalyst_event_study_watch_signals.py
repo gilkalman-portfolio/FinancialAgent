@@ -161,6 +161,45 @@ class TestRecordWatchSignalsDedup:
         conn.close()
         assert n == 2
 
+    def test_new_publisher_same_direction_creates_a_new_row(self, temp_db):
+        """IdeaDistill design review, 2026-08-26: a same-direction article
+        from a genuinely different outlet is a materially new observation
+        (independent corroboration), not a repeat of the same story -- pure
+        direction-based dedup was too coarse."""
+        from src.forward_signals import record_watch_signals
+        hits = [{"ticker": "FOO", "price": 12.5, "score": 80}]
+        with patch("src.gap_scanner.fetch_recent_news_catalyst",
+                   return_value=_news("positive", title="Wire A story")):
+            record_watch_signals(hits, "momentum")
+        with patch("src.gap_scanner.fetch_recent_news_catalyst",
+                   return_value={**_news("positive", title="Wire B story"),
+                                 "publisher_name": "Different Wire"}):
+            stats2 = record_watch_signals(hits, "momentum")
+        assert stats2["recorded"] == 1
+        assert stats2["deduped"] == 0
+
+        import sqlite3
+        conn = sqlite3.connect(str(temp_db))
+        n = conn.execute(
+            "SELECT COUNT(*) FROM forward_signals WHERE ticker='FOO' AND signal_type='WATCH'"
+        ).fetchone()[0]
+        conn.close()
+        assert n == 2
+
+    def test_same_publisher_same_direction_repeat_is_still_deduped(self, temp_db):
+        """The publisher check adds a reason to insert, it doesn't remove the
+        existing one -- the same outlet repeating the same direction is still
+        the same observation."""
+        from src.forward_signals import record_watch_signals
+        hits = [{"ticker": "FOO", "price": 12.5, "score": 80}]
+        with patch("src.gap_scanner.fetch_recent_news_catalyst",
+                   return_value=_news("positive", title="Wire A story v1")):
+            record_watch_signals(hits, "momentum")
+        with patch("src.gap_scanner.fetch_recent_news_catalyst",
+                   return_value=_news("positive", title="Wire A story v2, updated")):
+            stats2 = record_watch_signals(hits, "momentum")
+        assert stats2 == {"checked": 1, "recorded": 0, "deduped": 1, "news_found": 1}
+
     def test_news_appearing_after_no_news_is_a_new_observation(self, temp_db):
         from src.forward_signals import record_watch_signals
         hits = [{"ticker": "FOO", "price": 12.5, "score": 80}]
@@ -214,6 +253,54 @@ class TestControlGroupLogged:
         assert row["ai_verdict"] == "no_news"
         assert row["entry_price"] == 20.0
         assert "no fresh news" in row["catalyst_summary"]
+
+
+class TestNewsProvenanceColumns:
+    """news_publisher / news_age_minutes, added 2026-08-26 per the IdeaDistill
+    design review: the 30-min scan cadence otherwise can't distinguish "this
+    hit is a fresh reaction to news that just broke" from "sentiment has been
+    sitting here a while" (pure persistence)."""
+
+    def test_publisher_and_age_recorded_for_a_fresh_article(self, temp_db):
+        from src.forward_signals import record_watch_signals
+        hits = [{"ticker": "FOO", "price": 12.5}]
+        with patch("src.gap_scanner.fetch_recent_news_catalyst",
+                   return_value=_news("positive", minutes_ago=7)):
+            record_watch_signals(hits, "momentum")
+
+        import sqlite3
+        conn = sqlite3.connect(str(temp_db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT news_publisher, news_age_minutes FROM forward_signals WHERE ticker='FOO'"
+        ).fetchone()
+        conn.close()
+        assert row["news_publisher"] == "Example Wire"
+        assert 6.0 <= row["news_age_minutes"] <= 8.0
+
+    def test_no_news_hit_has_null_publisher_and_age(self, temp_db):
+        from src.forward_signals import record_watch_signals
+        hits = [{"ticker": "CTRL", "price": 20.0}]
+        with patch("src.gap_scanner.fetch_recent_news_catalyst", return_value=None):
+            record_watch_signals(hits, "supertrend")
+
+        import sqlite3
+        conn = sqlite3.connect(str(temp_db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT news_publisher, news_age_minutes FROM forward_signals WHERE ticker='CTRL'"
+        ).fetchone()
+        conn.close()
+        assert row["news_publisher"] is None
+        assert row["news_age_minutes"] is None
+
+    def test_new_columns_exist_after_migration(self, temp_db):
+        import sqlite3
+        conn = sqlite3.connect(str(temp_db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(forward_signals)")}
+        conn.close()
+        assert "news_publisher" in cols
+        assert "news_age_minutes" in cols
 
 
 # ── record_watch_signals: robustness ─────────────────────────────────────────

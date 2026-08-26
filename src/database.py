@@ -162,6 +162,23 @@ def _migrate(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE forward_signals ADD COLUMN {col} {definition}")
             logger.info(f"Migrated forward_signals: added column {col}")
 
+    # WATCH-row provenance for the News-Catalyst Event-Study Measurement,
+    # added after an external design review (IdeaDistill panel, 2026-08-26)
+    # found the 30-min scan cadence means a WATCH row can't tell "news landed
+    # right before this hit" (catalyst reaction) apart from "sentiment has
+    # been sitting there a while" (pure persistence) without recording how
+    # old the article was at capture time. news_publisher additionally lets
+    # record_watch_signals() dedup on source change, not just direction change
+    # (same panel: a same-direction article from a genuinely new outlet is a
+    # new observation, not a repeat of the same story). See CLAUDE.md.
+    for col, definition in [
+        ("news_publisher",    "TEXT"),
+        ("news_age_minutes",  "REAL"),
+    ]:
+        if col not in fs_cols:
+            conn.execute(f"ALTER TABLE forward_signals ADD COLUMN {col} {definition}")
+            logger.info(f"Migrated forward_signals: added column {col}")
+
     # telegram_command_state — persists getUpdates offset across restarts
     conn.execute("""
         CREATE TABLE IF NOT EXISTS telegram_command_state (

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import yfinance as yf
@@ -55,6 +55,8 @@ class SignalRecord:
     supertrend_atr: Optional[float] = None
     ai_verdict: Optional[str] = None
     telegram_sent_at: Optional[str] = None
+    news_publisher: Optional[str] = None
+    news_age_minutes: Optional[float] = None
 
 
 def _check_entry_price_plausibility(ticker: str, entry_price: float) -> str | None:
@@ -104,8 +106,9 @@ def record_signal(rec: SignalRecord) -> int:
             INSERT INTO forward_signals (
                 ticker, signal_ts, signal_type, entry_price, composite_score,
                 catalyst_summary, supertrend_level, supertrend_atr, ai_verdict,
-                telegram_sent_at, status, data_quality_flag
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                telegram_sent_at, status, data_quality_flag,
+                news_publisher, news_age_minutes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rec.ticker,
@@ -120,6 +123,8 @@ def record_signal(rec: SignalRecord) -> int:
                 rec.telegram_sent_at or now,
                 OPEN,
                 quality_flag,
+                rec.news_publisher,
+                rec.news_age_minutes,
             ),
         )
         signal_id = cur.lastrowid
@@ -620,24 +625,50 @@ def _sentiment_direction(news: Optional[dict]) -> str:
     return sentiment or "no_news"
 
 
-def _last_watch_direction(ticker: str) -> Optional[str]:
-    """Most recent WATCH signal's sentiment_direction for `ticker`, or None if
-    this ticker has never had a WATCH row recorded.
+def _last_watch_signature(ticker: str) -> Optional[tuple]:
+    """Most recent WATCH signal's (sentiment_direction, news_publisher) for
+    `ticker`, or None if this ticker has never had a WATCH row recorded.
 
-    Direction is stored in the existing `ai_verdict` column — that column is
-    otherwise unpopulated for WATCH rows (signal_combiner.py never sets it for
-    BUY/SELL either), so this reuses an existing nullable TEXT column instead
-    of adding a new one beyond what CLAUDE.md's PLANNED section specified
-    (only the 1/2/3d price/return columns were called out as new).
+    Direction is stored in the existing `ai_verdict` column (otherwise
+    unpopulated for WATCH rows — signal_combiner.py never sets it for BUY/SELL
+    either). Publisher is compared too, not just direction, per an external
+    design review (IdeaDistill panel, 2026-08-26): a same-direction article
+    from a genuinely different outlet is a materially new observation (a
+    second, independent source corroborating/repeating a story), not a repeat
+    of the same one — pure direction-based dedup was too coarse. Two no-news
+    hits in a row both have publisher=None, which compares equal, so the
+    control group is unaffected.
     """
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT ai_verdict FROM forward_signals "
+            "SELECT ai_verdict, news_publisher FROM forward_signals "
             "WHERE ticker = ? AND signal_type = 'WATCH' "
             "ORDER BY signal_ts DESC LIMIT 1",
             (ticker,),
         ).fetchone()
-    return row["ai_verdict"] if row else None
+    if not row:
+        return None
+    return (row["ai_verdict"], row["news_publisher"])
+
+
+def _news_age_minutes(news: Optional[dict]) -> Optional[float]:
+    """Minutes between the article's published_utc and now, or None when
+    there's no news. Lets a later analysis distinguish "this hit was caught
+    within one scan cycle of the article publishing" (genuine catalyst
+    reaction) from "sentiment has just been sitting there a while" (pure
+    persistence) — the 30-min momentum/supertrend cadence means a WATCH row
+    on its own can't tell those apart otherwise. Per the IdeaDistill design
+    review, 2026-08-26 — rename the hypothesis or add this distinction; this
+    is the distinction."""
+    if not news or not news.get("published_utc"):
+        return None
+    try:
+        published = news["published_utc"]
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - published).total_seconds() / 60.0)
+    except Exception:
+        return None
 
 
 def _build_watch_catalyst_summary(source: str, news: Optional[dict]) -> str:
@@ -661,14 +692,26 @@ def record_watch_signals(hits: list, source: str, max_workers: int = 10) -> dict
     news attached AND tickers with none are both logged; the no-news group is
     the control, not something to skip.
 
-    Dedup key is (ticker, sentiment_direction) — NOT (ticker, time_window) and
-    NOT (ticker, article_id). A hit repeating with the same direction (or the
-    same no-news state) is the same observation and is skipped; a direction
-    change (positive->negative, or news appearing/disappearing) is logged as a
-    new one. Logging every same-direction repeat would inflate the sample with
-    correlated, non-independent points — the same clustering failure mode
-    exit_simulation.py already hit once (see CLAUDE.md Incident Archive,
-    2026-08-05, "Exit Simulation").
+    Dedup key is (ticker, sentiment_direction, news_publisher) — NOT
+    (ticker, time_window) and NOT (ticker, article_id). A hit repeating with
+    the same direction AND the same publisher (or the same no-news state) is
+    the same observation and is skipped; a direction change, a genuinely new
+    publisher on the same direction, or news appearing/disappearing is logged
+    as a new one. Logging every same-direction repeat would inflate the
+    sample with correlated, non-independent points — the same clustering
+    failure mode exit_simulation.py already hit once (see CLAUDE.md Incident
+    Archive, 2026-08-05, "Exit Simulation"). The publisher condition was added
+    2026-08-26 after an external design review found pure direction-based
+    dedup too coarse: a second, independent outlet corroborating the same
+    direction is materially new information, not a repeat of one story.
+
+    Each recorded row also carries news_publisher and news_age_minutes (time
+    between the article's published_utc and the moment this hit was caught) —
+    added for the same review: the 30-min scan cadence means a WATCH row
+    can't otherwise distinguish "this is a fresh reaction to news that just
+    broke" from "sentiment has been sitting here a while" (pure persistence).
+    Downstream analysis in catalyst_event_study.py should treat these as
+    different populations, not pool them.
 
     News lookups are fanned out via ThreadPoolExecutor (same pattern as
     gap_scanner.scan_premarket_gaps / catalyst_scanner.fetch_sec_8k_events).
@@ -721,17 +764,18 @@ def record_watch_signals(hits: list, source: str, max_workers: int = 10) -> dict
         if news:
             stats["news_found"] += 1
         direction = _sentiment_direction(news)
+        publisher = (news.get("publisher_name") or None) if news else None
 
         try:
-            last_direction = _last_watch_direction(ticker)
+            last_signature = _last_watch_signature(ticker)
         except Exception as e:
             # Fail-open: worst case this produces one extra correlated row
             # (the same non-independence record_watch_signals otherwise
             # guards against), not a silently lost observation.
             logger.warning(f"[forward_signals] WATCH dedup check failed for {ticker}: {e}")
-            last_direction = None
+            last_signature = None
 
-        if last_direction == direction:
+        if last_signature == (direction, publisher):
             stats["deduped"] += 1
             continue
 
@@ -743,6 +787,8 @@ def record_watch_signals(hits: list, source: str, max_workers: int = 10) -> dict
             catalyst_summary=_build_watch_catalyst_summary(source, news),
             supertrend_level=hit.get("level"),
             ai_verdict=direction,
+            news_publisher=publisher,
+            news_age_minutes=_news_age_minutes(news),
         ))
         stats["recorded"] += 1
 

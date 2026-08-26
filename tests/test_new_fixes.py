@@ -90,7 +90,9 @@ def _db(tmp_path, monkeypatch):
             status              TEXT NOT NULL DEFAULT 'open',
             data_quality_flag   TEXT,
             fill_price          REAL,
-            fill_source         TEXT
+            fill_source         TEXT,
+            news_publisher      TEXT,
+            news_age_minutes    REAL
         );
     """)
     conn.close()
