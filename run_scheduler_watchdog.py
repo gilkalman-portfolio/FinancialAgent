@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import urllib.request
 import urllib.parse
 import os
@@ -30,6 +31,18 @@ PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 SCRIPT = ROOT / "scheduler.py"
 RESTART_DELAY = 15  # seconds between restarts
 STOP_SENTINEL = ROOT / "stop_scheduler.flag"
+
+# The scheduler child's stderr used to go to DEVNULL — an uncaught exception
+# (5 same-day returncode=1 crashes on 2026-08-26) left no traceback anywhere:
+# scheduler.py's own loguru sink can't record an exception that kills the
+# process before any handler runs. See CLAUDE.md Incident Archive 2026-08-26.
+# Deliberately a raw file redirect, not piping the child's stderr back
+# through loguru — that's a separate, bigger change. Rotation thresholds
+# mirror scheduler.py's loguru sink (rotation="10 MB", retention=5) for
+# consistency between the two log families.
+STDERR_LOG          = LOG_DIR / "scheduler_stderr.log"
+STDERR_MAX_BYTES    = 10 * 1024 * 1024  # 10 MB
+STDERR_BACKUP_COUNT = 5
 
 
 def _load_env() -> dict:
@@ -68,6 +81,42 @@ def _send_telegram(message: str) -> None:
         logging.warning(f"Telegram notify failed: {e}")
 
 
+def _open_stderr_log(attempt: int):
+    """Opens (rotating first if the previous file is already oversized) the
+    file the scheduler child process's stderr is redirected into for this
+    launch attempt, with a header line so multiple attempts landing in the
+    same file stay distinguishable.
+
+    Deliberately a raw file object, not a logging.Handler — subprocess needs
+    a real OS file descriptor for stderr=, which a Handler doesn't expose.
+    RotatingFileHandler is reused only for its rollover/rename logic
+    (doRollover() works standalone, with no dependency on going through
+    emit()).
+
+    Never raises — falls back to subprocess.DEVNULL (the old behavior) if
+    the log file can't be opened, e.g. a permissions or disk-space issue,
+    but always logs that fallback first so the degradation is visible in
+    watchdog.log instead of silently reproducing the original gap.
+    """
+    try:
+        roller = RotatingFileHandler(STDERR_LOG, maxBytes=STDERR_MAX_BYTES,
+                                      backupCount=STDERR_BACKUP_COUNT, encoding="utf-8")
+        try:
+            if STDERR_LOG.exists() and STDERR_LOG.stat().st_size >= STDERR_MAX_BYTES:
+                roller.doRollover()
+        finally:
+            roller.close()
+
+        f = open(STDERR_LOG, "a", encoding="utf-8")
+        f.write(f"\n{'=' * 80}\n{time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"Launching scheduler (attempt #{attempt})\n{'=' * 80}\n")
+        f.flush()
+        return f
+    except Exception as e:
+        logging.error(f"Failed to open stderr log ({STDERR_LOG}) — stderr will be discarded: {e}")
+        return subprocess.DEVNULL
+
+
 def main():
     logging.info("=== Watchdog started ===")
     _send_telegram("🟢 <b>Scheduler</b> — watchdog started, launching scheduler...")
@@ -79,19 +128,23 @@ def main():
         if attempt > 1:
             _send_telegram(f"🔄 <b>Scheduler</b> — restarting (attempt #{attempt})")
 
+        stderr_log = _open_stderr_log(attempt)
         try:
             proc = subprocess.run(
                 [PYTHON, str(SCRIPT)],
                 cwd=str(ROOT),
                 creationflags=CREATE_NO_WINDOW,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_log,
             )
         except Exception as e:
             logging.error(f"Failed to launch scheduler: {e}")
             _send_telegram(f"🔴 <b>Scheduler</b> — failed to launch: {e}")
             time.sleep(RESTART_DELAY)
             continue
+        finally:
+            if stderr_log is not subprocess.DEVNULL:
+                stderr_log.close()
 
         # Check stop sentinel first.
         if STOP_SENTINEL.exists():
