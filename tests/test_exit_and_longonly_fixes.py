@@ -55,6 +55,7 @@ def _test_db(monkeypatch, tmp_path):
             ticker TEXT NOT NULL, action TEXT NOT NULL, shares INTEGER NOT NULL,
             entry_price REAL, stop_price REAL, target_price REAL,
             status TEXT NOT NULL, fill_price REAL, ibkr_order_id INTEGER,
+            stop_order_id INTEGER,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, notes TEXT
         );
         CREATE TABLE watchlist_alerts (
@@ -95,13 +96,14 @@ def stub_engine():
 
 
 def _insert_order(get_conn, ticker, action, shares, status, created_at,
-                  ibkr_order_id=None, notes=None):
+                  ibkr_order_id=None, notes=None, stop_order_id=None):
     with get_conn() as c:
         c.execute(
             "INSERT INTO order_log (ticker, action, shares, entry_price, stop_price, "
-            "target_price, status, ibkr_order_id, created_at, updated_at, notes) "
-            "VALUES (?,?,?,10.0,9.0,12.0,?,?,?,?,?)",
-            (ticker, action, shares, status, ibkr_order_id, created_at, created_at, notes),
+            "target_price, status, ibkr_order_id, created_at, updated_at, notes, stop_order_id) "
+            "VALUES (?,?,?,10.0,9.0,12.0,?,?,?,?,?,?)",
+            (ticker, action, shares, status, ibkr_order_id, created_at, created_at, notes,
+             stop_order_id),
         )
 
 
@@ -431,3 +433,124 @@ class TestExitLayerRunsOnEmptyQueue:
         tiers.assert_called_once()
         tstop.assert_called_once()
         deter.assert_called_once()
+
+
+# ── 6. modify_stop_order() targets the recorded STP leg, not an ambiguous
+#      ticker scan (order_log.stop_order_id) ────────────────────────────────
+
+def _fake_hourly_bars(n=15, start=100.0, step=1.0, rng=1.0):
+    import numpy as np
+    import pandas as pd
+    idx = pd.date_range("2026-01-01", periods=n, freq="h")
+    close = start + np.arange(n) * step
+    return pd.DataFrame(
+        {"Open": close - 0.1, "High": close + rng, "Low": close - rng,
+         "Close": close, "Volume": np.ones(n) * 1_000_000},
+        index=idx,
+    )
+
+
+class TestStopOrderIdLookup:
+    """order_log.stop_order_id resolves modify_stop_order()'s scan ambiguity
+    — see CLAUDE.md backlog ('modify_stop_order() matches the first STP SELL
+    by ticker ... needs a stop_order_id column in order_log')."""
+
+    def test_no_row_returns_none(self, _test_db):
+        from src import ibkr_worker
+        assert ibkr_worker._lookup_stop_order_id("GHOST") is None
+
+    def test_returns_recorded_stop_order_id(self, _test_db):
+        from src import ibkr_worker
+        _insert_order(_test_db, "SENEA", "BUY", 70, "SUBMITTED",
+                      datetime.now().isoformat(), ibkr_order_id=10, stop_order_id=555)
+        assert ibkr_worker._lookup_stop_order_id("SENEA") == 555
+
+    def test_picks_most_recent_buy(self, _test_db):
+        from src import ibkr_worker
+        older = (datetime.now() - timedelta(days=5)).isoformat()
+        newer = (datetime.now() - timedelta(minutes=1)).isoformat()
+        _insert_order(_test_db, "AAA", "BUY", 50, "FILLED", older,
+                      ibkr_order_id=1, stop_order_id=111)
+        _insert_order(_test_db, "AAA", "BUY", 60, "SUBMITTED", newer,
+                      ibkr_order_id=2, stop_order_id=222)
+        assert ibkr_worker._lookup_stop_order_id("AAA") == 222
+
+    def test_ignores_rows_with_no_recorded_stop_order_id(self, _test_db):
+        """A position opened before this fix shipped — order_log has no
+        stop_order_id, so the caller must fall back to modify_stop_order()'s
+        original ticker/type/action scan (i.e. get back None here)."""
+        from src import ibkr_worker
+        _insert_order(_test_db, "OLD", "BUY", 40, "FILLED",
+                      datetime.now().isoformat(), ibkr_order_id=9)
+        assert ibkr_worker._lookup_stop_order_id("OLD") is None
+
+
+class TestTieredExitUsesLookedUpStopOrderId:
+    def test_t1_breakeven_stop_targets_the_recorded_stp_leg(self, _test_db):
+        """T1's stop-to-breakeven modify must target the exact STP leg
+        recorded at bracket-submission time, not an ambiguous ticker scan."""
+        from src import ibkr_worker
+
+        _insert_position(_test_db, "SENEA", 100, 10.0, 800.0)  # well past +7%
+        _insert_order(_test_db, "SENEA", "BUY", 100, "FILLED",
+                      (datetime.now() - timedelta(days=2)).isoformat(),
+                      ibkr_order_id=1, stop_order_id=555)
+
+        conn = MagicMock()
+        conn.place_limit_order.return_value = 5003
+
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._check_tiered_exits(conn)
+
+        conn.modify_stop_order.assert_called_once()
+        args, kwargs = conn.modify_stop_order.call_args
+        assert args[0] == "SENEA"
+        assert kwargs.get("stop_order_id") == 555
+
+
+class TestTrailingStopUsesLookedUpStopOrderId:
+    def test_trailing_stop_raise_targets_the_recorded_stp_leg(self, _test_db):
+        from src import ibkr_worker
+
+        _insert_order(_test_db, "SENEA", "BUY", 100, "FILLED",
+                      (datetime.now() - timedelta(days=2)).isoformat(),
+                      ibkr_order_id=1, stop_order_id=777)
+
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [{
+            "order_id": 42, "ticker": "SENEA", "action": "SELL",
+            "order_type": "STP", "aux_price": 90.0, "lmt_price": None,
+            "qty": 100, "status": "Submitted",
+        }]
+        conn.historical_bars.return_value = _fake_hourly_bars()
+
+        ibkr_worker._last_trailing_stop_ts = None
+        ibkr_worker._update_trailing_stops(conn)
+
+        conn.modify_stop_order.assert_called_once()
+        args, kwargs = conn.modify_stop_order.call_args
+        assert args[0] == "SENEA"
+        assert kwargs.get("stop_order_id") == 777
+
+    def test_falls_back_to_none_when_order_log_has_no_record(self, _test_db):
+        """No order_log row at all for this ticker (e.g. a position opened
+        before this fix) — must still call modify_stop_order, just without a
+        stop_order_id, so it falls back to the original ticker/type/action
+        scan instead of silently skipping the raise."""
+        from src import ibkr_worker
+
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [{
+            "order_id": 42, "ticker": "NOROW", "action": "SELL",
+            "order_type": "STP", "aux_price": 90.0, "lmt_price": None,
+            "qty": 100, "status": "Submitted",
+        }]
+        conn.historical_bars.return_value = _fake_hourly_bars()
+
+        ibkr_worker._last_trailing_stop_ts = None
+        ibkr_worker._update_trailing_stops(conn)
+
+        conn.modify_stop_order.assert_called_once()
+        args, kwargs = conn.modify_stop_order.call_args
+        assert args[0] == "NOROW"
+        assert kwargs.get("stop_order_id") is None

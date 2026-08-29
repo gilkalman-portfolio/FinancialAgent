@@ -17,6 +17,7 @@ def render():
         get_market_news, get_market_mood, get_upcoming_macro,
         get_earnings_calendar, get_market_indices, get_futures, get_vix_level,
     )
+    from src.market_regime import get_fear_greed_index
 
     st.markdown("### Market Overview")
 
@@ -25,16 +26,17 @@ def render():
     now_ts      = _time.time()
     if now_ts - refresh_ts > 300 or refresh_key not in st.session_state:
         with st.spinner("Loading market data..."):
-            indices  = get_market_indices()
-            futures  = get_futures()
-            articles = get_market_news(40)
-            mood     = get_market_mood(articles)
-            macro    = get_upcoming_macro(7)
-            earnings = get_earnings_calendar(7)
-        st.session_state[refresh_key]         = (indices, futures, articles, mood, macro, earnings)
+            indices    = get_market_indices()
+            futures    = get_futures()
+            articles   = get_market_news(40)
+            mood       = get_market_mood(articles)
+            macro      = get_upcoming_macro(7)
+            earnings   = get_earnings_calendar(7)
+            fear_greed = get_fear_greed_index()
+        st.session_state[refresh_key]         = (indices, futures, articles, mood, macro, earnings, fear_greed)
         st.session_state["market_refresh_ts"] = now_ts
     else:
-        indices, futures, articles, mood, macro, earnings = st.session_state[refresh_key]
+        indices, futures, articles, mood, macro, earnings, fear_greed = st.session_state[refresh_key]
 
     col_r, col_t = st.columns([1, 4])
     with col_r:
@@ -75,6 +77,38 @@ def render():
             """),
             unsafe_allow_html=True,
         )
+
+    # ── Fear & Greed Index (composite approximation) ────────────────────────────
+    if fear_greed.get("score") is not None:
+        fg = fear_greed
+        st.markdown(_html(f"""
+            <div style="background:#ffffff;border:1px solid #e2e8f0;
+                        border-radius:10px;padding:14px 20px;margin-bottom:10px;
+                        display:flex;align-items:center;gap:24px;">
+              <div style="min-width:200px;">
+                <div style="font-size:13px;font-weight:600;color:#374151;margin-bottom:6px;cursor:help;"
+                     title="In-house approximation of a CNN-style Fear &amp; Greed Index, built from VIX level and SPY-vs-200-day-SMA trend. 0 = extreme fear, 100 = extreme greed. Not CNN's real 7-factor methodology.">Fear &amp; Greed Index (approx.)</div>
+                <div style="display:flex;align-items:baseline;gap:10px;">
+                  <span style="font-size:32px;font-weight:800;color:{fg['color']};">{fg['score']}</span>
+                  <span style="font-size:13px;font-weight:700;background:{fg['color']}22;
+                              color:{fg['color']};padding:3px 10px;border-radius:4px;">
+                    {fg['label']}
+                  </span>
+                </div>
+                <div style="font-size:12px;color:#64748b;margin-top:4px;">{fg['desc']}</div>
+              </div>
+              <div style="flex:1;">
+                <div style="background:#f1f5f9;border-radius:6px;height:10px;margin-bottom:6px;">
+                  <div style="background:{fg['color']};height:10px;border-radius:6px;
+                              width:{fg['score']:.0f}%;"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#374151;font-weight:500;">
+                  <span>0 Fear</span><span>25</span><span>50 Neutral</span>
+                  <span>75</span><span>100 Greed</span>
+                </div>
+              </div>
+            </div>
+        """), unsafe_allow_html=True)
 
     # ── Market Indices + VIX ──────────────────────────────────────────────────
     if indices:

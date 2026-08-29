@@ -134,8 +134,15 @@ def _migrate(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE forward_signals ADD COLUMN data_quality_flag TEXT")
         logger.info("Migrated forward_signals: added column data_quality_flag")
     for col, definition in [
-        ("fill_price",  "REAL"),
-        ("fill_source", "TEXT"),
+        ("fill_price",     "REAL"),
+        ("fill_source",    "TEXT"),
+        # fill_order_id lets record_fill() recognize a fill it already applied
+        # (a reconnect can replay orderStatusEvent, and the periodic fill sweep
+        # can re-find an execution the live callback already recorded) instead
+        # of re-querying "most recent row with fill_price IS NULL", which would
+        # land on a different, unrelated row once the true target is no longer
+        # NULL. See CLAUDE.md backlog.
+        ("fill_order_id",  "INTEGER"),
     ]:
         if col not in fs_cols:
             conn.execute(f"ALTER TABLE forward_signals ADD COLUMN {col} {definition}")
@@ -192,6 +199,15 @@ def _migrate(conn: sqlite3.Connection):
     if "exit_tier" not in ip_cols:
         conn.execute("ALTER TABLE ibkr_positions ADD COLUMN exit_tier INTEGER DEFAULT 0")
         logger.info("Migrated ibkr_positions: added column exit_tier")
+
+    # order_log — stop_order_id records the STP leg's IBKR order id at bracket
+    # submission time, so modify_stop_order() can target that exact order
+    # instead of scanning openTrades() by ticker/type/action, which is
+    # ambiguous if more than one resting STP SELL order exists for a ticker.
+    ol_cols = {row[1] for row in conn.execute("PRAGMA table_info(order_log)")}
+    if "stop_order_id" not in ol_cols:
+        conn.execute("ALTER TABLE order_log ADD COLUMN stop_order_id INTEGER")
+        logger.info("Migrated order_log: added column stop_order_id")
 
     # llm_curated_universe — weekly LLM curation of the scanner's top-score pool
     # into the actual monitoring set. action is 'keep' | 'add' | 'remove' relative
