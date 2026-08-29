@@ -134,9 +134,6 @@ FAKE_REGIME_BEAR = {
     "spy_vs_sma200_pct": -16.67, "multiplier": 0.3, "cached_at": "irrelevant",
 }
 
-DASHBOARD_PATH = str(Path(__file__).parent.parent / "dashboard.py")
-
-
 @pytest.fixture
 def temp_db(monkeypatch):
     fd, path = tempfile.mkstemp(suffix=".db", prefix="page_market_fg_")
@@ -152,25 +149,46 @@ def temp_db(monkeypatch):
         pass
 
 
-def _run_market_page(regime: dict):
-    """Render the real dashboard.py with the Market page selected, all network
-    calls mocked. Returns the AppTest instance for assertions."""
-    from streamlit.testing.v1 import AppTest
+def _render_market_page(regime: dict, indices: list, mood: dict):
+    """Calls page_market.render() directly instead of AppTest.from_file() on
+    the whole dashboard.py, which was found to leave Streamlit internal state
+    that breaks a LATER AppTest.from_function() test in the same pytest
+    process (order-dependent, reproducible with just this file plus
+    tests/test_page_scheduler_save.py). Mirrors that file's own pattern.
 
-    with patch("src.market_feed.get_market_indices", return_value=FAKE_INDICES), \
+    AppTest.from_function() re-executes only this function's own extracted
+    source as a standalone script - it does NOT carry over this module's
+    top-level imports or globals, so everything used below must be either a
+    local import or an explicit argument (hence indices/mood are passed in
+    instead of read from the module-level FAKE_INDICES/FAKE_MOOD constants).
+
+    NOTE: keep this docstring and this function body plain ASCII. A non-ASCII
+    character here (an em dash was here originally) breaks AppTest.from_function()
+    on this Windows/Python setup: it round-trips the function's source through
+    a temp file using a non-UTF-8 default write encoding, then Streamlit's
+    script cache reads that file back as UTF-8 and throws UnicodeDecodeError."""
+    from unittest.mock import patch
+    import _pages_modules.page_market as page_market
+
+    with patch("src.market_feed.get_market_indices", return_value=indices), \
          patch("src.market_feed.get_futures", return_value=[]), \
          patch("src.market_feed.get_market_news", return_value=[]), \
-         patch("src.market_feed.get_market_mood", return_value=FAKE_MOOD), \
+         patch("src.market_feed.get_market_mood", return_value=mood), \
          patch("src.market_feed.get_upcoming_macro", return_value=[]), \
          patch("src.market_feed.get_earnings_calendar", return_value=[]), \
          patch("src.market_regime.get_regime", return_value=regime), \
          patch("yfinance.download") as mock_dl:
         import pandas as pd
         mock_dl.return_value = pd.DataFrame()  # sector heatmap: no data, handled gracefully
+        page_market.render()
 
-        at = AppTest.from_file(DASHBOARD_PATH)
-        at.session_state["sidebar_nav"] = "Market"
-        at.run(timeout=30)
+
+def _run_market_page(regime: dict):
+    """Returns the AppTest instance for assertions."""
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_function(_render_market_page, args=(regime, FAKE_INDICES, FAKE_MOOD))
+    at.run(timeout=30)
     return at
 
 
