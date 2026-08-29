@@ -200,6 +200,7 @@ def _fetch_ticker_data(ticker: str) -> Optional[Dict]:
         vol_ratio = 1.0
         pct_5d    = None
 
+        avg_dollar_volume = 0
         if len(hist) >= 6:
             vol_5     = hist["Volume"].iloc[-5:].mean()
             vol_30    = hist["Volume"].iloc[-30:].mean() if len(hist) >= 30 else hist["Volume"].mean()
@@ -207,6 +208,7 @@ def _fetch_ticker_data(ticker: str) -> Optional[Dict]:
             close_now = hist["Close"].iloc[-1]
             close_5d  = hist["Close"].iloc[-6]
             pct_5d    = (close_now - close_5d) / close_5d * 100 if close_5d else None
+            avg_dollar_volume = float(close_now * vol_30) if vol_30 > 0 else 0
 
         ta = _ta_snapshot(hist)
 
@@ -218,6 +220,7 @@ def _fetch_ticker_data(ticker: str) -> Optional[Dict]:
             "dtc":        dtc,
             "vol_ratio":  vol_ratio,
             "pct_5d":     pct_5d,
+            "avg_dollar_volume": avg_dollar_volume,
             "name":       info.get("shortName") or info.get("longName") or ticker,
             "sector":     info.get("sector", ""),
             "rsi":        ta["rsi"],
@@ -867,6 +870,7 @@ def scan_catalysts(
             "si_pct":          round(si_pct, 1),
             "vol_ratio":       round(data["vol_ratio"], 2),
             "pct_5d":          data["pct_5d"],
+            "avg_dollar_volume": data.get("avg_dollar_volume", 0),
             "has_insider":     has_insider,
             "insider_detail":  insider_detail,
             # Technical snapshot

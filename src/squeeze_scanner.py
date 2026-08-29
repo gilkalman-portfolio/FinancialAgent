@@ -222,6 +222,7 @@ def analyze_ticker(ticker: str) -> Optional[dict]:
             "market_cap_b":         round(market_cap / 1e9, 2) if market_cap else None,
             "vol_ratio":            round(vol_ratio, 2),
             "rvol":                 round(rvol, 2),
+            "avg_dollar_volume":    round(price * vol_30d, 0) if vol_30d > 0 else 0,
             "price_change_2d":      round(price_change_2d, 1),
             "entry_signal":         entry_signal,
             "week_high_52":         round(float(week_high_52), 2),

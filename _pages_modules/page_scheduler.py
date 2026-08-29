@@ -195,6 +195,7 @@ def render():
 
     if st.button("💾 Save settings"):
         new_cfg = {
+            **cfg,
             "enabled":                                enabled,
             "times":                                  scan_times,
             "watchlist_time":                         watchlist_time,
