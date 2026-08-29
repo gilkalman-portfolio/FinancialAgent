@@ -8,6 +8,7 @@ import re
 import time
 import threading
 import logging
+from logging.handlers import RotatingFileHandler
 import socket
 from pathlib import Path
 import os
@@ -56,14 +57,114 @@ def send_telegram(text: str):
         logging.error(f"Telegram send failed: {e}")
 
 
+# Streamlit's stderr used to be uninherited-and-discarded (Popen with no stdout/
+# stderr args, under a CREATE_NO_WINDOW parent that itself has no console) —
+# any crash traceback was lost. Mirrors run_scheduler_watchdog.py's
+# _open_stderr_log (same rotation thresholds) — see CLAUDE.md Incident Archive
+# 2026-08-29.
+STDERR_LOG          = LOG_DIR / "streamlit_stderr.log"
+STDERR_MAX_BYTES    = 10 * 1024 * 1024  # 10 MB
+STDERR_BACKUP_COUNT = 5
+
+
+def _open_stderr_log():
+    try:
+        roller = RotatingFileHandler(STDERR_LOG, maxBytes=STDERR_MAX_BYTES,
+                                      backupCount=STDERR_BACKUP_COUNT, encoding="utf-8")
+        try:
+            if STDERR_LOG.exists() and STDERR_LOG.stat().st_size >= STDERR_MAX_BYTES:
+                roller.doRollover()
+        finally:
+            roller.close()
+        f = open(STDERR_LOG, "a", encoding="utf-8")
+        f.write(f"\n{'=' * 80}\n{time.strftime('%Y-%m-%d %H:%M:%S')} | Launching Streamlit\n{'=' * 80}\n")
+        f.flush()
+        return f
+    except Exception as e:
+        logging.error(f"Failed to open stderr log ({STDERR_LOG}) — stderr will be discarded: {e}")
+        return subprocess.DEVNULL
+
+
+def _find_pid_on_port(port: int) -> int | None:
+    """PID currently LISTENing on `port`, or None. Shells out to PowerShell
+    instead of adding psutil (not a project dependency)."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+             f"-ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)"],
+            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW,
+        ).stdout.strip()
+        return int(out) if out else None
+    except Exception as e:
+        logging.warning(f"Port {port} occupancy check failed: {e}")
+        return None
+
+
+def _is_our_streamlit(pid: int) -> bool:
+    """True only if `pid`'s command line is unambiguously our own dashboard.py
+    Streamlit process. Never used to justify killing anything we can't
+    positively identify as our own."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" "
+             f"-ErrorAction SilentlyContinue).CommandLine"],
+            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW,
+        ).stdout.lower()
+        return "streamlit" in out and "dashboard.py" in out
+    except Exception as e:
+        logging.warning(f"Command-line check for PID {pid} failed: {e}")
+        return False
+
+
+def _clear_stale_port(port: int) -> None:
+    """Kill a leftover instance of OUR OWN dashboard already bound to `port`.
+
+    Root cause of the 2026-08-29 incident (new tunnel URL roughly every
+    minute, forever): a Streamlit child survived its own run_dashboard_tunnel.py
+    parent being interrupted, because a CREATE_NO_WINDOW child has no console
+    and never receives the parent's Ctrl+C/console-close signal. Every
+    subsequent cycle then failed to bind `port` and crashed (exit code 1)
+    within ~10-15s, which main()'s loop mistook for a normal exit and
+    "fixed" by restarting everything — including a fresh public URL — every
+    ~70 seconds. See CLAUDE.md Incident Archive 2026-08-29.
+
+    Deliberately conservative: only terminates a process positively
+    identified as our own dashboard.py; an unrecognized occupant is logged
+    and left alone (Streamlit will fail to bind as before, and the normal
+    health-check/restart cycle takes it from there).
+    """
+    pid = _find_pid_on_port(port)
+    if pid is None:
+        return
+    if not _is_our_streamlit(pid):
+        logging.warning(f"Port {port} is held by PID {pid} (not recognized as our dashboard) — leaving it alone")
+        return
+    logging.warning(f"Port {port} already held by a leftover Streamlit (PID {pid}) — terminating it")
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
+                        timeout=10, creationflags=CREATE_NO_WINDOW)
+        time.sleep(2)
+    except Exception as e:
+        logging.error(f"Failed to terminate stale PID {pid}: {e}")
+
+
 def start_streamlit():
+    _clear_stale_port(STREAMLIT_PORT)
     cmd = [
         PYTHON, "-m", "streamlit", "run",
         str(BASE_DIR / "dashboard.py"),
         "--server.port", str(STREAMLIT_PORT),
         "--server.headless", "true",
     ]
-    proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), creationflags=CREATE_NO_WINDOW)
+    stderr_log = _open_stderr_log()
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), creationflags=CREATE_NO_WINDOW,
+                                 stdout=subprocess.DEVNULL, stderr=stderr_log)
+    finally:
+        if stderr_log is not subprocess.DEVNULL:
+            stderr_log.close()
     logging.info(f"Streamlit started (PID {proc.pid})")
     return proc
 
