@@ -122,10 +122,14 @@ class IBKRConnection:
         entry_price: float,
         stop_price: float,
         target_price: float,
-    ) -> int:
+    ) -> dict[str, int]:
         """Place a bracket order (LMT entry + STP stop + LMT target).
 
-        Returns the parent order_id.
+        Returns {"order_id": parent_id, "stop_order_id": stop_leg_id}. The STP
+        leg's id lets a caller record it (order_log.stop_order_id) so
+        modify_stop_order() can later target that exact order instead of
+        scanning openTrades() by ticker/type/action — ambiguous if more than
+        one resting STP SELL order ends up open for the same ticker.
         """
         contract = Stock(ticker, "SMART", "USD")
         self.ib.qualifyContracts(contract)
@@ -170,9 +174,9 @@ class IBKRConnection:
         logger.info(
             f"[ibkr] bracket order placed: {action} {shares} {ticker} "
             f"entry=${entry_price:.2f} stop=${stop_price:.2f} target=${target_price:.2f} "
-            f"parent_id={parent.orderId}"
+            f"parent_id={parent.orderId} stop_id={stop_order.orderId}"
         )
-        return parent.orderId
+        return {"order_id": parent.orderId, "stop_order_id": stop_order.orderId}
 
     def place_limit_order(
         self,
@@ -289,20 +293,39 @@ class IBKRConnection:
 
         return result
 
-    def modify_stop_order(self, ticker: str, new_stop_price: float) -> bool:
+    def modify_stop_order(
+        self,
+        ticker: str,
+        new_stop_price: float,
+        stop_order_id: int | None = None,
+    ) -> bool:
         """Raise the trailing stop for an open STP order on ticker.
 
-        Finds the active SELL STP order for ticker in open trades and updates
-        its auxPrice to new_stop_price. Uses placeOrder() again — IBKR treats
-        a re-submitted order with the same orderId as a modification. Returns
-        True if an order was found and modified, False otherwise.
+        When stop_order_id is given (the STP leg id recorded on order_log at
+        bracket-submission time), matches that exact IBKR order — precise even
+        if more than one resting STP SELL order exists for ticker — and does
+        NOT fall back to the ticker scan if it isn't found live, so a stale id
+        can only no-op, never modify the wrong order. When omitted (a caller
+        not yet updated, or a pre-migration order_log row with no recorded
+        id), falls back to the original ticker/type/action scan unchanged —
+        first match wins, same as before this parameter existed.
+
+        Uses placeOrder() again — IBKR treats a re-submitted order with the
+        same orderId as a modification. Returns True if an order was found
+        and modified, False otherwise.
         """
         new_stop_price = round(new_stop_price, 2)
         for trade in self.ib.openTrades():
             o = trade.order
-            if (trade.contract.symbol == ticker
+            if stop_order_id is not None:
+                matches = o.orderId == stop_order_id
+            else:
+                matches = (
+                    trade.contract.symbol == ticker
                     and o.orderType == "STP"
-                    and o.action == "SELL"):
+                    and o.action == "SELL"
+                )
+            if matches:
                 old_price = round(getattr(o, "auxPrice", 0.0), 2)
                 o.auxPrice = new_stop_price
                 self.ib.placeOrder(trade.contract, o)
@@ -311,7 +334,10 @@ class IBKRConnection:
                     f"${old_price:.2f} -> ${new_stop_price:.2f}"
                 )
                 return True
-        logger.debug(f"[ibkr] no active STP SELL order found for {ticker}")
+        logger.debug(
+            f"[ibkr] no active STP SELL order found for {ticker}"
+            + (f" matching order_id={stop_order_id}" if stop_order_id is not None else "")
+        )
         return False
 
     def resize_sell_orders(self, ticker: str, max_qty: int) -> list[int]:

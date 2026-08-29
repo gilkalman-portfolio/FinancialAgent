@@ -61,6 +61,7 @@ def _in_memory_db(monkeypatch, tmp_path):
             status        TEXT NOT NULL,
             fill_price    REAL,
             ibkr_order_id INTEGER,
+            stop_order_id INTEGER,
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL,
             notes         TEXT
@@ -101,7 +102,7 @@ def _in_memory_db(monkeypatch, tmp_path):
 @pytest.fixture
 def mock_ibkr():
     client = MagicMock()
-    client.place_bracket_order.return_value = 12345
+    client.place_bracket_order.return_value = {"order_id": 12345, "stop_order_id": 67890}
     return client
 
 
@@ -207,6 +208,7 @@ class TestHappyPath:
         assert len(rows) == 1
         assert rows[0]["status"] == "SUBMITTED"
         assert rows[0]["ibkr_order_id"] == 12345
+        assert rows[0]["stop_order_id"] == 67890
         assert rows[0]["ticker"] == "TEST"
 
 

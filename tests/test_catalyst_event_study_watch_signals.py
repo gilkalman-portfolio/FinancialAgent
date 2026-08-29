@@ -407,6 +407,97 @@ class TestWatchRowsExcludedFromTradingAggregates:
         assert rows["WATCH"] is None
 
 
+class TestRecordFillIdempotency:
+    """A duplicate fill event for an order already applied must not re-run
+    the "most recent row with fill_price IS NULL" query, which would land on
+    a different, unrelated row once the true target's fill_price is no
+    longer NULL — see CLAUDE.md backlog ('record_fill() is not idempotent on
+    duplicate fill events ... can corrupt an older forward_signals row')."""
+
+    def test_duplicate_fill_event_is_a_noop_and_returns_true(self, temp_db):
+        from src.forward_signals import SignalRecord, record_signal, record_fill
+
+        sid = record_signal(SignalRecord(ticker="DUPCO", signal_type="BUY", entry_price=40.0))
+
+        first = record_fill("DUPCO", 42.50, ibkr_order_id=700)
+        assert first is True
+
+        # A reconnect replaying the same orderStatusEvent, or the periodic
+        # fill sweep re-finding an execution the live callback already
+        # recorded — same ticker, same order id, same price.
+        second = record_fill("DUPCO", 42.50, ibkr_order_id=700)
+        assert second is True, "an already-applied fill must be reported truthy, not a failure"
+
+        import sqlite3
+        conn = sqlite3.connect(str(temp_db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT fill_price, fill_source FROM forward_signals WHERE id=?", (sid,)
+        ).fetchone()
+        conn.close()
+        assert row["fill_price"] == 42.50
+        assert row["fill_source"] == "IBKR_CALLBACK"
+
+    def test_duplicate_does_not_corrupt_a_different_older_row(self, temp_db):
+        """The exact corruption mechanism this fix closes: once the real
+        target's fill_price is no longer NULL, a naive re-query for "most
+        recent NULL-fill row" would land on an unrelated older row instead."""
+        from src.forward_signals import record_fill
+        import sqlite3
+
+        conn = sqlite3.connect(str(temp_db))
+        now = datetime.now()
+        # Older row — must NEVER receive order 700's fill.
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status) "
+            "VALUES ('DUPCO', ?, 'BUY', 41.0, 'open')",
+            ((now - timedelta(hours=1)).isoformat(),),
+        )
+        # Newer row — the real target of order 700's fill.
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status) "
+            "VALUES ('DUPCO', ?, 'BUY', 40.0, 'open')",
+            (now.isoformat(),),
+        )
+        conn.commit()
+        conn.close()
+
+        assert record_fill("DUPCO", 42.50, ibkr_order_id=700) is True
+        assert record_fill("DUPCO", 42.50, ibkr_order_id=700) is True  # duplicate replay
+
+        conn = sqlite3.connect(str(temp_db))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT entry_price, fill_price FROM forward_signals WHERE ticker='DUPCO' "
+            "ORDER BY signal_ts ASC"
+        ).fetchall()
+        conn.close()
+        older, newer = rows
+        assert older["entry_price"] == 41.0 and older["fill_price"] is None, \
+            "the older, unrelated row must never be touched"
+        assert newer["entry_price"] == 40.0 and newer["fill_price"] == 42.50
+
+    def test_distinct_order_id_still_applies_normally(self, temp_db):
+        """Idempotency must be scoped to the exact order id — a genuinely
+        different fill for a different ticker/order must not be blocked."""
+        from src.forward_signals import SignalRecord, record_signal, record_fill
+
+        record_signal(SignalRecord(ticker="AAA", signal_type="BUY", entry_price=10.0))
+        record_signal(SignalRecord(ticker="BBB", signal_type="BUY", entry_price=20.0))
+
+        assert record_fill("AAA", 10.5, ibkr_order_id=1) is True
+        assert record_fill("BBB", 20.5, ibkr_order_id=2) is True
+
+        import sqlite3
+        conn = sqlite3.connect(str(temp_db))
+        conn.row_factory = sqlite3.Row
+        rows = {r["ticker"]: r["fill_price"]
+                for r in conn.execute("SELECT ticker, fill_price FROM forward_signals")}
+        conn.close()
+        assert rows["AAA"] == 10.5
+        assert rows["BBB"] == 20.5
+
+
 class TestStatusCommandExcludesWatchRows:
     def test_last_signal_query_filters_to_buy_sell(self, temp_db):
         """telegram_command_handler's /status 'last signal' line must read the
