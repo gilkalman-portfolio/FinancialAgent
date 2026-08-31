@@ -145,7 +145,7 @@ DEFAULT_BENCHMARK = "SPY"
 
 def _t_stat(values: list) -> dict:
     """n / mean / sd / t for a 1-D sample. Same shape as trigger_backtest.stats()."""
-    xs = [v for v in values if v is not None]
+    xs = [v for v in values if v is not None and not math.isnan(v)]
     n = len(xs)
     if n < 3:
         return {"n": n, "mean": None, "sd": None, "t": None}
@@ -285,7 +285,7 @@ def _forward_pct_return(close, start_ts, days: int) -> Optional[float]:
     if i0 >= len(close) or i1 >= len(close) or i1 <= i0:
         return None
     p0, p1 = float(close.iloc[i0]), float(close.iloc[i1])
-    if p0 <= 0:
+    if p0 <= 0 or math.isnan(p0) or math.isnan(p1):
         return None
     return (p1 / p0 - 1.0) * 100.0
 
