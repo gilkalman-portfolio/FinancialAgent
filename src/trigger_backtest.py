@@ -240,7 +240,7 @@ def _forward_return(close: pd.Series, ts: pd.Timestamp, days: int) -> float | No
     if i0 >= len(close) or i1 >= len(close) or i1 <= i0:
         return None
     p0, p1 = float(close.iloc[i0]), float(close.iloc[i1])
-    if p0 <= 0:
+    if p0 <= 0 or np.isnan(p0) or np.isnan(p1):
         return None
     return (p1 / p0 - 1.0) * 100.0
 

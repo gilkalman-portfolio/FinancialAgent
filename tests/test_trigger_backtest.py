@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.supertrend import supertrend
 from src.trigger_backtest import (
-    BacktestConfig, daily_features, find_flips, run_backtest, stats, trend_series,
+    BacktestConfig, _forward_return, daily_features, find_flips, run_backtest, stats,
+    trend_series,
 )
 
 
@@ -164,6 +165,27 @@ class TestNoLookAhead:
         assert recent["ret30"].isna().all()
         matured = ev[ev["ts"] < last_ts - pd.Timedelta(days=35)]
         assert matured["ret30"].notna().any(), "older signals should have matured"
+
+
+# ── 3b. _forward_return must never return NaN as a stand-in for None ────────
+
+class TestForwardReturnNaNHandling:
+    """catalyst_event_study._forward_pct_return is 'deliberately the same
+    algorithm ... reused as a pattern' from this function -- both had the
+    same gap (a NaN price bar passed the `p0 <= 0` check and propagated into
+    the return value instead of yielding None) until it was caught via
+    catalyst_event_study's placebo_test() silently reporting a corrupted nan
+    mean as a normal result on 2026-08-31. stats() already filters NaN
+    (`not pd.isna(v)`), so this function is the one place upstream that must
+    not hand it a NaN as if it were real data."""
+
+    def test_nan_bar_returns_none_not_nan(self):
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[3] = np.nan  # 2026-06-01 + 3 days lands on this bar
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        r = _forward_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r is None
 
 
 # ── 4. Statistics ──────────────────────────────────────────────────────────

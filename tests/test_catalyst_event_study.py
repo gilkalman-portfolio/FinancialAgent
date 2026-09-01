@@ -47,6 +47,17 @@ class TestTStat:
         s = ces._t_stat([1.0, None, 2.0, None, 3.0])
         assert s["n"] == 3
 
+    def test_nan_values_are_dropped(self):
+        """NaN is not None, so it survives the `is not None` filter unless
+        explicitly checked -- a single NaN sneaking into a plain sum() poisons
+        the whole mean. This is what let placebo_test() report a silently
+        corrupted (nan, nan) placebo distribution as 'ok' in production on
+        2026-08-31 (see _forward_pct_return's own regression test)."""
+        s = ces._t_stat([1.0, float("nan"), 2.0, 3.0])
+        assert s["n"] == 3
+        assert s["mean"] == pytest.approx(2.0)
+        assert not math.isnan(s["mean"])
+
 
 # ── _welch_t ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +76,55 @@ class TestWelchT:
 
     def test_too_few_samples_returns_none(self):
         assert ces._welch_t([1.0], [1.0, 2.0, 3.0]) is None
+
+
+# ── _forward_pct_return ──────────────────────────────────────────────────────
+
+class TestForwardPctReturn:
+    def test_normal_return(self):
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        close = pd.Series([100.0 + i for i in range(len(dates))], index=pd.DatetimeIndex(dates))
+        r = ces._forward_pct_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r == pytest.approx(3.0)  # 100 -> 103 over 3 days
+
+    def test_nan_start_bar_returns_none_not_nan(self):
+        """A NaN price bar (a yfinance data gap) at the start index must
+        return None, not a NaN float -- _t_stat/_welch_t consume this via a
+        plain sum() with no NaN-awareness, so a NaN masquerading as a valid
+        Optional[float] silently corrupts every downstream mean/t-stat built
+        from it. This is exactly what production hit in placebo_test()'s
+        horizon=3d run on 2026-08-31: n stayed correct (2307) while
+        mean/sd/t all came back nan, and distinguishable_from_placebo read
+        back as a plain False -- indistinguishable from a genuine null
+        result unless you inspect the mean itself."""
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[0] = float("nan")
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        r = ces._forward_pct_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r is None
+
+    def test_nan_end_bar_returns_none_not_nan(self):
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[3] = float("nan")  # 2026-06-01 + 3 days lands on this bar
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        r = ces._forward_pct_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r is None
+
+    def test_nan_bar_never_poisons_an_aggregate_mean(self):
+        """End-to-end regression for the placebo_test() corruption: a NaN bar
+        anywhere in the series must not be able to reach _t_stat as a value
+        that looks like real data."""
+        dates = pd.date_range("2026-06-01", "2026-06-20", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[5] = float("nan")
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        returns = [r for start in dates[:10]
+                   if (r := ces._forward_pct_return(close, start, 3)) is not None]
+        stats = ces._t_stat(returns)
+        assert stats["mean"] is not None
+        assert not math.isnan(stats["mean"])
 
 
 # ── _date_clustered_stats: the cross-sectional clustering correction ────────
