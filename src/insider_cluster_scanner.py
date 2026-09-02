@@ -40,21 +40,58 @@ Pipeline, once per scheduled run (see scheduler.py::run_insider_cluster_scan):
 
 from __future__ import annotations
 
+import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
 from lxml import etree
 from loguru import logger
 
 from src.database import get_connection, retry_on_busy
 from src.yf_cache import get_info as _yf_info
 
-_HEADERS = {"User-Agent": "FinancialAgent (agent@example.com)"}
+load_dotenv()  # must run before os.getenv() below — matches edgar_fcf.py /
+                # insider_tracker.py's identical convention. Missing this
+                # sends an empty-email User-Agent ("FinancialAgent ()"),
+                # which SEC's automated-access policy is known to penalize
+                # more aggressively than a real contact email (found live
+                # 2026-08-30 — see the rate-limiter docstring above).
+_email = os.getenv("SEC_USER_AGENT_EMAIL", "")
+_HEADERS = {"User-Agent": f"FinancialAgent ({_email})"}
 _thread_local = threading.local()
+
+
+class _RateLimiter:
+    """Shared, thread-safe throttle across ALL worker threads — SEC's fair-
+    access policy caps automated requests at 10/sec TOTAL, not per-thread
+    (https://www.sec.gov/os/webmaster-faq#developers). A naive
+    ThreadPoolExecutor with no shared throttle can burst far past that in
+    the first second (confirmed live 2026-08-30: an untouched 10-worker
+    pool hitting ~811 filings got HTTP 429 on nearly everything, and even a
+    single follow-up request minutes later was still 429'd — SEC's block
+    outlasts the burst itself, not just a per-request limit)."""
+
+    def __init__(self, max_per_second: float = 8.0):
+        self._lock = threading.Lock()
+        self._min_interval = 1.0 / max_per_second
+        self._last_call = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_call
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_call = time.monotonic()
+
+
+_rate_limiter = _RateLimiter(max_per_second=8.0)
 
 # Same fixed-width-with-internal-spaces daily index format used by every SEC
 # form.YYYYMMDD.idx file — verified live 2026-08-30 against a real file
@@ -96,6 +133,7 @@ def fetch_daily_form4_filings(day: date) -> list[dict]:
     quarter = (day.month - 1) // 3 + 1
     url = f"https://www.sec.gov/Archives/edgar/daily-index/{day.year}/QTR{quarter}/form.{day.strftime('%Y%m%d')}.idx"
     try:
+        _rate_limiter.wait()
         resp = _thread_session().get(url, timeout=20)
         if resp.status_code != 200:
             logger.debug(f"[insider_cluster_scanner] daily index {day}: HTTP {resp.status_code}")
@@ -137,8 +175,11 @@ def _parse_form4_filing(file_path: str) -> Optional[dict]:
     daily index happened to file this row under."""
     url = f"https://www.sec.gov/Archives/edgar/{file_path}"
     try:
+        _rate_limiter.wait()
         resp = _thread_session().get(url, timeout=15)
         if resp.status_code != 200:
+            if resp.status_code == 429:
+                logger.warning(f"[insider_cluster_scanner] HTTP 429 (rate limited) on {file_path}")
             return None
         m = _XML_BLOCK_RE.search(resp.text)
         if not m:
