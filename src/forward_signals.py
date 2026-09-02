@@ -140,7 +140,9 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
     """Update the most recent forward_signal for *ticker* with the real fill price.
 
     Targets the newest row where fill_price IS NULL and data_quality_flag != 'SUSPECT'.
-    Returns True if a row was updated.
+    Returns True if a row was updated OR this exact order's fill was already
+    applied (idempotent no-op — see below); False only on a genuine failure
+    (no eligible row, or the order was CANCELLED).
 
     signal_type IN ('BUY','SELL') is required, not incidental: only a real
     trade produces an IBKR fill callback, so the row this fill belongs to is
@@ -148,8 +150,26 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
     earlier for the same ticker (momentum/supertrend scan every 30 min, no
     relation to order placement) could be newer than the real BUY/SELL row
     and would wrongly receive the fill price instead of it.
+
+    Idempotency: a duplicate fill event for an order already recorded here
+    (a reconnect replaying orderStatusEvent, or the periodic fill sweep
+    re-finding an execution the live callback already processed) must not
+    re-run the "most recent row with fill_price IS NULL" query below — by the
+    second call that row's fill_price is no longer NULL, so the query would
+    silently land on a DIFFERENT, unrelated row and corrupt it.
     """
     with get_connection() as conn:
+        already = conn.execute(
+            "SELECT id FROM forward_signals WHERE fill_order_id = ? LIMIT 1",
+            (ibkr_order_id,),
+        ).fetchone()
+        if already is not None:
+            logger.info(
+                f"[forward_signals] record_fill: order_id={ibkr_order_id} already "
+                f"applied to forward_signals id={already['id']} — skipping duplicate"
+            )
+            return True
+
         row = conn.execute(
             """
             SELECT id FROM forward_signals
@@ -182,8 +202,9 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
             )
             return False
         conn.execute(
-            "UPDATE forward_signals SET fill_price = ?, fill_source = ? WHERE id = ?",
-            (actual_fill_price, "IBKR_CALLBACK", row["id"]),
+            "UPDATE forward_signals SET fill_price = ?, fill_source = ?, "
+            "fill_order_id = ? WHERE id = ?",
+            (actual_fill_price, "IBKR_CALLBACK", ibkr_order_id, row["id"]),
         )
     logger.info(
         f"[forward_signals] fill recorded: {ticker} id={row['id']} "

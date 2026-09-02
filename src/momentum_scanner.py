@@ -137,6 +137,7 @@ def _score_series(
         "ma200":           round(ma200, 2),
         "rsi":             round(rsi, 1),
         "vol_ratio":       round(vol_5d / vol_30d if vol_30d > 0 else 0.0, 2),
+        "avg_dollar_volume": round(p_today * vol_30d, 0),
         "score":           round(score, 1),
         "pts_roc":         round(roc_pts, 1),
         "pts_rs":          round(rs_pts, 1),

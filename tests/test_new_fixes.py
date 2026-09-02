@@ -22,9 +22,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 @pytest.fixture()
 def _db(tmp_path, monkeypatch):
     """
-    File-backed test DB redirected from src.database.get_connection.
-    Creates all tables required by signal_combiner and forward_signals.
-    Returns the factory callable.
+    Real init_db() schema on a file-backed test DB, redirected from
+    src.database.get_connection. Returns the factory callable.
+
+    Previously a hand-rolled CREATE TABLE block, independently maintained
+    from database.py's actual schema — it already broke once (missing
+    news_publisher/news_age_minutes until manually patched, 2026-08-26) and
+    would break again on the next new column. Using the real init_db()/
+    _migrate() means this schema can never drift from production again. See
+    CLAUDE.md backlog and tests/test_catalyst_event_study_watch_signals.py's
+    temp_db fixture, which already established this pattern.
     """
     db_path = tmp_path / "test.db"
 
@@ -38,64 +45,10 @@ def _db(tmp_path, monkeypatch):
     monkeypatch.setattr("src.signal_combiner.get_connection", _get_conn)
     monkeypatch.setattr("src.forward_signals.get_connection", _get_conn)
 
-    conn = _get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS watchlist_alerts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker      TEXT NOT NULL,
-            alert_type  TEXT NOT NULL,
-            message     TEXT,
-            sent_at     TEXT NOT NULL,
-            score       REAL,
-            price       REAL
-        );
-        CREATE TABLE IF NOT EXISTS scan_results (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id      INTEGER NOT NULL DEFAULT 1,
-            ticker      TEXT NOT NULL,
-            scanned_at  TEXT NOT NULL,
-            price       REAL,
-            explosion_score REAL,
-            recommendation  TEXT,
-            confidence      TEXT,
-            rsi             REAL,
-            macd_signal     TEXT,
-            ma_trend        TEXT,
-            pattern_sentiment TEXT,
-            bullish_score   INTEGER,
-            bearish_score   INTEGER,
-            fundamental_score REAL,
-            raw_data        TEXT,
-            catalyst        TEXT,
-            short_pct       REAL
-        );
-        CREATE TABLE IF NOT EXISTS forward_signals (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker              TEXT NOT NULL,
-            signal_ts           TEXT NOT NULL,
-            signal_type         TEXT NOT NULL,
-            entry_price         REAL NOT NULL,
-            composite_score     REAL,
-            catalyst_summary    TEXT,
-            supertrend_level    REAL,
-            supertrend_atr      REAL,
-            ai_verdict          TEXT,
-            telegram_sent_at    TEXT,
-            price_after_7d      REAL,
-            price_after_14d     REAL,
-            price_after_30d     REAL,
-            return_7d_pct       REAL,
-            return_14d_pct      REAL,
-            return_30d_pct      REAL,
-            status              TEXT NOT NULL DEFAULT 'open',
-            data_quality_flag   TEXT,
-            fill_price          REAL,
-            fill_source         TEXT,
-            news_publisher      TEXT,
-            news_age_minutes    REAL
-        );
-    """)
-    conn.close()
+    import src.database as db
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+    db.init_db()
+
     return _get_conn
 
 

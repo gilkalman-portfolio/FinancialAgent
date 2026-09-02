@@ -7,6 +7,7 @@ import sys, json, time, threading, os
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import schedule
 from loguru import logger
@@ -366,6 +367,54 @@ def run_scan():
         logger.error(f"run_scan: unhandled failure — {e}")
 
 
+# Mirrors src/watchlist_manager.py::_DEFAULT_SCAN_MAX_WORKERS and its rationale
+# exactly — score_stock() is CPU-bound ARIMA/MLP plus 6-8 sequential network
+# calls per ticker, far heavier than a lightweight REST call, so this stays
+# deliberately lower than gap_scanner.py's massive_max_workers=10. run_scan()
+# scores the full scan universe (~2,463 tickers), the heaviest score_stock()
+# caller in the project, so the same conservative value applies at least as
+# strongly here.
+_SCAN_MAX_WORKERS = 5
+
+
+def _score_scan_ticker(ticker: str, forecast_days: int) -> Optional[dict]:
+    """ThreadPoolExecutor worker unit — mirrors watchlist_manager.py::_score_one().
+    Never raises, so pool.map() can't abort the batch on one ticker's failure;
+    this is the exact try/except that used to sit inline in the sequential
+    nested loop below."""
+    try:
+        return score_stock(ticker, forecast_days=forecast_days)
+    except Exception as e:
+        logger.warning(f"run_scan: {ticker} scoring failed — skipping: {e}")
+        return None
+
+
+def _score_scan_universe(tickers: list, forecast_days: int,
+                          max_workers: int = _SCAN_MAX_WORKERS) -> list:
+    """Phase 1 of run_scan() — the ONLY concurrent part. Scores `tickers`
+    concurrently and returns results as a list in the SAME order as
+    `tickers` (concurrent.futures.Executor.map guarantees output order
+    matches input order, regardless of which ticker's score_stock() call
+    finishes first) so Phase 2 can consume them via a plain iterator over
+    the original nested source/ticker loop.
+
+    Returns a list, not a ticker->result dict like watchlist_manager.py's
+    _score_all_parallel() — run_scan()'s tickers_map is built per-sector, and
+    unlike a watchlist a ticker could in principle appear under two sectors,
+    so a dict keyed by ticker could silently collapse a legitimate duplicate
+    scoring pass. A positional list preserves the old sequential loop's
+    behavior exactly regardless of that edge case. See
+    src/watchlist_manager.py::scan_watchlist() for the pattern this mirrors,
+    and CLAUDE.md Incident Archive 2026-08-18 for the thread-local HTTP
+    session prerequisite (sec_api_client.py / insider_tracker.py) this relies
+    on — both already fixed and covered by tests/test_thread_local_sessions.py.
+    """
+    if not tickers:
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(lambda t: _score_scan_ticker(t, forecast_days), tickers))
+
+
 def _run_scan_impl():
     if not _is_trading_day():
         logger.info("run_scan: skipping — weekend")
@@ -416,13 +465,19 @@ def _run_scan_impl():
     # See src/hysteresis.py for rationale. Old behaviour was symmetric 50/50, causing thrash.
     EXIT_SCORE_THRESHOLD = AUTO_WL_SCORE_EXIT  # 40
 
+    # Phase 1 — score the full scan universe concurrently (see _score_scan_universe
+    # docstring). Phase 2 below is completely unchanged from the old sequential
+    # loop except that `r` is now pulled from this precomputed list instead of
+    # an inline score_stock() call — every DB write, auto-exit check, and
+    # Telegram send still happens strictly sequentially in original ticker
+    # order. See CLAUDE.md Incident Archive 2026-08-26 (15:00 run still
+    # executing 72+ min later, starving the 15:50 Premarket Gap Alert).
+    flat_tickers = [ticker for tickers in tickers_map.values() for ticker in tickers]
+    scored_iter = iter(_score_scan_universe(flat_tickers, fc_days))
+
     for source, tickers in tickers_map.items():
         for ticker in tickers:
-            try:
-                r = score_stock(ticker, forecast_days=fc_days)
-            except Exception as e:
-                logger.warning(f"run_scan: {ticker} scoring failed — skipping: {e}")
-                continue
+            r = next(scored_iter)
             if r and r["score"] >= min_score:
                 r["source"] = source
                 all_results.append(r)

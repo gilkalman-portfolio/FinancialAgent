@@ -89,7 +89,7 @@ def _in_memory_db(monkeypatch, tmp_path):
 @pytest.fixture
 def mock_ibkr():
     client = MagicMock()
-    client.place_bracket_order.return_value = 12345
+    client.place_bracket_order.return_value = {"order_id": 12345, "stop_order_id": 12346}
     client.place_limit_order.return_value = 67890
     return client
 

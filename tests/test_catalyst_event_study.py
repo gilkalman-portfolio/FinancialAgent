@@ -20,6 +20,7 @@ Run:
 
 from __future__ import annotations
 
+import math
 from unittest.mock import patch
 
 import pandas as pd
@@ -46,6 +47,17 @@ class TestTStat:
         s = ces._t_stat([1.0, None, 2.0, None, 3.0])
         assert s["n"] == 3
 
+    def test_nan_values_are_dropped(self):
+        """NaN is not None, so it survives the `is not None` filter unless
+        explicitly checked -- a single NaN sneaking into a plain sum() poisons
+        the whole mean. This is what let placebo_test() report a silently
+        corrupted (nan, nan) placebo distribution as 'ok' in production on
+        2026-08-31 (see _forward_pct_return's own regression test)."""
+        s = ces._t_stat([1.0, float("nan"), 2.0, 3.0])
+        assert s["n"] == 3
+        assert s["mean"] == pytest.approx(2.0)
+        assert not math.isnan(s["mean"])
+
 
 # ── _welch_t ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +76,55 @@ class TestWelchT:
 
     def test_too_few_samples_returns_none(self):
         assert ces._welch_t([1.0], [1.0, 2.0, 3.0]) is None
+
+
+# ── _forward_pct_return ──────────────────────────────────────────────────────
+
+class TestForwardPctReturn:
+    def test_normal_return(self):
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        close = pd.Series([100.0 + i for i in range(len(dates))], index=pd.DatetimeIndex(dates))
+        r = ces._forward_pct_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r == pytest.approx(3.0)  # 100 -> 103 over 3 days
+
+    def test_nan_start_bar_returns_none_not_nan(self):
+        """A NaN price bar (a yfinance data gap) at the start index must
+        return None, not a NaN float -- _t_stat/_welch_t consume this via a
+        plain sum() with no NaN-awareness, so a NaN masquerading as a valid
+        Optional[float] silently corrupts every downstream mean/t-stat built
+        from it. This is exactly what production hit in placebo_test()'s
+        horizon=3d run on 2026-08-31: n stayed correct (2307) while
+        mean/sd/t all came back nan, and distinguishable_from_placebo read
+        back as a plain False -- indistinguishable from a genuine null
+        result unless you inspect the mean itself."""
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[0] = float("nan")
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        r = ces._forward_pct_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r is None
+
+    def test_nan_end_bar_returns_none_not_nan(self):
+        dates = pd.date_range("2026-06-01", "2026-06-10", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[3] = float("nan")  # 2026-06-01 + 3 days lands on this bar
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        r = ces._forward_pct_return(close, pd.Timestamp("2026-06-01"), 3)
+        assert r is None
+
+    def test_nan_bar_never_poisons_an_aggregate_mean(self):
+        """End-to-end regression for the placebo_test() corruption: a NaN bar
+        anywhere in the series must not be able to reach _t_stat as a value
+        that looks like real data."""
+        dates = pd.date_range("2026-06-01", "2026-06-20", freq="D")
+        prices = [100.0 + i for i in range(len(dates))]
+        prices[5] = float("nan")
+        close = pd.Series(prices, index=pd.DatetimeIndex(dates))
+        returns = [r for start in dates[:10]
+                   if (r := ces._forward_pct_return(close, start, 3)) is not None]
+        stats = ces._t_stat(returns)
+        assert stats["mean"] is not None
+        assert not math.isnan(stats["mean"])
 
 
 # ── _date_clustered_stats: the cross-sectional clustering correction ────────
@@ -133,6 +194,259 @@ class TestDateClusteredStats:
 
     def test_empty_rows(self):
         assert ces._date_clustered_stats([], "abn_7") == {"n": 0, "dates": 0, "mean": None, "t": None}
+
+
+# ── _block_bootstrap_stats: within-ticker serial-correlation correction ─────
+
+class TestBlockBootstrapStats:
+    def test_too_few_tickers_returns_none_bootstrap_fields(self):
+        """Only 1 independent cluster -- can't bootstrap a meaningful spread
+        out of resampling the same single ticker over and over."""
+        rows = [{"ticker": "A", "abn_7": 1.0}, {"ticker": "A", "abn_7": 1.1},
+                {"ticker": "A", "abn_7": 0.9}]
+        s = ces._block_bootstrap_stats(rows, "abn_7")
+        assert s["n_tickers"] == 1
+        assert s["bootstrap_se"] is None
+        assert s["bootstrap_t"] is None
+        # naive fields are still populated -- same "always report what's
+        # computable" convention as every other primitive here.
+        assert s["n"] == 3
+
+    def test_missing_values_are_skipped_not_treated_as_zero(self):
+        rows = [{"ticker": "A", "abn_7": 1.0}, {"ticker": "A", "abn_7": None},
+                {"ticker": "B", "abn_7": 1.0}, {"ticker": "C", "abn_7": 1.0}]
+        s = ces._block_bootstrap_stats(rows, "abn_7", n_boot=200, seed=1)
+        assert s["n"] == 3  # the None never entered the naive count
+
+    def test_seed_makes_bootstrap_reproducible(self):
+        rows = [{"ticker": t, "abn_7": v} for t, v in
+                [("A", 1.0), ("A", 1.2), ("B", -0.5), ("C", 2.0), ("D", 0.3)]]
+        s1 = ces._block_bootstrap_stats(rows, "abn_7", n_boot=500, seed=9)
+        s2 = ces._block_bootstrap_stats(rows, "abn_7", n_boot=500, seed=9)
+        assert s1["bootstrap_se"] == s2["bootstrap_se"]
+        assert s1["bootstrap_t"] == s2["bootstrap_t"]
+
+    def test_naive_and_date_clustering_both_miss_within_ticker_repetition_bootstrap_catches_it(self):
+        """Mirrors test_naive_significance_can_be_inflated_vs_clustered above,
+        but demonstrates the GAP that correction leaves open: 6 tickers, each
+        contributing 10 near-duplicate observations on 10 DIFFERENT dates (60
+        distinct dates total -- _date_clustered_stats() sees no same-date
+        overlap anywhere, so it provides zero protection here), built from
+        per-ticker means with real spread (some negative, some strongly
+        positive) so there are really only 6 independent pieces of evidence,
+        not 60.
+        """
+        ticker_means = {"A": -2.0, "B": 3.0, "C": -1.0, "D": 2.5, "E": -0.5, "F": 4.0}
+        rows = []
+        day = 0
+        for tk, m in ticker_means.items():
+            for i in range(10):
+                rows.append({
+                    "ticker": tk,
+                    "date": pd.Timestamp("2026-01-01") + pd.Timedelta(days=day),
+                    "abn_7": m + (i % 3 - 1) * 0.001,
+                })
+                day += 1
+
+        naive = ces._t_stat([r["abn_7"] for r in rows])
+        clustered = ces._date_clustered_stats(rows, "abn_7")
+        block = ces._block_bootstrap_stats(rows, "abn_7", n_boot=2000, seed=1)
+
+        # Naive AND the existing cross-sectional correction both read this as
+        # strongly significant -- neither addresses the within-ticker axis,
+        # since every row sits on its own unique date.
+        assert naive["n"] == 60
+        assert abs(naive["t"]) > 2.0
+        assert clustered["dates"] == 60
+        assert abs(clustered["t"]) > 2.0
+
+        # The new correction recognizes only 6 independent clusters, widens
+        # the standard error well past the naive one, and correctly no
+        # longer calls this significant.
+        assert block["n_tickers"] == 6
+        naive_se = naive["sd"] / math.sqrt(naive["n"])
+        assert block["bootstrap_se"] > naive_se * 2   # measurably wider SE
+        assert abs(block["bootstrap_t"]) < 2.0          # false positive corrected away
+
+
+# ── direction_report(block_bootstrap=True) wiring ────────────────────────────
+
+class TestDirectionReportBlockBootstrap:
+    def test_block_bootstrap_key_absent_by_default_present_when_requested(self):
+        rows = [{"ticker": "A", "direction": "positive",
+                 "date": pd.Timestamp("2026-06-01"), "abn_7": 1.0}]
+        with patch.object(ces, "compute_abnormal_returns", return_value=rows):
+            default = ces.direction_report(days=90, horizons=(7,))
+            on = ces.direction_report(days=90, horizons=(7,), block_bootstrap=True, n_boot=50)
+        assert "block_bootstrap" not in default["directions"]["positive"][7]
+        assert "block_bootstrap" in on["directions"]["positive"][7]
+
+    def test_block_bootstrap_flows_through_and_corrects_inflated_significance(self):
+        ticker_means = {"A": -2.0, "B": 3.0, "C": -1.0, "D": 2.5, "E": -0.5, "F": 4.0}
+        rows = []
+        day = 0
+        for tk, m in ticker_means.items():
+            for _ in range(10):
+                rows.append({
+                    "ticker": tk, "direction": "positive",
+                    "date": pd.Timestamp("2026-01-01") + pd.Timedelta(days=day),
+                    "abn_7": m,
+                })
+                day += 1
+        with patch.object(ces, "compute_abnormal_returns", return_value=rows):
+            d = ces.direction_report(days=90, horizons=(7,), block_bootstrap=True,
+                                      n_boot=1000, boot_seed=1)
+        cell = d["directions"]["positive"][7]
+        bb = cell["block_bootstrap"]
+        assert bb["n_tickers"] == 6
+        assert abs(bb["bootstrap_t"]) < abs(cell["clustered"]["t"])
+
+    def test_format_direction_report_includes_block_bootstrap_line_when_present(self):
+        d = {
+            "benchmark": "SPY", "window_days": 90,
+            "directions": {
+                "positive": {7: {
+                    "naive": {"n": 10, "t": 1.5},
+                    "clustered": {"n": 10, "dates": 4, "mean": 1.2, "t": 0.8},
+                    "block_bootstrap": {"n_tickers": 3, "bootstrap_se": 0.5, "bootstrap_t": 1.1},
+                }}
+            },
+        }
+        text = ces.format_direction_report(d)
+        assert "block-bootstrap" in text
+        assert "n_tickers=3" in text
+
+    def test_format_direction_report_omits_block_bootstrap_line_when_absent(self):
+        """The pre-existing table format (no block_bootstrap key at all) must
+        keep rendering exactly as before -- this is an additive, opt-in
+        feature, not a change to default output."""
+        d = {
+            "benchmark": "SPY", "window_days": 90,
+            "directions": {
+                "positive": {7: {"naive": {"n": 10, "t": 1.5},
+                                  "clustered": {"n": 10, "dates": 4, "mean": 1.2, "t": 0.8}}}
+            },
+        }
+        text = ces.format_direction_report(d)
+        assert "block-bootstrap" not in text
+
+
+# ── _nearest_neighbor_match / liquidity_matched_direction_report ────────────
+
+class TestNearestNeighborMatch:
+    def test_matches_closest_adv_within_caliper(self):
+        treatment = [{"ticker": "T", "adv": 50e6}]
+        control = [{"ticker": "C1", "adv": 1e6}, {"ticker": "C2", "adv": 48e6}]
+        mt, mc = ces._nearest_neighbor_match(treatment, control, caliper=0.5)
+        assert [r["ticker"] for r in mt] == ["T"]
+        assert [r["ticker"] for r in mc] == ["C2"]
+
+    def test_treatment_dropped_when_no_control_within_caliper(self):
+        treatment = [{"ticker": "T", "adv": 50e6}]
+        control = [{"ticker": "C1", "adv": 1e6}]  # ~1.7 log10(ADV) units away
+        mt, mc = ces._nearest_neighbor_match(treatment, control, caliper=0.5)
+        assert mt == [] and mc == []
+
+    def test_rows_missing_adv_are_excluded_from_both_pools(self):
+        treatment = [{"ticker": "T1", "adv": 50e6}, {"ticker": "T2"}]  # T2: no ADV (fetch failure)
+        control = [{"ticker": "C1", "adv": 48e6}, {"ticker": "C2"}]
+        mt, mc = ces._nearest_neighbor_match(treatment, control, caliper=0.5)
+        assert [r["ticker"] for r in mt] == ["T1"]
+        assert [r["ticker"] for r in mc] == ["C1"]
+
+    def test_no_replacement_each_control_used_at_most_once(self):
+        treatment = [{"ticker": "T1", "adv": 50e6}, {"ticker": "T2", "adv": 50.5e6}]
+        control = [{"ticker": "C1", "adv": 50e6}]  # only one plausible control exists
+        mt, mc = ces._nearest_neighbor_match(treatment, control, caliper=0.5)
+        assert len(mt) == 1   # the second treatment row has nothing left to pair with
+        assert len(mc) == 1
+        assert len(set(r["ticker"] for r in mc)) == len(mc)  # no control reused
+
+
+class TestLiquidityMatchedDirectionReport:
+    def test_matching_balances_a_deliberate_adv_skew(self):
+        """Construct exactly the failure mode the correction exists for: the
+        'positive' (news) group all sits at ~$40-60M ADV; the 'no_news'
+        (control) pool is a mix of 5 similarly-liquid tickers plus 20
+        illiquid ~$1M tickers dragging its raw average far below the
+        treatment group's. Before matching the skew must be large and
+        visible; after matching, treatment and control ADV must land close
+        together, and only the 5 plausible (high-ADV) controls may be used.
+        """
+        treatment_adv = {"T1": 40e6, "T2": 45e6, "T3": 50e6, "T4": 55e6, "T5": 60e6}
+        control_high_adv = {"C1": 42e6, "C2": 48e6, "C3": 52e6, "C4": 58e6, "C5": 65e6}
+        control_low_adv = {f"L{i}": 1e6 for i in range(1, 21)}
+        adv_by_ticker = {**treatment_adv, **control_high_adv, **control_low_adv}
+
+        rows = []
+        d0 = pd.Timestamp("2026-06-01")
+        for i, tk in enumerate(treatment_adv):
+            rows.append({"ticker": tk, "direction": "positive",
+                         "date": d0 + pd.Timedelta(days=i), "abn_7": 2.0})
+        for i, tk in enumerate({**control_high_adv, **control_low_adv}):
+            rows.append({"ticker": tk, "direction": "no_news",
+                         "date": d0 + pd.Timedelta(days=i), "abn_7": 0.0})
+
+        def _fake_adv(ticker, lookback_days=20):
+            return adv_by_ticker.get(ticker)
+
+        with patch.object(ces, "compute_abnormal_returns", return_value=rows), \
+             patch.object(ces, "_fetch_ticker_adv", side_effect=_fake_adv):
+            result = ces.liquidity_matched_direction_report(days=90, horizons=(7,), caliper=0.5)
+
+        pos = result["directions"]["positive"]
+        bal = pos["adv_balance"]
+
+        # The deliberate skew is really there before matching.
+        assert bal["treatment_mean_adv_before"] == pytest.approx(50e6, rel=0.01)
+        assert bal["control_mean_adv_before"] < 15e6
+        assert bal["treatment_mean_adv_before"] / bal["control_mean_adv_before"] > 3
+
+        # Matching uses only the 5 plausible controls, one each -- never any
+        # of the 20 illiquid ones, since none is within the 0.5 caliper.
+        assert pos["n_matched_pairs"] == 5
+        for h_stats in pos["horizons"].values():
+            assert h_stats["control"]["n"] <= 5
+
+        # After matching, treatment and control ADV land close together --
+        # the skew is corrected, not just relabeled.
+        ratio_after = bal["treatment_mean_adv_after"] / bal["control_mean_adv_after"]
+        assert 0.8 < ratio_after < 1.25
+
+    def test_no_watch_rows_returns_empty(self):
+        with patch.object(ces, "compute_abnormal_returns", return_value=[]):
+            result = ces.liquidity_matched_direction_report(days=90)
+        assert result["directions"] == {}
+
+    def test_promoted_only_forwarded_to_compute_abnormal_returns(self):
+        with patch.object(ces, "compute_abnormal_returns", return_value=[]) as mock_car:
+            ces.liquidity_matched_direction_report(days=90, promoted_only=True)
+        _, kwargs = mock_car.call_args
+        assert kwargs.get("promoted_only") is True
+
+
+class TestFormatLiquidityMatchedReport:
+    def test_handles_empty(self):
+        assert "no WATCH data" in ces.format_liquidity_matched_report({"directions": {}})
+
+    def test_renders_a_table(self):
+        d = {
+            "benchmark": "SPY", "window_days": 90, "caliper": 0.5,
+            "directions": {
+                "positive": {
+                    "n_matched_pairs": 5,
+                    "adv_balance": {
+                        "treatment_mean_adv_before": 50e6, "control_mean_adv_before": 11e6,
+                        "treatment_mean_adv_after": 50e6, "control_mean_adv_after": 53e6,
+                    },
+                    "horizons": {7: {"treatment": {"t": 1.2}, "control": {"t": 0.3}}},
+                }
+            },
+        }
+        text = ces.format_liquidity_matched_report(d)
+        assert "positive" in text
+        assert "n_matched_pairs=5" in text
+        assert "SPY" in text
 
 
 # ── compute_abnormal_returns / direction_report ──────────────────────────────

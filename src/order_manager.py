@@ -45,20 +45,25 @@ def _write_order_log(
     fill_price: float | None = None,
     ibkr_order_id: int | None = None,
     notes: str | None = None,
+    stop_order_id: int | None = None,
 ) -> int:
     now = datetime.now().isoformat()
+    columns = ["ticker", "action", "shares", "entry_price", "stop_price", "target_price",
+               "status", "fill_price", "ibkr_order_id", "created_at", "updated_at", "notes"]
+    values = [ticker, action, shares, entry_price, stop_price, target_price,
+              status, fill_price, ibkr_order_id, now, now, notes]
+    # stop_order_id is only appended when a caller actually has one (the BUY
+    # bracket path) — omitting the column entirely otherwise keeps every other
+    # call site's INSERT byte-for-byte unchanged, including pre-migration or
+    # hand-rolled-schema test databases that don't have the column at all.
+    if stop_order_id is not None:
+        columns.append("stop_order_id")
+        values.append(stop_order_id)
+    placeholders = ", ".join("?" * len(values))
     with get_connection() as conn:
         cur = conn.execute(
-            """
-            INSERT INTO order_log (
-                ticker, action, shares, entry_price, stop_price, target_price,
-                status, fill_price, ibkr_order_id, created_at, updated_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ticker, action, shares, entry_price, stop_price, target_price,
-                status, fill_price, ibkr_order_id, now, now, notes,
-            ),
+            f"INSERT INTO order_log ({', '.join(columns)}) VALUES ({placeholders})",
+            values,
         )
         return cur.lastrowid
 
@@ -405,6 +410,7 @@ class OrderManager:
             shares = sellable  # close what is left, never more
 
         try:
+            stop_order_id = None
             if action == "SELL":
                 # Plain LMT SELL — no bracket. A SELL exits an existing long;
                 # there is no stop/target geometry (that is BUY-entry only).
@@ -417,7 +423,7 @@ class OrderManager:
                 log_stop = 0.0
                 log_target = 0.0
             else:
-                order_id = self.ibkr.place_bracket_order(
+                bracket = self.ibkr.place_bracket_order(
                     ticker=ticker,
                     action=action,
                     shares=shares,
@@ -425,6 +431,8 @@ class OrderManager:
                     stop_price=stop_price,
                     target_price=target_price,
                 )
+                order_id = bracket["order_id"]
+                stop_order_id = bracket.get("stop_order_id")
                 log_stop = stop_price
                 log_target = target_price
             _write_order_log(
@@ -436,6 +444,7 @@ class OrderManager:
                 target_price=log_target,
                 status="SUBMITTED",
                 ibkr_order_id=order_id,
+                stop_order_id=stop_order_id,
             )
             logger.info(
                 f"[order_manager] {ticker} SUBMITTED: {action} {shares} shares "

@@ -440,6 +440,30 @@ def _check_ticker(conn: IBKRConnection, ticker: str) -> Optional[SupertrendEvent
     )
 
 
+def _lookup_stop_order_id(ticker: str) -> int | None:
+    """Most recent bracket BUY's recorded STP leg id for ticker, or None.
+
+    order_log is the authoritative record of which STP order belongs to THIS
+    position's own bracket (recorded by order_manager.submit() at entry time)
+    — resolving modify_stop_order()'s scan ambiguity when more than one
+    resting STP SELL order exists for ticker. Returns None (triggering
+    modify_stop_order()'s original ticker/type/action scan, unchanged) for a
+    position opened before this column existed, or if the lookup fails.
+    """
+    try:
+        with get_connection() as db:
+            row = db.execute(
+                "SELECT stop_order_id FROM order_log WHERE ticker = ? AND action = 'BUY' "
+                "AND stop_order_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        if row and row["stop_order_id"] is not None:
+            return int(row["stop_order_id"])
+    except Exception as e:
+        logger.warning(f"[worker] _lookup_stop_order_id({ticker}) failed: {e}")
+    return None
+
+
 def _update_trailing_stops(conn: IBKRConnection) -> None:
     """Raise ATR-based trailing stops for all open positions.
 
@@ -492,7 +516,7 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
                 )
                 continue
 
-            if conn.modify_stop_order(ticker, new_stop):
+            if conn.modify_stop_order(ticker, new_stop, stop_order_id=_lookup_stop_order_id(ticker)):
                 logger.info(
                     f"[worker] {ticker}: trailing stop raised "
                     f"${current_stop:.2f} -> ${new_stop:.2f} "
@@ -845,7 +869,7 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                 if result["status"] != "SUBMITTED":
                     logger.info(f"[worker] T1 {ticker}: {result['status']} — {result.get('reason')}")
                     continue
-                conn.modify_stop_order(ticker, breakeven)
+                conn.modify_stop_order(ticker, breakeven, stop_order_id=_lookup_stop_order_id(ticker))
 
                 logger.info(
                     f"[worker] TIER-1 exit: {ticker} selling {result['shares']}sh "
