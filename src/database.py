@@ -209,6 +209,26 @@ def _migrate(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_curated_week ON llm_curated_universe(week_of)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_curated_ticker ON llm_curated_universe(ticker)")
 
+    # insider_purchase_events — raw Form 4 open-market-purchase log from
+    # src/insider_cluster_scanner.py, universe-agnostic (not filtered to any
+    # market-cap/liquidity threshold at write time — the filter is applied
+    # later, only to cluster candidates, see that module's docstring). The
+    # UNIQUE constraint makes daily re-scans of the same date idempotent.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS insider_purchase_events (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker            TEXT NOT NULL,
+            insider_name      TEXT NOT NULL,
+            transaction_date  TEXT NOT NULL,
+            price             REAL,
+            shares            REAL,
+            recorded_at       TEXT NOT NULL,
+            UNIQUE(ticker, insider_name, transaction_date)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_insider_events_ticker ON insider_purchase_events(ticker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_insider_events_date ON insider_purchase_events(transaction_date)")
+
 
 
 _PERSISTENT_PRAGMAS_DONE = False

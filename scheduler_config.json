@@ -61,6 +61,16 @@
     "enabled": true,
     "max_workers": 10
   },
+  "insider_cluster_scan": {
+    "enabled": true,
+    "scan_time": "08:10",
+    "max_market_cap": 2000000000,
+    "min_price": 1.0,
+    "min_dollar_volume": 300000,
+    "cluster_window_hours": 72,
+    "min_distinct_insiders": 2,
+    "max_workers": 10
+  },
   "gap_scanner": {
     "enabled": true,
     "indices": ["Russell 2000", "S&P 500"],
