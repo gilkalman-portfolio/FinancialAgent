@@ -160,6 +160,24 @@ class TestFetchDailyForm4Filings:
 # ── per-filing XML parsing ───────────────────────────────────────────────────
 
 class TestParseForm4Filing:
+    def test_requests_the_correct_url_no_doubled_edgar_segment(self):
+        """Regression test for a real bug found live 2026-09-03: file_path
+        from the daily index already starts with "edgar/...", so the base
+        URL must be https://www.sec.gov/Archives/ (NOT .../Archives/edgar/)
+        or every request 404s on a doubled "/edgar/edgar/" path. Every other
+        test in this class mocks requests.Session.get by VALUE alone and
+        would pass even with the doubled-segment bug present — this is the
+        one that actually inspects what URL was requested."""
+        from src.insider_cluster_scanner import _parse_form4_filing
+
+        mock_get = MagicMock(return_value=_mock_response(_REAL_FORM4_SUBMISSION))
+        with patch("requests.Session.get", mock_get):
+            _parse_form4_filing("edgar/data/1770787/0001610717-26-000393.txt")
+
+        called_url = mock_get.call_args[0][0]
+        assert called_url == "https://www.sec.gov/Archives/edgar/data/1770787/0001610717-26-000393.txt"
+        assert "/edgar/edgar/" not in called_url
+
     def test_extracts_ticker_and_purchase(self):
         from src.insider_cluster_scanner import _parse_form4_filing
 

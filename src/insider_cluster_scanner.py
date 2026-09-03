@@ -173,7 +173,12 @@ def _parse_form4_filing(file_path: str) -> Optional[dict]:
     comes from the filing's own <issuerTradingSymbol> — always correct
     regardless of which CIK (issuer's or the individual insider's) the
     daily index happened to file this row under."""
-    url = f"https://www.sec.gov/Archives/edgar/{file_path}"
+    # file_path already starts with "edgar/..." (comes straight from the daily
+    # index's File Name column) -- do NOT prepend another "edgar/" here, or
+    # every request 404s on a doubled "/edgar/edgar/" path. Caught live
+    # 2026-09-03: the unit tests all mock requests.Session.get directly, so
+    # they never exercised the real URL string and missed this entirely.
+    url = f"https://www.sec.gov/Archives/{file_path}"
     try:
         _rate_limiter.wait()
         resp = _thread_session().get(url, timeout=15)
