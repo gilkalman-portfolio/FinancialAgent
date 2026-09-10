@@ -365,6 +365,21 @@ _MAX_PLAUSIBLE_MOVE_PCT = 80.0
 _MAX_PLAUSIBLE_DOLLAR_VOLUME = 2_000_000_000.0
 
 
+def _fetch_ticker_adv(ticker: str) -> Optional[float]:
+    """20-day average daily dollar volume for `ticker` -- same formula as
+    monitoring_queue.py::_liquid() / catalyst_event_study.py::_fetch_ticker_adv().
+    Returns None on any failure; callers must fail closed (treat as unknown,
+    not as "confirmed low")."""
+    try:
+        hist = yf.Ticker(ticker).history(period="1mo", auto_adjust=False)
+        if hist is None or hist.empty:
+            return None
+        return float((hist["Close"] * hist["Volume"]).tail(20).mean())
+    except Exception as e:
+        logger.warning(f"Opening print scan {ticker}: ADV lookup failed: {e}")
+        return None
+
+
 def scan_opening_prints(
     tickers: list,
     pct_move_min: float = 10.0,
@@ -444,7 +459,29 @@ def scan_opening_prints(
                  if ticker in volumes.columns else pd.Series(0.0, index=c.index))
             dollar_volume = float((c * v).sum())
 
-            if move_pct > _MAX_PLAUSIBLE_MOVE_PCT or dollar_volume > _MAX_PLAUSIBLE_DOLLAR_VOLUME:
+            implausible_move = move_pct > _MAX_PLAUSIBLE_MOVE_PCT
+            implausible_volume = dollar_volume > _MAX_PLAUSIBLE_DOLLAR_VOLUME
+            if implausible_volume:
+                # Confirmed live, 2026-09: a handful of mega-caps (NVDA, MU,
+                # SNDK) routinely clear this flat $2B floor within ~7-10 min
+                # of the open on perfectly ordinary days -- their own
+                # full-day dollar volume runs into the tens of billions, so
+                # a small fraction of that alone exceeds $2B. That falsely
+                # tripped the clamp on ~every trading day and, via
+                # _job_halted_on_clamps() below, halted this job's entire
+                # scan 4 of 6 trading days in a row (2026-09-02..09-10) even
+                # though none of the flagged readings had a move over ~2%.
+                # Only escalate to "implausible" if it's ALSO implausible
+                # relative to THIS ticker's own recent typical volume, not
+                # just the universal floor -- only fetched for tickers that
+                # already trip the flat ceiling, so this stays cheap (a
+                # handful/day, not a per-ticker cost). Fails closed: an ADV
+                # lookup failure keeps the original conservative behavior.
+                adv = _fetch_ticker_adv(ticker)
+                if adv is not None and dollar_volume <= adv:
+                    implausible_volume = False
+
+            if implausible_move or implausible_volume:
                 logger.warning(
                     f"Opening print scan {ticker}: implausible reading discarded "
                     f"(move={move_pct:.1f}%, $vol={dollar_volume:,.0f}) — treating as "

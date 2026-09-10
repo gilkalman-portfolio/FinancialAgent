@@ -372,7 +372,10 @@ class TestScanOpeningPrints:
         a plausible-looking +11.9% move but "volume since open" of $66.4B --
         more than HUBB's entire real dollar volume over several months. A
         reading like this is a data-corruption signature on its own, even
-        when move_pct alone looks sane."""
+        when move_pct alone looks sane. ADV lookup mocked to None (HUBB has
+        no real billions-scale ADV, and this keeps the test deterministic/
+        offline) -- the 2026-09 ADV-aware exemption below must fail closed
+        and still clamp when the ticker's own typical volume is unknown."""
         from src.gap_scanner import scan_opening_prints
         idx = _opening_index(n_bars=4)
         frame = _make_frame(
@@ -380,7 +383,51 @@ class TestScanOpeningPrints:
             closes_by_ticker={"HUBB": [423.00, 450.0, 465.0, 473.38]},
             volumes_by_ticker={"HUBB": [1_200_000] * 4},   # ~$2.2B dollar_volume at these prices
         )
-        with patch("src.gap_scanner._download_with_retry", return_value=frame):
+        with patch("src.gap_scanner._download_with_retry", return_value=frame), \
+             patch("src.gap_scanner._fetch_ticker_adv", return_value=None):
+            results, clamped = scan_opening_prints(["HUBB"], pct_move_min=5.0, min_dollar_volume=1000)
+        assert results == []
+        assert len(clamped) == 1
+        assert clamped[0]["ticker"] == "HUBB"
+
+    def test_high_volume_mega_cap_exempted_when_within_its_own_adv(self):
+        """Regression, 2026-09-10: NVDA/MU/SNDK routinely cleared the flat
+        $2B dollar-volume ceiling within ~7-10 min of the open on ordinary
+        days (move well under 2%, nowhere near the move-pct ceiling either)
+        -- their own full-day ADV runs into the tens of billions, so a small
+        slice of that alone exceeds $2B. That falsely tripped the clamp on
+        ~every trading day and, via _job_halted_on_clamps(), halted this
+        job's entire scan 4 of 6 trading days in a row. A reading must not
+        be clamped on dollar-volume alone when it's still within this
+        specific ticker's own typical (ADV) volume."""
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            # ~$2.4B dollar_volume, move well under 2% -- the real NVDA shape.
+            closes_by_ticker={"NVDA": [180.00, 180.60, 181.10, 181.40]},
+            volumes_by_ticker={"NVDA": [3_300_000] * 4},
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame), \
+             patch("src.gap_scanner._fetch_ticker_adv", return_value=25_000_000_000.0):
+            results, clamped = scan_opening_prints(["NVDA"], pct_move_min=10.0, min_dollar_volume=1000)
+        assert clamped == []
+        assert results == []  # move is under pct_move_min=10 -- correctly not a real "hit" either way
+
+    def test_high_volume_still_clamped_when_over_its_own_adv(self):
+        """The ADV exemption must not become a blanket pass for high dollar
+        volume -- a reading that exceeds even the ticker's OWN typical
+        volume is still the corruption signature (HUBB's actual incident
+        shape: real dollar volume nowhere near what was reported)."""
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            closes_by_ticker={"HUBB": [423.00, 450.0, 465.0, 473.38]},
+            volumes_by_ticker={"HUBB": [1_200_000] * 4},   # ~$2.2B dollar_volume
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame), \
+             patch("src.gap_scanner._fetch_ticker_adv", return_value=150_000_000.0):
             results, clamped = scan_opening_prints(["HUBB"], pct_move_min=5.0, min_dollar_volume=1000)
         assert results == []
         assert len(clamped) == 1
