@@ -64,6 +64,7 @@ AI-powered stock scanner & financial analysis dashboard.
 | `stock_forecaster.py` | Ensemble forecaster (ARIMA/MA/ES/MLP). Constructor accepts `point_in_time: datetime` — strictly truncates input to ≤ point-in-time to prevent backtest look-ahead bias. `MLPRegressor.early_stopping=True` uses a shuffled validation split — non-ideal for time series, intentionally unchanged (flagged in code). |
 | `news_catalyst_monitor.py` | Background thread — checks news every N min; freshness gate skips articles older than `max_article_age_minutes` (default 45, config key `news_catalyst_max_article_age_minutes`) |
 | `insider_cluster_scanner.py` | Added 2026-08-30 — free, market-wide forward-validation data capture for the QuantConnect insider-cluster-buying research lead (see Incident Archive, 2026-08-28/29/30 — DSR~59-65% out-of-sample, not yet built into anything live). Fetches SEC's free daily Form-Type index (`form.YYYYMMDD.idx`), parses every Form 4 filing's own embedded XML for `issuerTradingSymbol` (ticker resolution is independent of which CIK — issuer's or the individual insider's — the row happened to be indexed under; most filings index under the insider's own CIK, not the issuer's, so a naive CIK-lookup approach would silently miss most rows). Every open-market PURCHASE (`transactionCode=='P'`) is logged to `insider_purchase_events`, unfiltered by market cap/liquidity — a complete, universe-agnostic raw record. The sub-$2B/no-coverage universe filter (matching the validated QC config) is applied late, only to tickers that already show 2+ distinct insiders in the trailing 72h window, keeping yfinance lookups cheap (dozens/day, not hundreds). Records a `forward_signals` WATCH row per detected cluster (dedup via a `[insider_cluster]`-prefixed `catalyst_summary`, distinct from the news-catalyst WATCH source's `ai_verdict`-based dedup) — DB-only, no Telegram, never places a trade, mirrors `forward_signals.record_watch_signals()`'s data-capture-only contract. All SEC calls (daily index + per-filing XML) go through a shared, thread-safe rate limiter capped at 8 req/sec total across the whole worker pool, not per-thread — SEC's fair-access policy caps automated access at 10/sec total, and a naive unthrottled `ThreadPoolExecutor` was confirmed live to burst past that and get HTTP 429 on nearly every request, with the block outlasting the burst itself (a single follow-up request minutes later still 429'd). |
+| `challenge_portfolio.py` | Added 2026-09-11 — standalone $10,000 paper-trading simulator for a bounded, one-month, head-to-head comparison against an external agent (see [$10K Challenge Strategy](#10k-challenge-strategy-srcchallenge_portfoliopy-run_challenge_cyclepy) below for the full evidence basis and rules). Entry: daily-bar Supertrend bullish flip (`supertrend.scan_supertrend_universe`) filtered to tickers with an open-market insider Form-4 purchase in the trailing 45 days (`massive_insider_client.get_insider_transactions` — fails closed on any error, since that filter alone is this strategy's entire evidence basis). Exit: ATR(14)×2.5 stop that only ever trails upward, plus a 30-day time-stop. Deliberately independent of `order_manager.py`/`execution_engine.py`/`ibkr_worker.py` — never touches the live/paper IBKR path; its own `challenge_trades`/`challenge_positions`/`challenge_equity_log` tables hold all state. Driven by `run_challenge_cycle.py`, run once/day via the user's own always-on Task Scheduler (not from a Claude Code cloud session — see that script's docstring for why). |
 | `run_dashboard_tunnel.py` | Cloudflare Quick Tunnel launcher; sends URL on startup + daily heartbeat at 08:05 IL. `_tunnel_healthy()` checks both local cloudflared metrics AND public DNS resolution (`socket.getaddrinfo`) — catches expired quick-tunnel URLs where cloudflared stays running but DNS is deregistered; 3 consecutive failures trigger a tunnel restart + new URL. `start_streamlit()` calls **`_clear_stale_port()`** (added 2026-08-29) before every launch — kills a leftover Streamlit already bound to `STREAMLIT_PORT` (a `CREATE_NO_WINDOW` child survives its own parent being interrupted, since it has no console to receive the signal) only after positively identifying it as our own `dashboard.py` process (PowerShell `Get-NetTCPConnection`/`Get-CimInstance Win32_Process`, no psutil dependency); an unrecognized occupant is logged and left alone. Streamlit's stderr is now captured to a rotating `logs/streamlit_stderr.log` (10MB×5, mirrors `run_scheduler_watchdog.py`'s `_open_stderr_log`) instead of being silently discarded. See Incident Archive 2026-08-29. |
 | `run_tunnel_watchdog.py` | Watchdog for `run_dashboard_tunnel.py` — auto-restarts on crash or clean exit, Telegram on startup/restart/crash (rate-limited to 1/5min). Registered as `FinancialAgentTunnelWatchdog` Windows Task. Stop with `stop_tunnel.flag` sentinel |
 | `supertrend.py` | Supertrend calculation (ATR-based, Wilder EMA, identical to TradingView Pine Script) — used by `ibkr_worker.py` and `price_alert_monitor.py`. **`scan_supertrend_universe()`** (added 2026-08-14) batch-downloads daily OHLCV (yfinance, ~0.2s/ticker) across the full scan universe and returns every ticker with a fresh bullish flip (`bars_ago==1`), with **no composite-score gate** — mirrors a bare TradingView `alertcondition(buySignal)`, closing the coverage gap left by `monitoring_queue.py`'s `SCANNER_MIN_SCORE=65` filter. |
@@ -187,6 +188,109 @@ Requires: the production `data/financial_agent.db` (months of accumulated `scan_
 **Before trusting any output**, check the printed reconstruction sanity check first — it recomputes every row's composite score from `raw_data._scores` under the CURRENT `WEIGHTS` and compares to the score actually stored in the DB. If `pct_within_1pt` isn't ~100%, either `WEIGHTS` has changed since some of that history was scanned (this tool assumes it hasn't) or the formula in `weight_tuning_backtest.py` has drifted from `stock_scorer.py`'s — the script hard-fails on this rather than printing a misleading report.
 
 **Expected finding, not a bug**: the composite score was already found to carry no measurable edge (2026-08-05 Live-Readiness Audit) — a component-level null result (no component's IC survives, "control" wins the walk-forward comparison) would be the consistent, expected outcome, not evidence the tool is broken. **This is what the first real run found** — see the 2026-08-26 Incident Archive entry below.
+
+---
+
+## $10K Challenge Strategy (`src/challenge_portfolio.py`, `run_challenge_cycle.py`)
+
+Built 2026-09-11 for a user-requested, bounded, one-month, $10,000 paper-trading
+strategy to be run head-to-head against an external agent. **Read this whole
+section before trusting any output it produces.**
+
+### Evidence basis — and its limits
+
+This project had already answered "is there a validated, live-ready, profitable
+long-only entry signal here" *before* this module existed. The 2026-08-28
+full-day signal-validation pass (Incident Archive) tested technical
+trend-following on both large-cap and genuine small-cap universes, pairs
+trading, PEAD, catalyst-conditioned entries, and an exit-policy sweep — each
+measured with a real train/holdout split and a Bonferroni-corrected
+significance bar, not naive overlapping-window stats. Its own written
+conclusion: **"are we on track for live trading in 1-2 months: no ... not yet
+met by anything tested."** That finding is not superseded by this module —
+it's the reason this module looks the way it does.
+
+Exactly one configuration in that entire pass did not collapse to zero or
+negative: **Supertrend daily bullish flip, gated on any open-market insider
+purchase (Form 4, code 'P') in the trailing 45 days.** It survived a
+walk-forward holdout with the right sign but weakened sharply (7d/14d
+tradeable t=+1.64 in-sample → t=+0.35 out-of-sample), and win rate improved
+49.1%→57.3% out of sample. A *stricter* version of the identical idea
+(requiring 2+ insider buys instead of any) looked stronger in-sample and
+**flipped negative out of sample** — the session's own live example of "the
+best-looking variant is the most overfit one." That is the single most
+evidence-backed configuration this project has produced, which is exactly why
+it's the one implemented here — and it is still a thin, weak, small-sample
+signal that directionally survived a holdout, not a confirmed source of
+alpha. This module exists to be a disciplined, capital-preservation-first bet
+placed on that thin signal, not a demonstrated money-maker. **Do not read a
+good or bad month from this as proof of anything** — one month is far short
+of the "≥100 independent clusters" gate the 2026-08-28 entry itself sets
+before trusting any signal with real capital.
+
+### Why a new standalone module instead of reusing the live pipeline
+
+`signal_combiner.py`/`order_manager.py`/`execution_engine.py`/`ibkr_worker.py`
+are the live (paper or real) IBKR trading path, with a long, hard-won incident
+history of subtle bugs there having real financial consequences (see the
+"shorts" incident family in the Incident Archive: 2026-08-03, -05, -06, -12).
+Bolting a new, unvalidated filter onto that path risked either compromising a
+battle-tested system or being silently neutered by its existing gates (its
+BUY path already has *no* score gate at all — see Hysteresis Bands — so an
+insider filter would need genuinely new plumbing, not a config tweak).
+`challenge_portfolio.py` is fully independent instead: its own tables, its
+own yfinance-only price fetching, zero calls into the live order path. A bug
+here cannot touch the live account, and a bug in the live account cannot
+touch this experiment.
+
+### Rules
+
+| Parameter | Value | Why |
+|---|---|---|
+| Starting cash | $10,000 | as specified |
+| Universe | Russell 2000 + S&P 500 | same as the production supertrend-universe monitor |
+| Entry signal | Fresh daily Supertrend bullish flip (`bars_ago==1`) | `src/supertrend.py::scan_supertrend_universe()`, unfiltered by composite score (same as production) |
+| Entry filter | Any open-market insider purchase in trailing 45 days | the one surviving configuration — see Evidence basis above; fails CLOSED on lookup error or missing `MASSIVE_API_KEY` |
+| Price floor | $5.00 | matches `gap_scanner`/`auto_watchlist` supertrend-source convention |
+| Max positions | 5 | diversification within a $10k account while keeping position sizes meaningful |
+| Sizing | `min(total_equity/5, cash)` capped by `2% of equity / stop distance`, whichever binds tighter | equal-weight with an explicit risk ceiling — this project's own research found no entry-side edge, so disciplined risk management is the actual lever being pulled, not signal quality |
+| Stop-loss | `entry_price − 2.5×ATR(14)`, trails up only, never down | matches `price_alert_monitor.py`'s existing 2.5×ATR trailing-stop scale |
+| Time-stop | 30 days | matches the challenge's own horizon and `run_exit_simulation.py`'s validated methodology |
+
+Deliberately **not** used: the "no stop-loss, 30-day time-exit only" variant
+that scored best in the 2026-08-28 exit-policy sweep. That sweep ran on the
+*plain* flip signal, not the insider-filtered one — adopting a result that
+was never jointly tested with this entry signal would compound two
+separately-cherry-picked choices, exactly the multiple-comparisons trap that
+pass spent all day documenting. The realistic, already-validated ATR+time-stop
+discipline is used instead.
+
+### Deployment — this cannot run from a Claude Code cloud session
+
+Confirmed live 2026-09-11, not assumed: this sandbox's cron (`CronCreate`) is
+session-only (dies when the session ends) and recurring jobs hard-expire
+after 7 days regardless; separately, this sandbox's outbound network policy
+rejects Yahoo Finance outright (`query2.finance.yahoo.com` etc., organization
+proxy policy, not a transient failure). Neither of those is a Claude Code
+limitation specific to this repo — no cloud chat session can stay live and
+network-connected for 30 days unattended. `run_challenge_cycle.py` has to run
+on a machine that stays on, once per trading day (e.g. via the same Windows
+Task Scheduler / watchdog pattern already documented under "IBKR Real-Time
+Architecture" above). See that script's own docstring for the exact command.
+
+### State
+
+`challenge_trades` (immutable fill ledger, source of truth for cash
+accounting), `challenge_positions` (mutable current state, ticker PK, mirrors
+`ibkr_positions`'s shape), `challenge_equity_log` (one daily mark-to-market
+snapshot). All three added to `database.py::init_db()`. `run_challenge_cycle.py`
+also writes a human-readable `data/challenge_report.md` on every run.
+
+`tests/test_challenge_portfolio.py` (29 tests, no network) covers cash
+accounting, position sizing (budget cap vs. risk cap, whichever binds
+tighter), the insider-filter fail-closed contract, exit logic (stop-loss,
+time-stop, trail-never-lowers), entry filtering, and max-positions enforcement
+across a multi-candidate batch.
 
 ---
 
@@ -589,6 +693,7 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — paid "Starter" plan, $
 
 ## Open Backlog
 
+- [ ] Run `run_challenge_cycle.py` daily for 30 days (built 2026-09-11, started once deployed to a machine that stays on) — record final equity/return/trade log and compare against the insider-filtered-Supertrend backtest's own holdout numbers (t=+0.35/+0.02, see "$10K Challenge Strategy" above) before drawing ANY conclusion from a single month of one strategy. Update that section (or the Incident Archive) with what actually happened, good or bad — same "needs real history first" discipline this project applies everywhere else (weight tuning, event study, insider cluster scanner).
 - [x] `run_scan()` parallelization — implemented 2026-08-29: `_score_scan_universe()`/`_score_scan_ticker()` (scheduler.py) mirror `watchlist_manager.py`'s 2-phase pattern exactly — Phase 1 scores the flattened ~2,463-ticker universe concurrently (`ThreadPoolExecutor`, `_SCAN_MAX_WORKERS=5`, same rationale as `_DEFAULT_SCAN_MAX_WORKERS`), Phase 2 (DB writes, auto-exit, breakout, Telegram) is byte-for-byte unchanged and still strictly sequential in original ticker order. Checked `scheduler-worker-load-issue-399d18` first as the note suggested — that worktree has no `ThreadPoolExecutor`/parallelization of its own, unrelated. `tests/test_scheduler_parallel_scan.py`, 7/7. **Not yet deployed to the live scheduler** — needs a restart to take effect, same as every prior fix in the Incident Archive.
 - [x] Scheduler crash-traceback capture — implemented 2026-08-29: `run_scheduler_watchdog.py` now redirects the child `scheduler.py` process's stderr to a rotating file (`logs/scheduler_stderr.log`, 10MB × 5 backups) instead of `subprocess.DEVNULL`, with a timestamped attempt header per launch and a logged (never silent) fallback to DEVNULL if the file can't be opened. `tests/test_scheduler_watchdog_stderr.py`, 6/6. This only helps the *next* crash — the original 5 `returncode=1` crashes from 2026-08-26 (11:34–14:29) have no recoverable traceback and stay formally undiagnosed. Also not yet deployed to the live watchdog.
 - [x] Sector-level sub-scanning in main Scan page — **stale claim, found false 2026-08-29**: `page_scan.py` has had an Index dropdown + per-sector `multiselect` + per-sector scan loop (`_load_tickers(sel_index, sec, ...)`) since the 2026-06-29 QA hardening commit (`3098f37`). Not a gap.

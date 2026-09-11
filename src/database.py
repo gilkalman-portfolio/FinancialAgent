@@ -464,6 +464,48 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_order_log_ticker ON order_log(ticker);
             CREATE INDEX IF NOT EXISTS idx_order_log_status ON order_log(status);
 
+            -- $10K Challenge strategy (src/challenge_portfolio.py) — a standalone,
+            -- bounded paper-trading simulator, deliberately independent of
+            -- order_manager.py/execution_engine.py/ibkr_worker.py: nothing here can
+            -- place a real or paper IBKR order. challenge_trades is the immutable
+            -- fill ledger (source of truth for cash accounting); challenge_positions
+            -- is mutable current-state (mirrors ibkr_positions's ticker-PK shape);
+            -- challenge_equity_log is one daily mark-to-market snapshot for reporting.
+            -- See CLAUDE.md's "$10K Challenge Strategy" section for the evidence
+            -- basis and rules.
+            CREATE TABLE IF NOT EXISTS challenge_trades (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker       TEXT NOT NULL,
+                action       TEXT NOT NULL,
+                shares       REAL NOT NULL,
+                price        REAL NOT NULL,
+                trade_date   TEXT NOT NULL,
+                reason       TEXT,
+                stop_price   REAL,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_challenge_trades_ticker ON challenge_trades(ticker);
+            CREATE INDEX IF NOT EXISTS idx_challenge_trades_date ON challenge_trades(trade_date);
+
+            CREATE TABLE IF NOT EXISTS challenge_positions (
+                ticker       TEXT PRIMARY KEY,
+                shares       REAL NOT NULL,
+                avg_cost     REAL NOT NULL,
+                stop_price   REAL NOT NULL,
+                opened_date  TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS challenge_equity_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_date        TEXT NOT NULL UNIQUE,
+                cash            REAL NOT NULL,
+                positions_value REAL NOT NULL,
+                total_equity    REAL NOT NULL,
+                open_positions  INTEGER NOT NULL,
+                notes           TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_results_ticker     ON scan_results(ticker);
             CREATE INDEX IF NOT EXISTS idx_results_scanned_at ON scan_results(scanned_at);
         """)
