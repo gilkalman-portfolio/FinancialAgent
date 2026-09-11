@@ -265,6 +265,74 @@ separately-cherry-picked choices, exactly the multiple-comparisons trap that
 pass spent all day documenting. The realistic, already-validated ATR+time-stop
 discipline is used instead.
 
+### External verification (2026-09-11)
+
+User-directed follow-up: check the strategy's design against outside sources
+rather than trusting only this project's own internal backtest. Real findings,
+with citations — not just "looks reasonable":
+
+- **Insider open-market buying predicting forward returns is a real, decades-
+  old, independently-replicated academic finding**, not something specific to
+  this project's own research: Seyhun (1986/1998) found ~4.3% abnormal return
+  over 300 days for net insider buying; Jeng, Metrick & Zeckhauser (2003) and
+  the Wharton "Estimating the Returns to Insider Trading" study found insider
+  buying beats the market by roughly 6–10%/year depending on period, with
+  **about half the abnormal return accruing within the first month** —
+  external support (found after the fact, not designed around) for this
+  module's ~45-day insider-purchase window and 30-day time-stop horizon.
+  ([InsideArbitrage academic summary](https://www.insidearbitrage.com/academic-research-related-to-insider-trading/), [QuantInsti Form 4 event study](https://blog.quantinsti.com/sec-form-4-insider-trading-python-event-study/))
+- **The effect concentrates in smaller, thinly-covered names** (multiple
+  sources, consistent) — this is exactly why `_passes_market_cap_filter()`
+  (sub-$2B market cap, no analyst coverage via a `forwardPE` proxy) was
+  **added to `find_entries()` as a direct result of this check**. The
+  original version of this module scanned the full Russell 2000 + S&P 500
+  universe with no market-cap filter at all — letting mega-cap flips (Apple,
+  Microsoft, any S&P 500 name with a routine Form 4 buy) into the candidate
+  pool, exactly where the academic literature says this effect is weakest.
+  The new filter mirrors `insider_cluster_scanner.py`'s already-validated
+  universe definition exactly, rather than inventing a new threshold.
+- **SEC Form 4 must be filed within 2 business days of the transaction**
+  ([Investor.gov bulletin](https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins/investor-bulletins-69)) — confirms the 45-day lookback window is reading genuinely
+  fresh, regulatorily-timely disclosure, not stale filings.
+- **Tension found, deliberately NOT acted on**: several sources describe
+  cluster buying (2+ insiders) as roughly **2x** the excess return of a
+  single insider's purchase ([summary discussion](https://insideract.com/learn/cluster-buying-explained), citing Lakonishok & Lee 2002 and Cohen, Malloy
+  & Pomorski 2012) — the opposite direction from this project's own internal
+  finding (see "Evidence basis" above) that requiring 2+ insiders on this
+  exact joint (flip + insider) signal *flipped negative* out of sample. These
+  aren't necessarily contradictory — the internal result rests on a thin
+  ~51-unit clustered sample (already flagged as such in Open Backlog) and
+  could be small-sample noise rather than a real reversal of a much
+  better-powered academic finding — but changing this module's filter from
+  "any insider buy" to "2+" on the strength of outside literature alone,
+  without testing that specific change against this specific joint signal,
+  would be exactly the kind of untested tweak this project's incident
+  archive spent all of 2026-08-28 warning against. **Left as "any insider
+  buy in 45 days."** Added to Open Backlog as a real thing to test once
+  either real challenge-cycle history or a larger-sample internal backtest
+  of the 2+ variant exists.
+- **ATR stop multiple checked against the "canonical" Turtle Trading system**
+  (2x ATR(20), fixed stop, no exception) ([Turtle Trading rules summary](https://trendspider.com/learning-center/richard-dennis-turtle-trading-strategy/)) — this module's 2.5x/ATR(14) is a
+  deliberate deviation for consistency with this project's own existing
+  `price_alert_monitor.py` trailing-stop convention, not an oversight; 2–3x
+  is the broadly accepted range in trend-following practice generally, so
+  this was left unchanged.
+- **Signal decay is real and worth taking seriously, not just a caveat**:
+  McLean & Pontiff (2016) found published anomalies lose much of their edge
+  after becoming public knowledge, and insider-buying has been a retail-
+  facing, publicly tracked signal (OpenInsider and similar sites) for over a
+  decade. This is independently consistent with — not contradicted by —
+  this project's own finding that the joint signal's holdout t-stat weakened
+  sharply (1.64→0.35): a real-but-decaying effect is exactly what that
+  pattern would look like, as opposed to either "fully fake" or "as strong
+  as the original 1990s papers."
+
+Net effect of this pass: **one real code fix** (the market-cap filter), one
+finding explicitly flagged and left for future testing rather than acted on
+without evidence (single vs. cluster), and several design choices (45-day
+window, 30-day horizon, 2.5x ATR) that turned out to have independent outside
+support that wasn't the reason they were originally chosen.
+
 ### Deployment — this cannot run from a Claude Code cloud session
 
 Confirmed live 2026-09-11, not assumed: this sandbox's cron (`CronCreate`) is
@@ -693,6 +761,7 @@ MASSIVE_API_KEY         # Massive/Polygon.io REST API — paid "Starter" plan, $
 
 ## Open Backlog
 
+- [ ] Test whether requiring 2+ distinct insiders (instead of any single insider buy) improves `challenge_portfolio.py`'s real results, once either real challenge-cycle history or a larger-sample internal backtest exists. Flagged 2026-09-11 during external verification: academic literature says cluster buying ≈2x a single insider's excess return, the opposite direction from this project's own thin-sample (~51 units) internal finding that a 2+ cut flipped negative out of sample — see "$10K Challenge Strategy" → "External verification" above. Not changed without real evidence on this exact joint signal.
 - [ ] Run `run_challenge_cycle.py` daily for 30 days (built 2026-09-11, started once deployed to a machine that stays on) — record final equity/return/trade log and compare against the insider-filtered-Supertrend backtest's own holdout numbers (t=+0.35/+0.02, see "$10K Challenge Strategy" above) before drawing ANY conclusion from a single month of one strategy. Update that section (or the Incident Archive) with what actually happened, good or bad — same "needs real history first" discipline this project applies everywhere else (weight tuning, event study, insider cluster scanner).
 - [x] `run_scan()` parallelization — implemented 2026-08-29: `_score_scan_universe()`/`_score_scan_ticker()` (scheduler.py) mirror `watchlist_manager.py`'s 2-phase pattern exactly — Phase 1 scores the flattened ~2,463-ticker universe concurrently (`ThreadPoolExecutor`, `_SCAN_MAX_WORKERS=5`, same rationale as `_DEFAULT_SCAN_MAX_WORKERS`), Phase 2 (DB writes, auto-exit, breakout, Telegram) is byte-for-byte unchanged and still strictly sequential in original ticker order. Checked `scheduler-worker-load-issue-399d18` first as the note suggested — that worktree has no `ThreadPoolExecutor`/parallelization of its own, unrelated. `tests/test_scheduler_parallel_scan.py`, 7/7. **Not yet deployed to the live scheduler** — needs a restart to take effect, same as every prior fix in the Incident Archive.
 - [x] Scheduler crash-traceback capture — implemented 2026-08-29: `run_scheduler_watchdog.py` now redirects the child `scheduler.py` process's stderr to a rotating file (`logs/scheduler_stderr.log`, 10MB × 5 backups) instead of `subprocess.DEVNULL`, with a timestamped attempt header per launch and a logged (never silent) fallback to DEVNULL if the file can't be opened. `tests/test_scheduler_watchdog_stderr.py`, 6/6. This only helps the *next* crash — the original 5 `returncode=1` crashes from 2026-08-26 (11:34–14:29) have no recoverable traceback and stay formally undiagnosed. Also not yet deployed to the live watchdog.

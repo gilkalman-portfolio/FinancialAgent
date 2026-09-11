@@ -42,18 +42,55 @@ a real order or the production trading bot.
 
 Rules (see run_challenge_cycle.py for the daily driver):
   - Universe: Russell 2000 + S&P 500 (SCAN_INDICES), same as the production
-    scheduler's own supertrend-universe monitor.
+    scheduler's own supertrend-universe monitor, further restricted to
+    sub-$2B market cap / no analyst coverage (_passes_market_cap_filter) —
+    see "External verification" below for why this was added.
   - Entry: fresh daily Supertrend bullish flip (src.supertrend.
-    scan_supertrend_universe, bars_ago==1) + price >= MIN_PRICE + any
-    open-market insider purchase in the trailing INSIDER_LOOKBACK_DAYS days
-    (has_recent_insider_buy — fails CLOSED on any lookup error or missing
-    MASSIVE_API_KEY, since silently falling through to "unfiltered" would
-    silently trade the exact configuration already shown to have ~0% edge).
+    scan_supertrend_universe, bars_ago==1) + price >= MIN_PRICE + passes the
+    market-cap filter + any open-market insider purchase in the trailing
+    INSIDER_LOOKBACK_DAYS days (has_recent_insider_buy — fails CLOSED on any
+    lookup error or missing MASSIVE_API_KEY, since silently falling through
+    to "unfiltered" would silently trade the exact configuration already
+    shown to have ~0% edge).
   - Sizing: equal-weight across MAX_POSITIONS slots of total equity, capped
     by an explicit per-trade risk budget (RISK_PER_TRADE_PCT of equity,
     divided by the ATR-implied stop distance) — whichever cap binds tighter.
   - Exit: hard stop at entry_price - STOP_ATR_MULT*ATR(14), trailed upward
     (never down) as price rises; hard time-stop at TIME_STOP_DAYS held.
+
+External verification (2026-09-11, user-directed web research against
+academic/practitioner sources — see CLAUDE.md's "$10K Challenge Strategy"
+section for full citations):
+  - Insider open-market buying predicting forward returns is a real,
+    decades-old, well-replicated finding (Seyhun 1986/98; Jeng, Metrick &
+    Zeckhauser 2003; Lakonishok & Lee 2002), NOT specific to this project's
+    internal backtest. About half the abnormal return accrues within the
+    first month post-purchase (Wharton/Seyhun) — external support for this
+    module's ~45-day filter window and 30-day time-stop horizon.
+  - The literature also says the effect concentrates in smaller,
+    thinly-covered names — this is WHY the market-cap filter above was
+    added; the original version of this module scanned the full Russell
+    2000 + S&P 500 universe with no cap filter, which academic evidence
+    says would have diluted the signal with mega-cap noise.
+  - Tension found, NOT acted on: multiple sources say CLUSTER buying (2+
+    insiders) beats single-insider buying by roughly 2x — the opposite of
+    this project's own internal finding (see "Evidence basis" above) that a
+    stricter 2+-insider cut flipped negative out of sample on this exact
+    joint (flip + insider) signal. Not resolved either way: that internal
+    result came from a thin sample (~51 clustered units), so it may be noise
+    rather than a real reversal of a much better-powered academic finding —
+    but changing this module's filter from "any insider buy" to "2+" on the
+    strength of outside literature alone, without testing it on THIS joint
+    signal, would be exactly the kind of untested tweak this project's own
+    incident archive warns against. Left as "any insider buy in 45 days";
+    flagged in CLAUDE.md's Open Backlog as worth testing once real
+    challenge-cycle history (or a proper backtest of the 2+ variant on a
+    larger sample) exists.
+  - ATR stop multiple (2.5x here) vs. the "canonical" Turtle Trading system
+    (2x ATR(20)): checked and left as is — 2-3x is the broadly accepted
+    range for trend-following stops, and 2.5x/ATR(14) was chosen for
+    consistency with this project's own existing price_alert_monitor.py
+    convention, not an oversight.
 """
 
 from __future__ import annotations
@@ -72,6 +109,7 @@ from src.database import get_connection
 from src.index_loader import get_index
 from src.massive_insider_client import get_insider_transactions
 from src.supertrend import scan_supertrend_universe
+from src.yf_cache import get_info as _yf_info
 
 # ── Tunables ─────────────────────────────────────────────────────────────
 STARTING_CASH = 10_000.0
@@ -88,6 +126,19 @@ MIN_PRICE = 5.0              # matches price floors used elsewhere in this
                              # codebase (gap_scanner, auto_watchlist supertrend)
 SCAN_INDICES = ["Russell 2000", "S&P 500"]
 ATR_PERIOD = 14
+NO_COVERAGE_MAX_MARKET_CAP = 2_000_000_000  # matches insider_cluster_scanner.py's
+                             # already-QC-validated universe (sub-$2B, no analyst
+                             # coverage). Added 2026-09-11 after external
+                             # verification: academic literature (Lakonishok &
+                             # Lee 2002; Cohen, Malloy & Pomorski 2012) is
+                             # consistent that insider-buying's predictive power
+                             # concentrates in smaller, thinly-covered names —
+                             # scanning the full Russell 2000 + S&P 500 universe
+                             # with NO market-cap filter (the original version of
+                             # this module) let mega-caps, where the academic
+                             # literature says the effect is weakest, dilute the
+                             # entry signal. See module docstring and CLAUDE.md's
+                             # "$10K Challenge Strategy" section for sources.
 
 
 @dataclass
@@ -207,6 +258,28 @@ def has_recent_insider_buy(ticker: str, lookback_days: int = INSIDER_LOOKBACK_DA
     return any(tx.get("type") == "BUY" for tx in txs)
 
 
+def _passes_market_cap_filter(ticker: str) -> bool:
+    """Sub-$2B / no-analyst-coverage check, matching insider_cluster_scanner.py's
+    already-validated universe definition exactly. Academic literature is
+    consistent that insider buying's predictive power concentrates in smaller,
+    thinly-covered names (see module docstring) — without this, a Russell
+    2000 + S&P 500 scan lets mega-caps (where the effect is weakest) dilute
+    the entry signal. Fails CLOSED on any lookup error, same convention as
+    has_recent_insider_buy() — a data failure must never be read as "passes"."""
+    try:
+        info = _yf_info(ticker, ttl=3600)
+        market_cap = info.get("marketCap") or 0
+        if market_cap <= 0 or market_cap >= NO_COVERAGE_MAX_MARKET_CAP:
+            return False
+        forward_pe = info.get("forwardPE")
+        if forward_pe is not None and forward_pe > 0:
+            return False
+        return True
+    except Exception as e:
+        logger.debug(f"[challenge] market-cap filter failed for {ticker}: {e}")
+        return False
+
+
 def _load_universe() -> list[str]:
     tickers: set[str] = set()
     for index_name in SCAN_INDICES:
@@ -284,6 +357,12 @@ def find_entries(open_slots: int) -> list[dict]:
     flips = scan_supertrend_universe(universe)
     held = {p.ticker for p in get_open_positions()}
     flips = [f for f in flips if f["price"] >= MIN_PRICE and f["ticker"] not in held]
+
+    # Market-cap/coverage filter runs before the insider-buy lookup: it's a
+    # cached local check (yf_cache), cheaper than the Massive/Polygon call,
+    # and also saves an API call for every mega-cap flip that would be
+    # excluded anyway.
+    flips = [f for f in flips if _passes_market_cap_filter(f["ticker"])]
 
     candidates = [f for f in flips if has_recent_insider_buy(f["ticker"])]
     candidates.sort(key=lambda f: f["avg_volume"], reverse=True)

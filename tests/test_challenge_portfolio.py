@@ -205,6 +205,40 @@ class TestCheckExits:
         assert len(cp.get_open_positions()) == 1  # untouched, not force-closed
 
 
+# ── Market-cap / no-coverage filter ─────────────────────────────────────
+
+class TestPassesMarketCapFilter:
+    def test_passes_small_cap_no_coverage(self, cp, monkeypatch):
+        monkeypatch.setattr(cp, "_yf_info", lambda t, ttl=3600: {
+            "marketCap": 500_000_000, "forwardPE": None,
+        })
+        assert cp._passes_market_cap_filter("SMALL") is True
+
+    def test_excluded_when_market_cap_too_large(self, cp, monkeypatch):
+        monkeypatch.setattr(cp, "_yf_info", lambda t, ttl=3600: {
+            "marketCap": 3_000_000_000_000, "forwardPE": None,
+        })
+        assert cp._passes_market_cap_filter("MEGA") is False
+
+    def test_excluded_when_market_cap_missing_or_zero(self, cp, monkeypatch):
+        monkeypatch.setattr(cp, "_yf_info", lambda t, ttl=3600: {"marketCap": 0})
+        assert cp._passes_market_cap_filter("UNKNOWN") is False
+
+    def test_excluded_when_analyst_coverage_present(self, cp, monkeypatch):
+        # positive forwardPE is used as an "has analyst coverage" proxy,
+        # matching insider_cluster_scanner.py's identical convention
+        monkeypatch.setattr(cp, "_yf_info", lambda t, ttl=3600: {
+            "marketCap": 500_000_000, "forwardPE": 18.5,
+        })
+        assert cp._passes_market_cap_filter("COVERED") is False
+
+    def test_fails_closed_on_exception(self, cp, monkeypatch):
+        def _boom(t, ttl=3600):
+            raise RuntimeError("network error")
+        monkeypatch.setattr(cp, "_yf_info", _boom)
+        assert cp._passes_market_cap_filter("XYZ") is False
+
+
 # ── Entry filtering ──────────────────────────────────────────────────────
 
 class TestFindEntries:
@@ -218,6 +252,7 @@ class TestFindEntries:
             {"ticker": "PENNY", "price": 1.0, "level": 0.9, "avg_volume": 1_000_000},
             {"ticker": "GOOD", "price": 50.0, "level": 45.0, "avg_volume": 500_000},
         ])
+        monkeypatch.setattr(cp, "_passes_market_cap_filter", lambda t: True)
         monkeypatch.setattr(cp, "has_recent_insider_buy", lambda t: True)
         result = cp.find_entries(open_slots=5)
         assert [r["ticker"] for r in result] == ["GOOD"]
@@ -228,6 +263,7 @@ class TestFindEntries:
         monkeypatch.setattr(cp, "scan_supertrend_universe", lambda tickers: [
             {"ticker": "GOOD", "price": 50.0, "level": 45.0, "avg_volume": 500_000},
         ])
+        monkeypatch.setattr(cp, "_passes_market_cap_filter", lambda t: True)
         monkeypatch.setattr(cp, "has_recent_insider_buy", lambda t: True)
         assert cp.find_entries(open_slots=5) == []
 
@@ -237,9 +273,24 @@ class TestFindEntries:
             {"ticker": "A", "price": 50.0, "level": 45.0, "avg_volume": 500_000},
             {"ticker": "B", "price": 50.0, "level": 45.0, "avg_volume": 900_000},
         ])
+        monkeypatch.setattr(cp, "_passes_market_cap_filter", lambda t: True)
         monkeypatch.setattr(cp, "has_recent_insider_buy", lambda t: t == "B")
         result = cp.find_entries(open_slots=5)
         assert [r["ticker"] for r in result] == ["B"]
+
+    def test_excludes_candidates_failing_market_cap_filter(self, cp, monkeypatch):
+        """A mega-cap flip with insider buying must still be excluded --
+        this is the exact gap the 2026-09-11 external-verification pass
+        found and fixed (see module docstring)."""
+        monkeypatch.setattr(cp, "_load_universe", lambda: ["MEGA", "SMALL"])
+        monkeypatch.setattr(cp, "scan_supertrend_universe", lambda tickers: [
+            {"ticker": "MEGA", "price": 200.0, "level": 190.0, "avg_volume": 5_000_000},
+            {"ticker": "SMALL", "price": 50.0, "level": 45.0, "avg_volume": 300_000},
+        ])
+        monkeypatch.setattr(cp, "_passes_market_cap_filter", lambda t: t == "SMALL")
+        monkeypatch.setattr(cp, "has_recent_insider_buy", lambda t: True)
+        result = cp.find_entries(open_slots=5)
+        assert [r["ticker"] for r in result] == ["SMALL"]
 
     def test_caps_at_open_slots_ranked_by_volume(self, cp, monkeypatch):
         monkeypatch.setattr(cp, "_load_universe", lambda: ["A", "B", "C"])
@@ -248,6 +299,7 @@ class TestFindEntries:
             {"ticker": "B", "price": 50.0, "level": 45.0, "avg_volume": 300},
             {"ticker": "C", "price": 50.0, "level": 45.0, "avg_volume": 200},
         ])
+        monkeypatch.setattr(cp, "_passes_market_cap_filter", lambda t: True)
         monkeypatch.setattr(cp, "has_recent_insider_buy", lambda t: True)
         result = cp.find_entries(open_slots=2)
         assert [r["ticker"] for r in result] == ["B", "C"]
@@ -298,6 +350,7 @@ class TestRunDailyCycle:
         monkeypatch.setattr(cp, "scan_supertrend_universe", lambda tickers: [
             {"ticker": "A", "price": 50.0, "level": 45.0, "avg_volume": 100},
         ])
+        monkeypatch.setattr(cp, "_passes_market_cap_filter", lambda t: True)
         monkeypatch.setattr(cp, "has_recent_insider_buy", lambda t: True)
         monkeypatch.setattr(cp, "fetch_latest_close", lambda t: 50.0)
         monkeypatch.setattr(cp, "compute_atr", lambda t: 2.0)
