@@ -105,6 +105,53 @@ def _send_telegram(message: str) -> None:
     except Exception as e:
         logging.warning(f"Telegram notify failed: {e}")
 
+GATEWAY_CONTAINER = "docker-ib-gateway-gateway-1"
+
+
+def _ensure_gateway_container_running() -> None:
+    """Start the IB Gateway Docker container if it isn't running.
+
+    2026-09-16: a host BSOD SIGKILLed this container (docker inspect showed
+    ExitCode=137); Docker Desktop came back up on the next login but never
+    honored the container's `restart: unless-stopped` policy — a known Docker
+    Desktop gap after a host-level crash rather than a clean daemon restart.
+    The worker then spent 3.5 days in a silent ConnectionRefusedError retry
+    loop with 10 open positions getting zero automated stop/exit monitoring,
+    and nothing surfaced it until someone happened to look. Run this before
+    every launch attempt so a dead container is caught within one watchdog
+    cycle instead of days.
+    """
+    try:
+        running = subprocess.run(
+            ["docker", "ps", "--filter", f"name={GATEWAY_CONTAINER}",
+             "--filter", "status=running", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if GATEWAY_CONTAINER in running.stdout:
+            return
+        logging.warning(f"IB Gateway container '{GATEWAY_CONTAINER}' is not running — starting it.")
+        started = subprocess.run(
+            ["docker", "start", GATEWAY_CONTAINER],
+            capture_output=True, text=True, timeout=30,
+        )
+        if started.returncode == 0:
+            logging.info(f"Started IB Gateway container '{GATEWAY_CONTAINER}'.")
+            _send_telegram(
+                f"🟡 <b>IBKR Worker</b> — Gateway container was down, auto-started it "
+                f"(takes ~60s to log in before the next connect attempt succeeds)."
+            )
+        else:
+            logging.error(f"Failed to start IB Gateway container: {started.stderr.strip()}")
+            _send_telegram(
+                f"🔴 <b>IBKR Worker</b> — Gateway container is down and auto-start failed: "
+                f"{started.stderr.strip()[:200]}"
+            )
+    except Exception as e:
+        # Never let this check block the worker from launching — e.g. Docker
+        # Desktop itself not installed/running, or `docker` not on PATH.
+        logging.warning(f"Gateway container health-check failed (non-fatal): {e}")
+
+
 VENV313_DIR = ROOT / ".venv313"
 if not VENV313_DIR.exists():
     raise RuntimeError(
@@ -180,6 +227,7 @@ def main():
 
     while True:
         attempt += 1
+        _ensure_gateway_container_running()
         # Between launches is the only safe moment: the log handle below is held
         # open for the whole life of the worker process.
         _rotate_worker_log(worker_log_path)
