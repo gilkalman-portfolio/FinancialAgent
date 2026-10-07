@@ -13,6 +13,7 @@ Score (0–100):
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from src.daily_download import download_daily
 from datetime import datetime
 from loguru import logger
 from typing import Optional
@@ -161,13 +162,7 @@ def scan_long_setups(
     logger.info(f"Long setup scan: {len(tickers)} tickers, min_score={min_score}")
 
     try:
-        raw = yf.download(
-            tickers,
-            period="6mo",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
+        raw = download_daily(tickers, period="6mo")
     except Exception as e:
         logger.error(f"Long setup scan download failed: {e}")
         return []

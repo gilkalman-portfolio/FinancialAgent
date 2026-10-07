@@ -14,6 +14,7 @@ import gc
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from src.daily_download import download_daily
 from typing import Optional
 from loguru import logger
 
@@ -163,13 +164,7 @@ def scan_momentum(
     logger.info(f"Momentum scan: downloading {len(all_tickers)} tickers ({len(tickers)} + SPY)")
 
     try:
-        raw = yf.download(
-            all_tickers,
-            period="1y",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
+        raw = download_daily(all_tickers, period="1y")
     except Exception as e:
         logger.error(f"Momentum scan download failed: {e}")
         return []

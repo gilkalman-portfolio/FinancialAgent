@@ -25,6 +25,7 @@ import gc
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from src.daily_download import download_daily
 from typing import Optional
 from loguru import logger
 
@@ -156,13 +157,7 @@ def scan_supertrend_universe(
 
     logger.info(f"Supertrend universe scan: downloading {len(tickers)} tickers")
     try:
-        raw = yf.download(
-            tickers,
-            period="1y",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
+        raw = download_daily(tickers, period="1y")
     except Exception as e:
         logger.error(f"Supertrend universe scan download failed: {e}")
         return []

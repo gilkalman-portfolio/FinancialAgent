@@ -98,3 +98,38 @@ def get_daily_history(ticker: str, period: str = "1y") -> pd.DataFrame:
     )
     out.index = pd.DatetimeIndex(idx, name="Date")
     return out
+
+
+def _bars_for(ticker: str, period: str) -> Optional[pd.DataFrame]:
+    """Daily bars with a tz-NAIVE date index (matches yf.download's shape).
+    One retry on HTTP 429/transport failure; None if nothing usable."""
+    for _ in range(2):
+        df = get_daily_history(ticker, period)
+        if not df.empty:
+            df = df.copy()
+            df.index = df.index.tz_localize(None)
+            return df
+    return None
+
+
+def download_daily(tickers: list, period: str = "1y", max_workers: int = 10) -> pd.DataFrame:
+    """Massive-backed equivalent of `yf.download(tickers, period=..., auto_adjust=True)`.
+
+    Returns a DataFrame with (field, ticker) MultiIndex columns — ALWAYS
+    MultiIndex, even for one ticker — covering only the tickers Massive
+    actually answered for. Tickers it could not serve are simply absent
+    (caller decides the fallback; see src/daily_download.py). Empty frame if
+    the key is missing, period is unsupported, or nothing came back.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not tickers or not _api_key() or period not in _PERIOD_DAYS:
+        return pd.DataFrame()
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        frames = list(pool.map(lambda t: _bars_for(t, period), tickers))
+    got = {t: f for t, f in zip(tickers, frames) if f is not None}
+    if not got:
+        return pd.DataFrame()
+    fields = ["Open", "High", "Low", "Close", "Volume"]
+    wide = {fld: pd.DataFrame({t: f[fld] for t, f in got.items()}) for fld in fields}
+    return pd.concat(wide, axis=1).sort_index()
