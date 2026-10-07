@@ -231,6 +231,11 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
     recovered = 0
     pending = 0
     now = datetime.now().isoformat()
+    # record_fill() opens its OWN connection and writes. Calling it while this
+    # `with` block still holds an uncommitted UPDATE self-deadlocks (this
+    # process blocks on its own write lock until busy_timeout x5 retries
+    # expire -> "database is locked", worker stalls). Defer until after commit.
+    deferred_fills: list[tuple[str, float, int]] = []
     with get_connection() as db:
         for row in rows:
             ibkr_id = row["ibkr_order_id"]
@@ -244,7 +249,7 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
                     "notes = ?, updated_at = ? WHERE id = ? AND status = 'SUBMITTED'",
                     (fp, "Recovered by startup reconciliation", now, row["id"]),
                 )
-                record_fill(row["ticker"], fp, ibkr_id)
+                deferred_fills.append((row["ticker"], fp, ibkr_id))
                 recovered += 1
                 logger.info(
                     f"[worker] reconciled order_log id={row['id']} ticker={row['ticker']} "
@@ -256,6 +261,9 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
                     f"[worker] reconciliation: id={row['id']} ticker={row['ticker']} "
                     f"ibkr_id={ibkr_id} not open and not in executions — leaving SUBMITTED"
                 )
+
+    for _t, _fp, _oid in deferred_fills:
+        record_fill(_t, _fp, _oid)
 
     logger.info(
         f"[worker] startup reconciliation complete: {recovered} recovered as FILLED, "
@@ -321,6 +329,7 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
     update_ts = now.isoformat()
     unknown_cutoff = (now - timedelta(seconds=FILL_SWEEP_UNKNOWN_GRACE_SECS)).isoformat()
 
+    deferred_fills: list[tuple[str, float, int]] = []  # see reconciliation note
     with get_connection() as db:
         for row in rows:
             ibkr_id = row["ibkr_order_id"]
@@ -339,7 +348,7 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
                     "WHERE id = ? AND status = 'SUBMITTED'",
                     (fp, update_ts, "Caught by periodic fill sweep", row["id"]),
                 )
-                record_fill(row["ticker"], fp, ibkr_id)
+                deferred_fills.append((row["ticker"], fp, ibkr_id))
                 filled += 1
                 logger.info(
                     f"[worker] fill sweep: order id={row['id']} ticker={row['ticker']} "
@@ -381,6 +390,9 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
                 )
 
             updated += 1
+
+    for _t, _fp, _oid in deferred_fills:
+        record_fill(_t, _fp, _oid)
 
     logger.info(
         f"[worker] fill sweep complete: checked {len(rows)} stale rows, "
