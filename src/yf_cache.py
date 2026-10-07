@@ -22,6 +22,8 @@ import yfinance as yf
 from typing import Optional
 from loguru import logger
 
+from src import massive_client
+
 _lock   = threading.Lock()
 _store: dict[str, tuple] = {}   # key → (value, expires_at)
 
@@ -67,12 +69,28 @@ def get_info(ticker: str, ttl: int = 300) -> dict:
 
     try:
         data = yf.Ticker(ticker).info or {}
-        _set(k, data, ttl)
-        logger.debug(f"[yf_cache] info MISS {ticker} → cached {ttl}s")
-        return data
+        if data:
+            _set(k, data, ttl)
+            logger.debug(f"[yf_cache] info MISS {ticker} → cached {ttl}s")
+            return data
+        err = "empty info"
     except Exception as e:
-        logger.warning(f"[yf_cache] info fetch failed {ticker}: {e}")
+        err = str(e)
+    # yfinance failed (typically a 429). Fall back to the paid Massive plan —
+    # but ONLY for the fields it can answer faithfully (marketCap, shares,
+    # name). Deliberately NO currentPrice/short-interest/float: get_price()
+    # reads currentPrice from here, so a stale prior-close would feed false
+    # price alerts, and absent keys behave exactly as they did on failure.
+    alt = massive_client.get_overview(ticker)
+    if alt:
+        _set(k, alt, min(ttl, 300))  # short TTL: retry yfinance soon
+        logger.info(f"[yf_cache] info via Massive fallback {ticker} (yfinance: {err[:60]})")
+        return alt
+    if err == "empty info":
+        _set(k, {}, ttl)  # preserve pre-fallback behavior: empty results were cached
         return {}
+    logger.warning(f"[yf_cache] info fetch failed {ticker}: {err}")
+    return {}
 
 
 def get_history(ticker: str, period: str = "1y", interval: str = "1d",
@@ -91,15 +109,29 @@ def get_history(ticker: str, period: str = "1y", interval: str = "1d",
         logger.debug(f"[yf_cache] hist HIT  {ticker} {period}/{interval}")
         return cached
 
+    import pandas as pd
+    err = None
     try:
         data = yf.Ticker(ticker).history(period=period, interval=interval)
-        _set(k, data, ttl)
-        logger.debug(f"[yf_cache] hist MISS {ticker} {period}/{interval} → cached {ttl}s")
-        return data
+        if data is not None and not data.empty:
+            _set(k, data, ttl)
+            logger.debug(f"[yf_cache] hist MISS {ticker} {period}/{interval} → cached {ttl}s")
+            return data
+        err = "empty history"
     except Exception as e:
-        logger.warning(f"[yf_cache] hist fetch failed {ticker} {period}/{interval}: {e}")
-        import pandas as pd
-        return pd.DataFrame()
+        err = str(e)
+    if interval == "1d":
+        alt = massive_client.get_daily_history(ticker, period)
+        if not alt.empty:
+            _set(k, alt, min(ttl, 300))
+            logger.info(f"[yf_cache] hist via Massive fallback {ticker} {period} (yfinance: {err[:60]})")
+            return alt
+    if err == "empty history":
+        empty = pd.DataFrame()
+        _set(k, empty, ttl)  # preserve pre-fallback behavior: empty results were cached
+        return empty
+    logger.warning(f"[yf_cache] hist fetch failed {ticker} {period}/{interval}: {err}")
+    return pd.DataFrame()
 
 
 def get_price(ticker: str, ttl: int = 180) -> Optional[float]:
