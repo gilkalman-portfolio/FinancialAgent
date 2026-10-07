@@ -1491,6 +1491,20 @@ def run_forward_digest():
         logger.error(f"Forward digest failed: {e}")
 
 
+def run_performance_report():
+    """Weekly — IBKR account NLV return vs SPY/IWM since the post-reset baseline."""
+    try:
+        from src.performance_report import build_report, format_report
+        d = build_report()
+        if d is None:
+            _log("Performance report: not enough NLV history — skipping send")
+            return
+        TelegramNotifier().send_message(format_report(d))
+        _log(f"Performance report sent (bot {d['ret_total']:+.2f}% since {d['start']})")
+    except Exception as e:
+        logger.error(f"Performance report failed: {e}")
+
+
 def run_opportunity_outcomes():
     """Daily — update status of open opportunity_log rows."""
     try:
@@ -1794,6 +1808,9 @@ def _main_body():
     forward_digest_time = cfg.get("forward_digest_time", "20:00")
     schedule.every().friday.at(forward_digest_time).do(run_forward_digest)
     logger.info(f"Forward weekly digest every Friday at {forward_digest_time}")
+    performance_report_time = cfg.get("performance_report_time", "20:15")
+    schedule.every().friday.at(performance_report_time).do(run_performance_report)
+    logger.info(f"IBKR performance report every Friday at {performance_report_time}")
 
     # Opportunity Tracker — daily outcome update + weekly Telegram digest
     opp_outcomes_time = cfg.get("opportunity_outcomes_time", "18:00")
