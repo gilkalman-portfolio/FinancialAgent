@@ -916,21 +916,23 @@ def _trading_days_since(entry_date_str: str) -> int:
 
 def _holding_period_start(history_desc, held: float) -> str | None:
     """created_at of the earliest FILLED BUY needed to explain `held` shares,
-    walking newest -> oldest. Later SELLs add back what they removed. If the
-    records can't fully explain the position (missing BUY rows), returns the
-    oldest BUY seen — the old behaviour for corrupted history."""
+    walking newest -> oldest. Later SELLs add back what they removed.
+
+    Returns None when the FILLED records can't explain the position (a real
+    fill missing or mis-marked). Guessing the OLDEST buy there is what sold
+    FUBO's fresh 1508sh as a "69d zombie" on 2026-10-16 — its 10-15 BUY row was
+    still ERROR, so the walk ran back to August. Overstating age force-sells a
+    new position; understating it only delays a time stop."""
     need = held
-    entry_at = None
     for h in history_desc:
         qty = h["shares"] or 0
         if h["action"] == "SELL":
             need += qty
             continue
-        entry_at = h["created_at"]
         need -= qty
         if need <= 0:
-            break
-    return entry_at
+            return h["created_at"]
+    return None
 
 
 def _check_time_stops(conn: IBKRConnection) -> None:
@@ -996,22 +998,22 @@ def _check_time_stops(conn: IBKRConnection) -> None:
                 row = {"created_at": entry_at} if entry_at else None
 
                 if not row:
-                    # No FILLED BUY row. This is usually corrupted history rather
-                    # than a phantom position (the fill sweep used to mark real
-                    # fills ERROR — RRR/TRS/LCII were all invisible here). Fall
-                    # back to the earliest BUY attempt of any status so a genuinely
-                    # held position still ages into its time stop.
+                    # FILLED records can't explain the position — usually a real
+                    # fill marked ERROR/SUBMITTED (RRR/TRS/LCII, FUBO). Fall back
+                    # to the MOST RECENT BUY attempt of any status: the position
+                    # still ages into its time stop, just never earlier than it
+                    # could possibly have been opened.
                     fallback = db.execute(
                         "SELECT created_at FROM order_log "
                         "WHERE ticker = ? AND action = 'BUY' "
-                        "ORDER BY created_at ASC LIMIT 1",
+                        "ORDER BY created_at DESC LIMIT 1",
                         (ticker,),
                     ).fetchone()
                     if fallback:
                         row = {"created_at": fallback["created_at"]}
                         logger.info(
-                            f"[worker] time stop: {ticker} has no FILLED BUY row — "
-                            f"using earliest BUY attempt {fallback['created_at'][:10]} as entry date"
+                            f"[worker] time stop: {ticker} not explained by FILLED rows — "
+                            f"using latest BUY attempt {fallback['created_at'][:10]} as entry date"
                         )
             if not row:
                 continue

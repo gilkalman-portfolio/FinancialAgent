@@ -232,9 +232,9 @@ def test_rebuy_after_logged_close_starts_fresh():
     assert w._holding_period_start(hist, 40) == "2026-08-07"
 
 
-def test_unexplained_position_falls_back_to_oldest_buy():
+def test_unexplained_position_returns_none():
     hist = [_h("BUY", 10, "2026-09-01"), _h("BUY", 10, "2026-08-01")]
-    assert w._holding_period_start(hist, 500) == "2026-08-01"
+    assert w._holding_period_start(hist, 500) is None
 
 
 def test_no_buys_returns_none():
@@ -336,3 +336,18 @@ def test_logged_leg_exit_restarts_time_stop_clock(temp_db):
         hist = c.execute("SELECT action, shares, created_at FROM order_log "
                          "WHERE ticker='EVER' AND status='FILLED' ORDER BY created_at DESC").fetchall()
     assert w._holding_period_start(hist, 322) == "2026-10-08T17:23:00"
+
+
+def test_fubo_replay_fresh_position_with_error_row_not_time_stopped(temp_db, monkeypatch):
+    """2026-10-16 17:58: FUBO 1508sh bought 10-15 (row ERROR), older FUBO
+    fills from August/October in order_log -> sold as a "69d zombie"."""
+    _order("FUBO", "BUY", 900, 1, "2026-08-08T17:00:00", status="FILLED")
+    _order("FUBO", "BUY", 1508, 84992, _ago(days=1), status="ERROR")
+    _position("FUBO", 1508, 8.455, _ago(minutes=1))
+    with db.get_connection() as c:
+        c.execute("UPDATE ibkr_positions SET unrealized_pnl=-20, market_value=12700")
+    exits = []
+    monkeypatch.setattr(w, "submit_exit", lambda *a, **k: exits.append((a, k)))
+    monkeypatch.setattr(w, "_last_time_stop_ts", None)
+    w._check_time_stops(_FakeConn())
+    assert exits == []

@@ -135,6 +135,10 @@ def record_signal(rec: SignalRecord) -> int:
     return signal_id
 
 
+# A signal fires seconds before order_manager submits; 30 min is generous slack.
+FILL_SIGNAL_WINDOW_MINUTES = 30
+
+
 @retry_on_busy()
 def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bool:
     """Update the most recent forward_signal for *ticker* with the real fill price.
@@ -170,16 +174,38 @@ def record_fill(ticker: str, actual_fill_price: float, ibkr_order_id: int) -> bo
             )
             return True
 
+        # Tie the fill to the signal that produced THIS order: same direction,
+        # fired shortly before the order was created. Without it, every
+        # software exit (time stop / T1 / score deterioration — none has a
+        # signal row) landed on the newest unfilled row of any type: on
+        # 2026-10-16 a FUBO time-stop SELL fill was written onto an unrelated
+        # BUY signal from 2026-08-12.
+        order = conn.execute(
+            "SELECT action, created_at FROM order_log WHERE ibkr_order_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (ibkr_order_id,),
+        ).fetchone()
+        types = ("BUY", "SELL")
+        lo, hi = "", "9999"
+        if order is not None and order["action"] in types:
+            types = (order["action"],)
+            try:
+                created = datetime.fromisoformat(order["created_at"])
+                lo = (created - timedelta(minutes=FILL_SIGNAL_WINDOW_MINUTES)).isoformat()
+                hi = (created + timedelta(minutes=5)).isoformat()
+            except (TypeError, ValueError):
+                pass
         row = conn.execute(
-            """
+            f"""
             SELECT id FROM forward_signals
             WHERE ticker = ?
-              AND signal_type IN ('BUY', 'SELL')
+              AND signal_type IN ({",".join("?" for _ in types)})
               AND (data_quality_flag IS NULL OR data_quality_flag != 'SUSPECT')
               AND fill_price IS NULL
+              AND signal_ts >= ? AND signal_ts <= ?
             ORDER BY signal_ts DESC LIMIT 1
             """,
-            (ticker,),
+            (ticker, *types, lo, hi),
         ).fetchone()
         if row is None:
             logger.warning(
