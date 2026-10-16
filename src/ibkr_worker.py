@@ -69,6 +69,27 @@ FILL_SWEEP_MIN_AGE_SECS = 5 * 60    # only sweep SUBMITTED rows older than 5 min
 # IBKR serves ~24h of executions via reqExecutions(), so anything younger than this
 # may simply not be visible yet — calling it ERROR early corrupts fill tracking.
 FILL_SWEEP_UNKNOWN_GRACE_SECS = 24 * 60 * 60
+# A fill can be invisible to BOTH paths above: orderStatusEvent is only
+# subscribed while a cycle holds a connection, and reqExecutions() on paper only
+# serves the current day. FUBO (2026-10-15) filled between cycles, the machine
+# slept past midnight, and the row would have aged into ERROR while the 1508
+# shares sat in ibkr_positions. A held position is proof of a BUY fill — but
+# only from a fresh sync (see the Client Portal trap in CLAUDE.md).
+POSITION_FILL_MAX_SYNC_AGE_SECS = 15 * 60
+# Bracket parents are GTC so the stop/target legs survive sessions — which also
+# means an unfilled entry rests forever (QLYS sat 16 days on a 2026-09-30
+# signal). Past this age the signal is stale; cancel the parent (IBKR cancels
+# its unfilled child legs with it).
+STALE_ENTRY_MAX_AGE_SECS = 24 * 60 * 60
+# An unbacked SELL is only cancelled once its position has been missing for this
+# long. On 2026-10-09 21:55 an IBKR connectivity drop (Error 1100, positions /
+# account requests timing out) left ibkr_positions empty for one pass and the
+# reconcile cancelled the live stop+target legs of STNG, SBGI, LRN, FUBO, PARR
+# and DG — real held positions, left unprotected for days. A transient sync
+# glitch heals within a cycle; a real orphan (account reset) is still orphaned
+# ten minutes later.
+UNBACKED_SELL_CONFIRM_SECS = 10 * 60
+_unbacked_first_seen: dict[int, float] = {}
 PER_CYCLE_BUY_CAP = 3               # max combined_buy signals per run_once() cycle
 
 # Stall guard. A cycle is ~30s; the poll interval is 5 min. Anything past this is
@@ -221,7 +242,8 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
 
     with get_connection() as db:
         rows = db.execute(
-            "SELECT id, ticker, ibkr_order_id FROM order_log WHERE status = 'SUBMITTED'"
+            "SELECT id, ticker, action, shares, ibkr_order_id FROM order_log "
+            "WHERE status = 'SUBMITTED'"
         ).fetchall()
 
     if not rows:
@@ -242,12 +264,16 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
             if ibkr_id is None or ibkr_id in live_order_ids:
                 continue
 
-            if ibkr_id in fill_map:
-                fp = fill_map[ibkr_id]
+            fp = fill_map.get(ibkr_id)
+            note = "Recovered by startup reconciliation"
+            if fp is None:
+                fp = _position_fill_price(db, row)
+                note = "Recovered by startup reconciliation (inferred from held position)"
+            if fp is not None:
                 db.execute(
                     "UPDATE order_log SET status = 'FILLED', fill_price = ?, "
                     "notes = ?, updated_at = ? WHERE id = ? AND status = 'SUBMITTED'",
-                    (fp, "Recovered by startup reconciliation", now, row["id"]),
+                    (fp, note, now, row["id"]),
                 )
                 deferred_fills.append((row["ticker"], fp, ibkr_id))
                 recovered += 1
@@ -272,6 +298,39 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
     )
 
 
+def _position_fill_price(db, row) -> float | None:
+    """avg_cost of a fresh held long position that can only be explained by this
+    BUY row, else None. SELL rows never qualify — a missing position doesn't
+    prove a SELL filled. Requires no other FILLED BUY for the ticker since its
+    last FILLED SELL, so an older fill can't be credited to this order."""
+    if row["action"] != "BUY" or not row["shares"] or row["shares"] <= 0:
+        return None
+    pos = db.execute(
+        "SELECT shares, avg_cost, last_synced FROM ibkr_positions WHERE ticker = ?",
+        (row["ticker"],),
+    ).fetchone()
+    if pos is None or not pos["avg_cost"] or pos["avg_cost"] <= 0:
+        return None
+    if (pos["shares"] or 0) < row["shares"]:
+        return None
+    try:
+        age = (datetime.now() - datetime.fromisoformat(pos["last_synced"])).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    if age > POSITION_FILL_MAX_SYNC_AGE_SECS:
+        return None
+    other = db.execute(
+        "SELECT COUNT(*) FROM order_log WHERE ticker = ? AND action = 'BUY' "
+        "AND status = 'FILLED' AND id != ? AND created_at > COALESCE("
+        "(SELECT MAX(created_at) FROM order_log WHERE ticker = ? "
+        "AND action = 'SELL' AND status = 'FILLED'), '')",
+        (row["ticker"], row["id"], row["ticker"]),
+    ).fetchone()[0]
+    if other:
+        return None
+    return float(pos["avg_cost"])
+
+
 def _periodic_fill_sweep(conn: IBKRConnection) -> None:
     """Sweep SUBMITTED order_log rows to catch fills missed by callbacks.
 
@@ -293,7 +352,7 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
     age_cutoff = (now - timedelta(seconds=FILL_SWEEP_MIN_AGE_SECS)).isoformat()
     with get_connection() as db:
         rows = db.execute(
-            "SELECT id, ticker, ibkr_order_id, created_at FROM order_log "
+            "SELECT id, ticker, action, shares, ibkr_order_id, created_at FROM order_log "
             "WHERE status = 'SUBMITTED' AND created_at <= ?",
             (age_cutoff,),
         ).fetchall()
@@ -330,16 +389,56 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
     unknown_cutoff = (now - timedelta(seconds=FILL_SWEEP_UNKNOWN_GRACE_SECS)).isoformat()
 
     deferred_fills: list[tuple[str, float, int]] = []  # see reconciliation note
+    stale_entries: list = []  # broker cancel happens after commit, never inside the txn
+    stale_cutoff = (now - timedelta(seconds=STALE_ENTRY_MAX_AGE_SECS)).isoformat()
     with get_connection() as db:
         for row in rows:
             ibkr_id = row["ibkr_order_id"]
             if ibkr_id is None:
+                # Never got a broker id: the order_log row is written before the
+                # broker call, so the call failed or was never made. Nothing at
+                # IBKR to reconcile — without this it stays SUBMITTED forever
+                # (YOU SELL, id=296, since 2026-08-05).
+                if row["created_at"] <= unknown_cutoff:
+                    db.execute(
+                        "UPDATE order_log SET status = 'ERROR', updated_at = ?, notes = ? "
+                        "WHERE id = ? AND status = 'SUBMITTED'",
+                        (update_ts, "Never reached broker (no ibkr_order_id)", row["id"]),
+                    )
+                    errored += 1
+                    updated += 1
+                    logger.info(
+                        f"[worker] fill sweep: order id={row['id']} ticker={row['ticker']} "
+                        f"→ ERROR (no ibkr_order_id after grace)"
+                    )
                 continue
 
             if ibkr_id in live_order_ids:
+                if (row["action"] == "BUY" and row["created_at"] <= stale_cutoff
+                        and _position_fill_price(db, row) is None):
+                    stale_entries.append(row)
                 continue  # still open — leave as SUBMITTED
 
             # Order is no longer open — check if it was filled
+            pos_fp = None if ibkr_id in fill_map else _position_fill_price(db, row)
+            if pos_fp is not None:
+                db.execute(
+                    "UPDATE order_log SET status = 'FILLED', fill_price = ?, "
+                    "updated_at = ?, notes = ? "
+                    "WHERE id = ? AND status = 'SUBMITTED'",
+                    (pos_fp, update_ts,
+                     "Fill inferred from held IBKR position (avg_cost) — execution no longer visible",
+                     row["id"]),
+                )
+                deferred_fills.append((row["ticker"], pos_fp, ibkr_id))
+                filled += 1
+                updated += 1
+                logger.info(
+                    f"[worker] fill sweep: order id={row['id']} ticker={row['ticker']} "
+                    f"FILLED (inferred from position) @ ${pos_fp:.2f} (ibkr_id={ibkr_id})"
+                )
+                continue
+
             if ibkr_id in fill_map:
                 fp = fill_map[ibkr_id]
                 db.execute(
@@ -393,6 +492,38 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
 
     for _t, _fp, _oid in deferred_fills:
         record_fill(_t, _fp, _oid)
+
+    cancelled_tickers: list[str] = []
+    for row in stale_entries:
+        try:
+            ok = conn.cancel_order(row["ibkr_order_id"])
+        except Exception as e:
+            logger.warning(f"[worker] stale entry cancel failed for {row['ticker']}: {e}")
+            continue
+        if not ok:
+            continue
+        with get_connection() as db:
+            db.execute(
+                "UPDATE order_log SET status = 'CANCELLED', updated_at = ?, notes = ? "
+                "WHERE id = ? AND status = 'SUBMITTED'",
+                (update_ts,
+                 f"Stale unfilled entry cancelled after {STALE_ENTRY_MAX_AGE_SECS // 3600}h",
+                 row["id"]),
+            )
+        cancelled_tickers.append(row["ticker"])
+        updated += 1
+        logger.info(
+            f"[worker] fill sweep: stale entry id={row['id']} ticker={row['ticker']} "
+            f"ibkr_id={row['ibkr_order_id']} unfilled since {row['created_at']} → CANCELLED"
+        )
+    if cancelled_tickers:
+        try:
+            _send_telegram(
+                f"🧹 Cancelled {len(cancelled_tickers)} stale unfilled entry order(s) "
+                f"older than {STALE_ENTRY_MAX_AGE_SECS // 3600}h: {', '.join(cancelled_tickers)}"
+            )
+        except Exception:
+            pass
 
     logger.info(
         f"[worker] fill sweep complete: checked {len(rows)} stale rows, "
@@ -595,6 +726,8 @@ def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
     cancelled = []
     resized = []
     resized_tickers: set[str] = set()
+    now_mono = time.monotonic()
+    still_unbacked: set[int] = set()
     for o in sells:
         t = o.get("ticker")
         if t in pending_buys:
@@ -615,15 +748,31 @@ def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
                 except Exception as e:
                     logger.error(f"[worker] failed to resize resting SELL {t}: {e}")
             continue
+        oid = o["order_id"]
+        still_unbacked.add(oid)
+        first = _unbacked_first_seen.setdefault(oid, now_mono)
+        if now_mono - first < UNBACKED_SELL_CONFIRM_SECS:
+            logger.warning(
+                f"[worker] unbacked SELL {t} {qty}sh (#{oid}) — position reads {have:.0f}; "
+                f"waiting {UNBACKED_SELL_CONFIRM_SECS // 60} min to confirm before cancelling"
+            )
+            continue
         try:
-            if conn.cancel_order(o["order_id"]):
-                cancelled.append(f"{t} {qty}sh (#{o['order_id']})")
+            if conn.cancel_order(oid):
+                _unbacked_first_seen.pop(oid, None)
+                cancelled.append(f"{t} {qty}sh (#{oid})")
                 logger.error(
                     f"[worker] CANCELLED unbacked SELL: {t} {qty}sh — position is "
                     f"{have:.0f}, this order could only have opened a short"
                 )
         except Exception as e:
             logger.error(f"[worker] failed to cancel unbacked SELL {t}: {e}")
+
+    # Forget orders whose position came back (or that are gone) — the clock
+    # restarts from zero if they ever look unbacked again.
+    for oid in list(_unbacked_first_seen):
+        if oid not in still_unbacked:
+            del _unbacked_first_seen[oid]
 
     if cancelled:
         _send_telegram(
@@ -683,6 +832,25 @@ def _trading_days_since(entry_date_str: str) -> int:
     return count
 
 
+def _holding_period_start(history_desc, held: float) -> str | None:
+    """created_at of the earliest FILLED BUY needed to explain `held` shares,
+    walking newest -> oldest. Later SELLs add back what they removed. If the
+    records can't fully explain the position (missing BUY rows), returns the
+    oldest BUY seen — the old behaviour for corrupted history."""
+    need = held
+    entry_at = None
+    for h in history_desc:
+        qty = h["shares"] or 0
+        if h["action"] == "SELL":
+            need += qty
+            continue
+        entry_at = h["created_at"]
+        need -= qty
+        if need <= 0:
+            break
+    return entry_at
+
+
 def _check_time_stops(conn: IBKRConnection) -> None:
     """Exit zombie positions held > TIME_STOP_DAYS trading days with no direction.
 
@@ -725,22 +893,24 @@ def _check_time_stops(conn: IBKRConnection) -> None:
             # zombie-exited within 30 minutes of the new entry, because a brand-new
             # position's ~0% P&L sits squarely inside the zombie band. The entry
             # date must reset at the last point shares crossed back to flat.
+            #
+            # That reset used to be found by summing order_log forward from the
+            # first fill — which never returns to flat when an exit was missed.
+            # Bracket stop/target fills at IBKR are never written to order_log, so
+            # EXPO (73sh 07-31, exited via its bracket) read as still-held when
+            # bought fresh on 10-07 and was zombie-sold 11h later as "49d held";
+            # EVER/MUR/FUBO/CNX the same. Walk BACKWARD from the shares actually
+            # held now instead: the current holding period is the most recent
+            # BUYs that account for them. A missed exit before that point can no
+            # longer leak in.
             with get_connection() as db:
                 history = db.execute(
                     "SELECT action, shares, created_at FROM order_log "
                     "WHERE ticker = ? AND action IN ('BUY', 'SELL') AND status = 'FILLED' "
-                    "ORDER BY created_at ASC",
+                    "ORDER BY created_at DESC",
                     (ticker,),
                 ).fetchall()
-                running = 0.0
-                entry_at = None
-                for h in history:
-                    if h["action"] == "BUY":
-                        if running <= 0:
-                            entry_at = h["created_at"]
-                        running += h["shares"] or 0
-                    else:
-                        running -= h["shares"] or 0
+                entry_at = _holding_period_start(history, float(pos["shares"] or 0))
                 row = {"created_at": entry_at} if entry_at else None
 
                 if not row:

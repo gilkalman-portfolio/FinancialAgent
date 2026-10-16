@@ -55,6 +55,37 @@ def _split_fields(raw: pd.DataFrame, tickers: list, fields: tuple):
     return tuple(raw[[f]].rename(columns={f: t}) for f in fields)
 
 
+# Wall-clock ceiling on one yf.download batch. yfinance's own per-request
+# timeout doesn't bound the whole threads=True batch: on 2026-10-14 the
+# opening-print download hung for 3+ hours with no error and no log line
+# (a normal run takes ~2 min for ~2,460 tickers).
+_DOWNLOAD_DEADLINE_SECS = 300
+
+
+def _download_with_deadline(tickers: list, **kwargs) -> pd.DataFrame:
+    """yf.download on a throwaway daemon thread; raises TimeoutError past the
+    deadline. A hung thread can't be killed, only abandoned — so the caller
+    gets a loud failure instead of a silently stuck scan."""
+    result: dict = {}
+
+    def _run() -> None:
+        try:
+            result["df"] = yf.download(tickers, **kwargs)
+        except BaseException as e:  # surfaced to the caller below
+            result["err"] = e
+
+    t = threading.Thread(target=_run, name="gap-yf-download", daemon=True)
+    t.start()
+    t.join(_DOWNLOAD_DEADLINE_SECS)
+    if t.is_alive():
+        raise TimeoutError(
+            f"yf.download of {len(tickers)} tickers exceeded {_DOWNLOAD_DEADLINE_SECS}s"
+        )
+    if "err" in result:
+        raise result["err"]
+    return result.get("df")
+
+
 def _download_with_retry(tickers: list, **kwargs) -> pd.DataFrame:
     """One retry with a short backoff. These scanners run once/day, so an
     unretried rate-limit failure loses the entire day's check with no
@@ -63,7 +94,9 @@ def _download_with_retry(tickers: list, **kwargs) -> pd.DataFrame:
     last_err = None
     for attempt in (1, 2):
         try:
-            return yf.download(tickers, **kwargs)
+            return _download_with_deadline(tickers, **kwargs)
+        except TimeoutError:
+            raise  # never retry a hang — the stuck thread still owns yfinance's shared state
         except Exception as e:
             last_err = e
             if attempt == 2:

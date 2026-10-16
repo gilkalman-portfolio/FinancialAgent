@@ -556,12 +556,17 @@ class TestPremarketGapAlertNoOps:
 
 
 class TestOpeningPrintAlertNoOps:
-    def test_missing_config_key_is_noop(self):
+    def test_missing_gap_scanner_key_defaults_to_enabled(self):
+        # Same as the premarket sibling (fixed 2026-08-26): a missing
+        # "gap_scanner" key means enabled. The window check is mocked so this
+        # no longer depends on the wall clock (it used to fail ~09:37-10:30 ET).
         with patch.object(scheduler, "load_config", return_value={"enabled": True, "telegram": True}), \
              patch.object(scheduler, "_is_trading_day", return_value=True), \
-             patch("src.gap_scanner.scan_opening_prints") as scan:
+             patch.object(scheduler, "_in_opening_print_window", return_value=True), \
+             patch.object(scheduler, "_job_halted_on_clamps", return_value=False), \
+             patch("src.gap_scanner.scan_opening_prints", return_value=([], [])) as scan:
             scheduler.run_opening_print_alert()
-        scan.assert_not_called()
+        scan.assert_called_once()
 
     def test_outside_window_is_noop(self):
         cfg = {"enabled": True, "telegram": True, "gap_scanner": {"enabled": True}}
@@ -900,3 +905,45 @@ class TestClampHaltTripwire:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestDownloadDeadline:
+    """2026-10-14: the opening-print yf.download hung 3+ hours, silently."""
+
+    def test_hung_download_raises_timeout_and_is_not_retried(self, monkeypatch):
+        import threading
+        import src.gap_scanner as gs
+        release = threading.Event()
+        calls = []
+
+        def _hang(*a, **k):
+            calls.append(1)
+            release.wait(5)
+
+        monkeypatch.setattr(gs, "_DOWNLOAD_DEADLINE_SECS", 0.2)
+        monkeypatch.setattr(gs.yf, "download", _hang)
+        try:
+            with pytest.raises(TimeoutError):
+                gs._download_with_retry(["AAA"], period="1d")
+            assert len(calls) == 1
+        finally:
+            release.set()
+
+    def test_download_errors_still_propagate_and_retry(self, monkeypatch):
+        import src.gap_scanner as gs
+        calls = []
+
+        def _boom(*a, **k):
+            calls.append(1)
+            raise ValueError("rate limited")
+
+        monkeypatch.setattr(gs.time, "sleep", lambda s: None)
+        monkeypatch.setattr(gs.yf, "download", _boom)
+        with pytest.raises(ValueError):
+            gs._download_with_retry(["AAA"], period="1d")
+        assert len(calls) == 2
+
+    def test_fast_download_returns_frame(self, monkeypatch):
+        import src.gap_scanner as gs
+        monkeypatch.setattr(gs.yf, "download", lambda *a, **k: pd.DataFrame({"x": [1]}))
+        assert list(gs._download_with_retry(["AAA"])["x"]) == [1]

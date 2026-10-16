@@ -38,6 +38,9 @@ def _db(monkeypatch, tmp_path):
     import src.ibkr_worker  # noqa: F401
     monkeypatch.setattr("src.database.get_connection", _conn)
     monkeypatch.setattr("src.ibkr_worker.get_connection", _conn)
+    # Debounce off by default here; TestDebounce covers it explicitly.
+    monkeypatch.setattr("src.ibkr_worker.UNBACKED_SELL_CONFIRM_SECS", 0)
+    monkeypatch.setattr("src.ibkr_worker._unbacked_first_seen", {})
 
     c = _conn()
     c.execute("""CREATE TABLE ibkr_positions (ticker TEXT PRIMARY KEY, shares REAL,
@@ -205,3 +208,46 @@ class TestLeavesLegitimateOrders:
             assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
         conn.cancel_order.assert_not_called()
         conn.resize_sell_orders.assert_not_called()
+
+
+class TestDebounce:
+    """2026-10-09 21:55: a connectivity drop emptied ibkr_positions for one pass
+    and the live stop/target legs of six HELD positions were cancelled."""
+
+    def test_first_sighting_does_not_cancel(self, _db, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "UNBACKED_SELL_CONFIRM_SECS", 600)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("STNG", qty=144, oid=84012)]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
+        conn.cancel_order.assert_not_called()
+
+    def test_position_reappearing_resets_the_clock(self, _db, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "UNBACKED_SELL_CONFIRM_SECS", 600)
+        clock = [1000.0]
+        monkeypatch.setattr(ibkr_worker.time, "monotonic", lambda: clock[0])
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("STNG", qty=144, oid=84012)]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(conn)       # glitch: looks unbacked
+            _pos(_db, "STNG", 144)                                  # next sync heals it
+            clock[0] += 300
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+            assert 84012 not in ibkr_worker._unbacked_first_seen
+        conn.cancel_order.assert_not_called()
+
+    def test_still_unbacked_after_window_is_cancelled(self, _db, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "UNBACKED_SELL_CONFIRM_SECS", 600)
+        clock = [1000.0]
+        monkeypatch.setattr(ibkr_worker.time, "monotonic", lambda: clock[0])
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("BOX", qty=154, oid=11)]
+        conn.cancel_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
+            clock[0] += 601
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 1
+        conn.cancel_order.assert_called_once_with(11)
