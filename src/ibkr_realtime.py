@@ -293,6 +293,55 @@ class IBKRConnection:
 
         return result
 
+    def get_execution_details(self, lookback_days: int = 2, timeout: float = 15.0) -> dict[int, dict]:
+        """{order_id: {ticker, side, shares, avg_price, time}} aggregated per order.
+
+        Same sources and timeout discipline as get_executions(), with the detail
+        needed to log a fill that has no order_log row — bracket stop/target legs
+        are child orders with no row of their own. side is 'BOT' or 'SLD'.
+        """
+        import asyncio
+
+        from ib_async import ExecutionFilter, util
+
+        fills: list = []
+        try:
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+            efilter = ExecutionFilter(time=cutoff.strftime("%Y%m%d-%H:%M:%S"))
+            fills = list(util.run(
+                asyncio.wait_for(self.ib.reqExecutionsAsync(efilter), timeout=timeout)
+            ))
+        except asyncio.TimeoutError:
+            logger.warning(f"[ibkr] reqExecutions (details) timed out after {timeout}s")
+        except Exception as e:
+            logger.warning(f"[ibkr] reqExecutions (details) failed: {e}")
+        try:
+            fills += list(self.ib.fills())
+        except Exception as e:
+            logger.warning(f"[ibkr] ib.fills() failed: {e}")
+
+        seen: set = set()
+        result: dict[int, dict] = {}
+        for fill in fills:
+            try:
+                ex = fill.execution
+                if ex.execId in seen:  # broker snapshot and session fills overlap
+                    continue
+                seen.add(ex.execId)
+                d = result.setdefault(ex.orderId, {
+                    "ticker": fill.contract.symbol, "side": ex.side,
+                    "shares": 0.0, "notional": 0.0, "time": ex.time,
+                })
+                d["shares"] += float(ex.shares)
+                d["notional"] += float(ex.shares) * float(ex.price)
+                if ex.time and (d["time"] is None or ex.time < d["time"]):
+                    d["time"] = ex.time
+            except Exception:
+                continue
+        for d in result.values():
+            d["avg_price"] = d.pop("notional") / d["shares"] if d["shares"] else None
+        return result
+
     def modify_stop_order(
         self,
         ticker: str,

@@ -239,3 +239,100 @@ def test_unexplained_position_falls_back_to_oldest_buy():
 
 def test_no_buys_returns_none():
     assert w._holding_period_start([], 10) is None
+
+
+# ── bracket-leg exits never reached order_log (EXPO/EVER/DG) ────────────────
+
+from types import SimpleNamespace
+
+
+def _trade(order_id, action, ticker, filled, price):
+    return SimpleNamespace(
+        order=SimpleNamespace(orderId=order_id, action=action),
+        contract=SimpleNamespace(symbol=ticker),
+        orderStatus=SimpleNamespace(status="Filled", avgFillPrice=price, filled=filled),
+    )
+
+
+def _sells(ticker):
+    with db.get_connection() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM order_log WHERE ticker=? AND action='SELL'", (ticker,))]
+
+
+def test_callback_logs_stop_leg_fill_without_touching_forward_signals(temp_db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(w, "record_fill", lambda *a: calls.append(a))
+    _order("EXPO", "BUY", 182, 83646, _ago(hours=11), status="FILLED")
+    with db.get_connection() as c:
+        c.execute("UPDATE order_log SET stop_order_id=83647 WHERE ibkr_order_id=83646")
+    w._on_order_status(_trade(83647, "SELL", "EXPO", 182, 68.10))
+    rows = _sells("EXPO")
+    assert len(rows) == 1
+    r = rows[0]
+    assert (r["status"], r["shares"], r["fill_price"], r["ibkr_order_id"]) == ("FILLED", 182, 68.10, 83647)
+    assert "stop leg" in r["notes"]
+    assert calls == []
+
+
+def test_callback_still_updates_existing_row_and_records_fill(temp_db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(w, "record_fill", lambda *a: calls.append(a))
+    _order("AAA", "SELL", 10, 501, _ago(minutes=10))
+    w._on_order_status(_trade(501, "SELL", "AAA", 10, 12.0))
+    assert _row(501)["status"] == "FILLED"
+    assert len(_sells("AAA")) == 1
+    assert calls == [("AAA", 12.0, 501)]
+
+
+def test_callback_ignores_unknown_buy_fill(temp_db):
+    w._on_order_status(_trade(999, "BUY", "ZZZ", 10, 5.0))
+    with db.get_connection() as c:
+        assert c.execute("SELECT COUNT(*) FROM order_log").fetchone()[0] == 0
+
+
+class _DetailConn(_FakeConn):
+    def __init__(self, details, **kw):
+        super().__init__(**kw)
+        self._details = details
+
+    def get_execution_details(self):
+        return self._details
+
+
+def test_sweep_logs_sell_execution_missing_from_order_log(temp_db):
+    t = datetime(2026, 10, 8, 14, 0).astimezone()
+    conn = _DetailConn({
+        84500: {"ticker": "DG", "side": "SLD", "shares": 51.0, "avg_price": 130.5, "time": t},
+        84501: {"ticker": "DG", "side": "BOT", "shares": 10.0, "avg_price": 120.0, "time": t},
+        0: {"ticker": "MAN", "side": "SLD", "shares": 5.0, "avg_price": 1.0, "time": t},
+    })
+    w._periodic_fill_sweep(conn)
+    rows = _sells("DG")
+    assert len(rows) == 1 and rows[0]["shares"] == 51 and rows[0]["fill_price"] == 130.5
+    assert rows[0]["created_at"].startswith("2026-10-08")
+    assert _sells("MAN") == []
+    # idempotent: a second sweep (or a later callback) never duplicates it
+    w._last_fill_sweep_ts = None
+    w._periodic_fill_sweep(conn)
+    w._on_order_status(_trade(84500, "SELL", "DG", 51, 130.5))
+    assert len(_sells("DG")) == 1
+
+
+def test_sweep_skips_execution_that_already_has_a_row(temp_db):
+    _order("AAA", "SELL", 10, 777, _ago(hours=1), status="FILLED")
+    conn = _DetailConn({777: {"ticker": "AAA", "side": "SLD", "shares": 10.0,
+                              "avg_price": 12.0, "time": None}})
+    w._periodic_fill_sweep(conn)
+    assert len(_sells("AAA")) == 1
+
+
+def test_logged_leg_exit_restarts_time_stop_clock(temp_db):
+    # The point of all this: with the exit logged, a re-buy is a new holding period.
+    _order("EVER", "BUY", 493, 1, "2026-09-03T17:00:00", status="FILLED")
+    w._log_unrecorded_sell(2, "EVER", 493, 19.0, "2026-09-20T15:00:00", "test")
+    _order("EVER", "BUY", 322, 3, "2026-10-08T17:23:00", status="FILLED")
+    with db.get_connection() as c:
+        hist = c.execute("SELECT action, shares, created_at FROM order_log "
+                         "WHERE ticker='EVER' AND status='FILLED' ORDER BY created_at DESC").fetchall()
+    assert w._holding_period_start(hist, 322) == "2026-10-08T17:23:00"

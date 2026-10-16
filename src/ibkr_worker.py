@@ -156,8 +156,8 @@ def _send_telegram(message: str) -> Optional[bool]:
 @retry_on_busy()
 def _update_order_log(ibkr_order_id: int, status: str,
                       fill_price: float | None = None,
-                      notes: str | None = None) -> None:
-    """Update order_log row when IBKR reports a status change.
+                      notes: str | None = None) -> int:
+    """Update order_log row when IBKR reports a status change. Returns rows updated.
 
     WHERE clause is status-dependent to handle the bracket-order race condition:
     TWS sometimes fires Cancelled for the parent order (on reconnect/reconcile)
@@ -174,11 +174,50 @@ def _update_order_log(ibkr_order_id: int, status: str,
     else:
         where_clause = "WHERE ibkr_order_id = ? AND status NOT IN ('FILLED', 'CANCELLED', 'ERROR')"
     with get_connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             f"UPDATE order_log SET status = ?, fill_price = COALESCE(?, fill_price), "
             f"updated_at = ?, notes = COALESCE(?, notes) {where_clause}",
             (status, fill_price, now, notes, ibkr_order_id),
         )
+        return cur.rowcount
+
+
+def _log_unrecorded_sell(ibkr_order_id: int, ticker: str, shares: float,
+                         fill_price: float | None, filled_at: str | None,
+                         source: str) -> bool:
+    """Insert a FILLED SELL row for an execution order_log has no row for.
+
+    Bracket stop/target legs are child orders: only the parent BUY gets an
+    order_log row, so a stop or target fill updated nothing and the exit was
+    simply never recorded (EXPO, EVER, DG, ~15 orphans since 2026-08-25). That
+    broke the time stop's holding-period math and makes order_log useless as a
+    trade ledger. Idempotent per ibkr_order_id — a row that already exists for
+    this order (any action, any status) is never duplicated.
+    """
+    if not shares or shares <= 0:
+        return False
+    now = datetime.now().isoformat()
+    with get_connection() as db:
+        if db.execute("SELECT 1 FROM order_log WHERE ibkr_order_id = ? LIMIT 1",
+                      (ibkr_order_id,)).fetchone():
+            return False
+        parent = db.execute(
+            "SELECT id FROM order_log WHERE stop_order_id = ? LIMIT 1", (ibkr_order_id,)
+        ).fetchone()
+        leg = (f"bracket stop leg of order_log id={parent['id']}" if parent
+               else "bracket target leg or untracked SELL")
+        db.execute(
+            "INSERT INTO order_log (ticker, action, shares, entry_price, stop_price, "
+            "target_price, status, fill_price, ibkr_order_id, created_at, updated_at, notes) "
+            "VALUES (?, 'SELL', ?, ?, 0, 0, 'FILLED', ?, ?, ?, ?, ?)",
+            (ticker, int(round(shares)), fill_price or 0.0, fill_price, ibkr_order_id,
+             filled_at or now, now, f"Logged from {source}: {leg}"),
+        )
+    logger.info(
+        f"[worker] logged unrecorded SELL fill: {ticker} {shares:.0f}sh "
+        f"@ {fill_price} ibkr_id={ibkr_order_id} ({leg}, via {source})"
+    )
+    return True
 
 
 def _on_order_status(trade) -> None:
@@ -190,8 +229,15 @@ def _on_order_status(trade) -> None:
         fill_price = trade.orderStatus.avgFillPrice
 
         if status_str == "Filled":
-            _update_order_log(order_id, "FILLED", fill_price=fill_price)
-            record_fill(ticker, fill_price, order_id)
+            if _update_order_log(order_id, "FILLED", fill_price=fill_price):
+                record_fill(ticker, fill_price, order_id)
+            elif trade.order.action == "SELL":
+                # No row for this order: a bracket stop/target leg. Log the exit.
+                # Never record_fill() it — there is no signal row it belongs to,
+                # and record_fill would attach it to the newest unfilled one.
+                _log_unrecorded_sell(order_id, ticker,
+                                     float(trade.orderStatus.filled or 0),
+                                     fill_price, None, "fill callback")
             _send_telegram(
                 f"💰 ORDER FILLED — {ticker}\n"
                 f"Fill price: ${fill_price:.2f} | Order ID: {order_id}"
@@ -298,6 +344,40 @@ def _reconcile_orders_on_startup(conn: IBKRConnection) -> None:
     )
 
 
+def _log_unrecorded_sell_executions(conn) -> int:
+    """Backstop for the fill callback: any SELL execution IBKR reports that has
+    no order_log row gets one. Catches leg fills that landed while the worker
+    was between cycles or disconnected. Paper serves only ~today's executions,
+    so this runs every sweep. Executions, not position deltas: a disconnect can
+    make positions read empty (2026-10-09) — an execution can't be invented."""
+    getter = getattr(conn, "get_execution_details", None)
+    if getter is None:
+        return 0
+    try:
+        details = getter()
+    except Exception as e:
+        logger.warning(f"[worker] execution details unavailable: {e}")
+        return 0
+    logged = 0
+    for oid, d in (details or {}).items():
+        # orderId <= 0: placed outside this API client (manual TWS). Their ids
+        # aren't unique, so aggregating them would merge unrelated fills.
+        if d.get("side") != "SLD" or not oid or oid <= 0:
+            continue
+        t = d.get("time")
+        try:
+            filled_at = t.astimezone().replace(tzinfo=None).isoformat() if t else None
+        except Exception:
+            filled_at = None
+        try:
+            if _log_unrecorded_sell(oid, d["ticker"], d.get("shares") or 0,
+                                    d.get("avg_price"), filled_at, "execution sweep"):
+                logged += 1
+        except Exception as e:
+            logger.warning(f"[worker] could not log execution {oid}: {e}")
+    return logged
+
+
 def _position_fill_price(db, row) -> float | None:
     """avg_cost of a fresh held long position that can only be explained by this
     BUY row, else None. SELL rows never qualify — a missing position doesn't
@@ -356,6 +436,8 @@ def _periodic_fill_sweep(conn: IBKRConnection) -> None:
             "WHERE status = 'SUBMITTED' AND created_at <= ?",
             (age_cutoff,),
         ).fetchall()
+
+    _log_unrecorded_sell_executions(conn)
 
     if not rows:
         logger.info("[worker] fill sweep: no stale SUBMITTED rows")
