@@ -755,6 +755,21 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
         logger.info(f"[worker] trailing stops updated: {updated} positions raised")
 
 
+def _closed_by_recorded_sell(ticker: str) -> bool:
+    """True if order_log's latest FILLED row for ticker is a SELL — i.e. we
+    know we flattened it, so a missing position is not a sync glitch."""
+    try:
+        with get_connection() as db:
+            r = db.execute(
+                "SELECT action FROM order_log WHERE ticker = ? AND status = 'FILLED' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        return r is not None and r["action"] == "SELL"
+    except Exception:
+        return False
+
+
 def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
     """Enforce: no resting SELL order may ever exceed the position it protects.
 
@@ -833,7 +848,14 @@ def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
         oid = o["order_id"]
         still_unbacked.add(oid)
         first = _unbacked_first_seen.setdefault(oid, now_mono)
-        if now_mono - first < UNBACKED_SELL_CONFIRM_SECS:
+        # The debounce exists for a position that vanished with no explanation
+        # (a sync glitch). When our own order_log shows we closed it, there is
+        # nothing to confirm — waiting only leaves a live short trigger armed:
+        # 2026-10-16 FUBO's time stop sold 1508sh at 17:58, the old bracket STP
+        # sat in this window (reset by two worker restarts) and filled at 18:10,
+        # opening a 1508sh short.
+        if (now_mono - first < UNBACKED_SELL_CONFIRM_SECS
+                and not _closed_by_recorded_sell(t)):
             logger.warning(
                 f"[worker] unbacked SELL {t} {qty}sh (#{oid}) — position reads {have:.0f}; "
                 f"waiting {UNBACKED_SELL_CONFIRM_SECS // 60} min to confirm before cancelling"

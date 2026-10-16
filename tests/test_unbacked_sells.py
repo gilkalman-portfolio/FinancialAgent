@@ -43,6 +43,8 @@ def _db(monkeypatch, tmp_path):
     monkeypatch.setattr("src.ibkr_worker._unbacked_first_seen", {})
 
     c = _conn()
+    c.execute("""CREATE TABLE order_log (id INTEGER PRIMARY KEY, ticker TEXT, action TEXT,
+                 shares INTEGER, status TEXT, created_at TEXT)""")
     c.execute("""CREATE TABLE ibkr_positions (ticker TEXT PRIMARY KEY, shares REAL,
                  avg_cost REAL, unrealized_pnl REAL, market_value REAL,
                  last_synced TEXT, exit_tier INTEGER DEFAULT 0)""")
@@ -251,3 +253,33 @@ class TestDebounce:
             clock[0] += 601
             assert ibkr_worker._reconcile_resting_sell_orders(conn) == 1
         conn.cancel_order.assert_called_once_with(11)
+
+
+    def test_position_we_sold_is_cancelled_immediately(self, _db, monkeypatch):
+        """FUBO 2026-10-16: time stop sold 1508sh, the old bracket STP must not
+        wait out the debounce — it filled 12 min later and opened a short."""
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "UNBACKED_SELL_CONFIRM_SECS", 600)
+        with _db() as c:
+            c.execute("INSERT INTO order_log (ticker, action, shares, status, created_at) "
+                      "VALUES ('FUBO','BUY',1508,'FILLED','2026-10-15T17:20:00')")
+            c.execute("INSERT INTO order_log (ticker, action, shares, status, created_at) "
+                      "VALUES ('FUBO','SELL',1508,'FILLED','2026-10-16T17:58:31')")
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("FUBO", qty=1508, oid=84993)]
+        conn.cancel_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 1
+        conn.cancel_order.assert_called_once_with(84993)
+
+    def test_unexplained_disappearance_still_waits(self, _db, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "UNBACKED_SELL_CONFIRM_SECS", 600)
+        with _db() as c:
+            c.execute("INSERT INTO order_log (ticker, action, shares, status, created_at) "
+                      "VALUES ('STNG','BUY',144,'FILLED','2026-10-08T17:00:00')")
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [_order("STNG", qty=144, oid=84012)]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
+        conn.cancel_order.assert_not_called()
