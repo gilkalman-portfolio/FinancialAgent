@@ -780,23 +780,52 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
         logger.warning(f"[worker] trailing stop: get_open_orders failed: {e}")
         return
 
-    # Build map: ticker -> current stop price (STP SELL orders only)
-    stop_map: dict[str, float] = {}
+    # Group resting STP SELL orders by ticker. A ticker can have more than one
+    # (e.g. a leftover leg from an earlier bracket); the price compared below
+    # must come from the exact order that will be modified, not whichever one
+    # happened to be listed last.
+    stops_by_ticker: dict[str, list[dict]] = {}
     for o in open_orders:
         if o["order_type"] == "STP" and o["action"] == "SELL":
-            aux = o.get("aux_price")
-            if aux is not None:
-                stop_map[o["ticker"]] = float(aux)
+            stops_by_ticker.setdefault(o["ticker"], []).append(o)
 
-    if not stop_map:
+    if not stops_by_ticker:
         logger.debug("[worker] trailing stop: no active STP SELL orders found")
         return
 
     updated = 0
-    for ticker, current_stop in stop_map.items():
+    for ticker, stops in stops_by_ticker.items():
         try:
             if _held_shares(ticker) <= 0:
                 logger.debug(f"[worker] {ticker}: trailing stop skipped — no held position (entry not filled)")
+                continue
+            ids = [s.get("order_id") for s in stops]
+            stop_order_id = _lookup_stop_order_id(ticker)
+            if stop_order_id is not None:
+                if stop_order_id not in ids:
+                    logger.warning(
+                        f"[worker] {ticker}: recorded STP leg order_id={stop_order_id} is not "
+                        f"among live STP SELL orders {ids} — trailing stop skipped"
+                    )
+                    continue
+                if len(stops) > 1:
+                    logger.warning(
+                        f"[worker] {ticker}: {len(stops)} resting STP SELL orders {ids} — "
+                        f"trailing only the recorded leg order_id={stop_order_id}"
+                    )
+            elif len(stops) == 1:
+                # Pre-migration row with no recorded id: the one live STP is
+                # unambiguous, so target it by its own id.
+                stop_order_id = stops[0].get("order_id")
+            else:
+                logger.warning(
+                    f"[worker] {ticker}: {len(stops)} resting STP SELL orders {ids} and no "
+                    f"recorded stop_order_id — ambiguous, trailing stop skipped"
+                )
+                continue
+            current_stop = _current_stop_price(conn, ticker, stop_order_id)
+            if current_stop is None:
+                logger.debug(f"[worker] {ticker}: trailing stop skipped — no trigger price on order_id={stop_order_id}")
                 continue
             df = conn.historical_bars(ticker, bar_size=BAR_SIZE, duration="5 D")
             if df.empty or len(df) < 2:
@@ -822,7 +851,7 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
                 )
                 continue
 
-            if conn.modify_stop_order(ticker, new_stop, stop_order_id=_lookup_stop_order_id(ticker)):
+            if conn.modify_stop_order(ticker, new_stop, stop_order_id=stop_order_id):
                 logger.info(
                     f"[worker] {ticker}: trailing stop raised "
                     f"${current_stop:.2f} -> ${new_stop:.2f} "
@@ -1244,7 +1273,11 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                 _sid = _lookup_stop_order_id(ticker)
                 _cur = _current_stop_price(conn, ticker, _sid)
                 if _cur is None or breakeven > _cur:
-                    conn.modify_stop_order(ticker, breakeven, stop_order_id=_sid)
+                    if not conn.modify_stop_order(ticker, breakeven, stop_order_id=_sid):
+                        logger.warning(
+                            f"[worker] T1 {ticker}: breakeven stop ${breakeven:.2f} NOT "
+                            f"confirmed by IBKR — stop left at its previous level"
+                        )
                 else:
                     logger.info(
                         f"[worker] T1 {ticker}: stop ${_cur:.2f} already >= breakeven "

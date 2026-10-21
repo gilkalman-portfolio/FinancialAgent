@@ -519,7 +519,7 @@ class TestTrailingStopUsesLookedUpStopOrderId:
 
         conn = MagicMock()
         conn.get_open_orders.return_value = [{
-            "order_id": 42, "ticker": "SENEA", "action": "SELL",
+            "order_id": 777, "ticker": "SENEA", "action": "SELL",
             "order_type": "STP", "aux_price": 90.0, "lmt_price": None,
             "qty": 100, "status": "Submitted",
         }]
@@ -533,11 +533,13 @@ class TestTrailingStopUsesLookedUpStopOrderId:
         assert args[0] == "SENEA"
         assert kwargs.get("stop_order_id") == 777
 
-    def test_falls_back_to_none_when_order_log_has_no_record(self, _test_db):
+    def test_targets_the_single_live_stp_when_order_log_has_no_record(self, _test_db):
         """No order_log row at all for this ticker (e.g. a position opened
-        before this fix) — must still call modify_stop_order, just without a
-        stop_order_id, so it falls back to the original ticker/type/action
-        scan instead of silently skipping the raise."""
+        before this fix) — must still call modify_stop_order instead of
+        silently skipping the raise. With exactly one live STP SELL for the
+        ticker that order is unambiguous, so it is targeted by its own id
+        (2026-10-21: the price compared and the order modified must be the
+        same order)."""
         from src import ibkr_worker
 
         _insert_position(_test_db, "NOROW", 100, 100.0, 0.0)  # trail only held positions
@@ -555,4 +557,4 @@ class TestTrailingStopUsesLookedUpStopOrderId:
         conn.modify_stop_order.assert_called_once()
         args, kwargs = conn.modify_stop_order.call_args
         assert args[0] == "NOROW"
-        assert kwargs.get("stop_order_id") is None
+        assert kwargs.get("stop_order_id") == 42

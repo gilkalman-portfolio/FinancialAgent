@@ -14,6 +14,7 @@ Connection target: Docker IB Gateway running on localhost.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Iterator, Literal
@@ -33,6 +34,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 PAPER_PORT = 4002
 LIVE_PORT = 4001
+
+# Upper bound on how long modify_stop_order() waits for the broker to echo a
+# modification. Normal acks arrive in ~0.2s; even one wait per held position
+# stays far below ibkr_worker's 720s stall guard.
+MODIFY_CONFIRM_TIMEOUT_SECS = 5.0
+# Order-related codes that are informational, not a rejection of the modify
+# (399 = "order will not be placed at the exchange until ..." for out-of-RTH
+# stops; 2100-2199 are connection/farm notices).
+_BENIGN_ORDER_CODES = frozenset({399}) | frozenset(range(2100, 2200))
 
 BarSize = Literal["1 min", "5 mins", "15 mins", "30 mins", "1 hour", "1 day"]
 WhatToShow = Literal["TRADES", "MIDPOINT", "BID", "ASK"]
@@ -347,6 +357,7 @@ class IBKRConnection:
         ticker: str,
         new_stop_price: float,
         stop_order_id: int | None = None,
+        confirm_timeout: float = MODIFY_CONFIRM_TIMEOUT_SECS,
     ) -> bool:
         """Raise the trailing stop for an open STP order on ticker.
 
@@ -360,32 +371,109 @@ class IBKRConnection:
         first match wins, same as before this parameter existed.
 
         Uses placeOrder() again — IBKR treats a re-submitted order with the
-        same orderId as a modification. Returns True if an order was found
-        and modified, False otherwise.
+        same orderId as a modification — and then WAITS (bounded by
+        confirm_timeout) for the broker to acknowledge it. Returns True only
+        when the broker echoed the order back (openOrder) with the new
+        trigger price; False if no order was found, the broker rejected the
+        modify, or no confirmation arrived in time.
+
+        Why the wait exists: this used to return True the instant placeOrder()
+        queued the message. The broker's answer arrives ~200ms later, and the
+        worker disconnects at the end of the cycle — sometimes within 10ms of
+        the last modify — so a rejection was either logged long after the
+        worker had already reported "trailing stop raised", or never seen at
+        all. On 2026-09-09..11 MUR and CRC were rejected 183 times in a row
+        ("Error 201 ... Cannot modify suspended order") while the worker kept
+        logging a successful raise every pass. Waiting here also guarantees
+        the cycle cannot disconnect before the broker has answered.
         """
         new_stop_price = round(new_stop_price, 2)
+        target = None
+        candidates = []
         for trade in self.ib.openTrades():
             o = trade.order
             if stop_order_id is not None:
-                matches = o.orderId == stop_order_id
-            else:
-                matches = (
-                    trade.contract.symbol == ticker
-                    and o.orderType == "STP"
-                    and o.action == "SELL"
+                if o.orderId == stop_order_id:
+                    target = trade
+                    break
+            elif (
+                trade.contract.symbol == ticker
+                and o.orderType == "STP"
+                and o.action == "SELL"
+            ):
+                candidates.append(trade)
+        if stop_order_id is None and candidates:
+            target = candidates[0]
+            if len(candidates) > 1:
+                logger.warning(
+                    f"[ibkr] {ticker}: {len(candidates)} resting STP SELL orders "
+                    f"({[t.order.orderId for t in candidates]}) and no stop_order_id "
+                    f"— modifying the first (order_id={target.order.orderId})"
                 )
-            if matches:
-                old_price = round(getattr(o, "auxPrice", 0.0), 2)
-                o.auxPrice = new_stop_price
-                self.ib.placeOrder(trade.contract, o)
-                logger.info(
-                    f"[ibkr] trailing stop updated: {ticker} "
-                    f"${old_price:.2f} -> ${new_stop_price:.2f}"
-                )
-                return True
-        logger.debug(
-            f"[ibkr] no active STP SELL order found for {ticker}"
-            + (f" matching order_id={stop_order_id}" if stop_order_id is not None else "")
+        if target is None:
+            logger.debug(
+                f"[ibkr] no active STP SELL order found for {ticker}"
+                + (f" matching order_id={stop_order_id}" if stop_order_id is not None else "")
+            )
+            return False
+        if target.isDone():
+            logger.warning(
+                f"[ibkr] {ticker}: order_id={target.order.orderId} is "
+                f"{target.orderStatus.status} — cannot modify"
+            )
+            return False
+
+        o = target.order
+        order_id = o.orderId
+        old_price = round(float(getattr(o, "auxPrice", 0.0) or 0.0), 2)
+        echoed: list[float] = []
+        errors: list[tuple[int, str]] = []
+
+        def _on_open_order(trade) -> None:
+            if trade.order.orderId == order_id:
+                echoed.append(round(float(trade.order.auxPrice), 2))
+
+        def _on_error(req_id, code, msg, *args) -> None:
+            if req_id == order_id:
+                errors.append((int(code), str(msg)))
+
+        self.ib.openOrderEvent += _on_open_order
+        self.ib.errorEvent += _on_error
+        try:
+            o.auxPrice = new_stop_price
+            self.ib.placeOrder(target.contract, o)
+            deadline = time.monotonic() + confirm_timeout
+            while time.monotonic() < deadline:
+                if any(abs(p - new_stop_price) < 0.005 for p in echoed):
+                    break
+                if any(c not in _BENIGN_ORDER_CODES for c, _ in errors):
+                    break
+                self.ib.sleep(0.05)
+        finally:
+            self.ib.openOrderEvent -= _on_open_order
+            self.ib.errorEvent -= _on_error
+
+        if any(abs(p - new_stop_price) < 0.005 for p in echoed):
+            logger.info(
+                f"[ibkr] trailing stop updated: {ticker} "
+                f"${old_price:.2f} -> ${new_stop_price:.2f} (order_id={order_id}, confirmed)"
+            )
+            return True
+
+        # Not confirmed: the broker still holds the old price (rejected) or we
+        # don't know. Put the local copy back so anything later in this cycle
+        # reads the conservative value, not the one we wished for.
+        if not echoed:
+            o.auxPrice = old_price
+        if errors:
+            reason = "; ".join(f"{c}: {m}" for c, m in errors)
+        elif echoed:
+            reason = f"broker echoed ${echoed[-1]:.2f} instead"
+        else:
+            reason = f"no broker acknowledgement within {confirm_timeout:.1f}s"
+        logger.warning(
+            f"[ibkr] trailing stop NOT confirmed: {ticker} order_id={order_id} "
+            f"${old_price:.2f} -> ${new_stop_price:.2f} — {reason}"
         )
         return False
 

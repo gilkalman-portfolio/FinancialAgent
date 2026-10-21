@@ -190,3 +190,86 @@ def test_t1_breakeven_still_raises_a_lower_stop(_db):
     args, kwargs = conn.modify_stop_order.call_args
     assert args[1] == pytest.approx(86.15)
     assert kwargs.get("stop_order_id") == 777
+
+
+# ── Defect 2 (2026-10-21): two resting STP SELLs for one ticker ──────────────
+# _update_trailing_stops used to build stop_map {ticker: aux} (last order
+# wins) but modify the order identified by order_log.stop_order_id — so the
+# "never lower / only raise" comparison could use a different order's price
+# than the order actually being modified.
+
+def _conn_two_stops(ticker, stops, hourly, daily):
+    """stops: list of (order_id, aux_price)."""
+    conn = MagicMock()
+    conn.get_open_orders.return_value = [{
+        "order_id": oid, "ticker": ticker, "action": "SELL", "order_type": "STP",
+        "aux_price": aux, "lmt_price": None, "qty": 100, "status": "Submitted"}
+        for oid, aux in stops]
+    conn.historical_bars.side_effect = lambda t, bar_size="1 hour", duration="10 D", **k: (
+        daily if bar_size == "1 day" else hourly)
+    conn.modify_stop_order.return_value = True
+    return conn
+
+
+def test_compares_against_the_recorded_leg_not_the_last_listed(_db, caplog):
+    """Recorded leg 100 sits at 13.50 (above the 13.10 candidate) — must NOT
+    modify, even though the other, later-listed order 200 sits at 12.00 and
+    would have made the old stop_map say 'raise'. The old code would then
+    have LOWERED order 100 from 13.50 to 13.10."""
+    from src import ibkr_worker
+    _pos(_db, "SBGI", 971, 13.05)
+    _buy(_db, "SBGI", 100)
+    conn = _conn_two_stops("SBGI", [(100, 13.50), (200, 12.00)],
+                           _hourly(14.00), _daily(13.11, day_range=0.45))
+    with caplog.at_level("WARNING"):
+        ibkr_worker._update_trailing_stops(conn)
+    conn.modify_stop_order.assert_not_called()
+    assert "2 resting STP SELL orders" in caplog.text
+
+
+def test_raises_the_recorded_leg_when_it_is_the_lower_one(_db):
+    from src import ibkr_worker
+    _pos(_db, "SBGI", 971, 13.05)
+    _buy(_db, "SBGI", 200)
+    conn = _conn_two_stops("SBGI", [(100, 13.50), (200, 12.00)],
+                           _hourly(14.00), _daily(13.11, day_range=0.45))
+    ibkr_worker._update_trailing_stops(conn)
+    conn.modify_stop_order.assert_called_once()
+    args, kwargs = conn.modify_stop_order.call_args
+    assert args[1] == pytest.approx(13.10, abs=0.01)
+    assert kwargs.get("stop_order_id") == 200
+
+
+def test_multiple_stops_without_recorded_id_is_skipped_as_ambiguous(_db, caplog):
+    from src import ibkr_worker
+    _pos(_db, "AAA", 100, 50.0)  # no order_log row -> no stop_order_id
+    conn = _conn_two_stops("AAA", [(1, 40.0), (2, 41.0)], _hourly(60.0), _daily(60.0, day_range=1.0))
+    with caplog.at_level("WARNING"):
+        ibkr_worker._update_trailing_stops(conn)
+    conn.modify_stop_order.assert_not_called()
+    assert "ambiguous" in caplog.text
+
+
+def test_recorded_id_not_live_is_skipped_with_warning(_db, caplog):
+    from src import ibkr_worker
+    _pos(_db, "SBGI", 971, 13.05)
+    _buy(_db, "SBGI", 999)  # stale id
+    conn = _conn_two_stops("SBGI", [(100, 12.00)], _hourly(14.00), _daily(13.11, day_range=0.45))
+    with caplog.at_level("WARNING"):
+        ibkr_worker._update_trailing_stops(conn)
+    conn.modify_stop_order.assert_not_called()
+    assert "not among live STP SELL orders" in caplog.text
+
+
+def test_unconfirmed_modify_is_not_logged_as_raised(_db, caplog):
+    """modify_stop_order now returns False when IBKR doesn't confirm; the worker
+    must not log 'trailing stop raised' in that case."""
+    from src import ibkr_worker
+    _pos(_db, "SBGI", 971, 13.05)
+    _buy(_db, "SBGI", 85945)
+    conn = _conn("SBGI", 12.21, _hourly(14.00), _daily(13.11, day_range=0.45))
+    conn.modify_stop_order.return_value = False
+    with caplog.at_level("INFO"):
+        ibkr_worker._update_trailing_stops(conn)
+    conn.modify_stop_order.assert_called_once()
+    assert "trailing stop raised" not in caplog.text
