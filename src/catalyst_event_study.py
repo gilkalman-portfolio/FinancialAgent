@@ -47,7 +47,14 @@ bar-by-bar replay, rather than reinventing either concept:
      ticker), to confirm a measured effect isn't just generic drift/beta that
      would show up on any day for these same names. Pattern observed in
      matthias-wyss/iti-8k-analysis (GitHub) — not previously done anywhere
-     in this codebase.
+     in this codebase. Fixed 2026-10-21: compares ABNORMAL returns (vs a
+     benchmark, same series/window for both samples), placebo dates confined
+     to the real events' calendar window (same regime), and split-like /
+     implausible observations dropped from both samples — see placebo_test().
+
+  Insider-cluster WATCH rows (src/insider_cluster_scanner.py) share
+  signal_type='WATCH' but are a different study; _watch_rows() excludes them
+  centrally (forward_signals.NEWS_WATCH_ONLY_SQL), fixed 2026-10-21.
 
   4. Documented, uncorrectable caveat (see also
      src/forward_signals.py::record_watch_signals docstring): Polygon's
@@ -132,6 +139,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from src.database import get_connection
+from src.forward_signals import NEWS_WATCH_ONLY_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +380,13 @@ def _watch_rows(days: int, promoted_only: bool = False) -> list:
     out of ~270-290 hits) -- comparing direction_report(promoted_only=True)
     against the unrestricted default is the direct way to check whether the
     relationship holds, strengthens, or is an artifact of that selection.
+
+    Insider-cluster WATCH rows (src/insider_cluster_scanner.py, catalyst_summary
+    prefixed '[insider_cluster]', ai_verdict='cluster_N') are ALWAYS excluded
+    here -- they share signal_type='WATCH' but are a different study entirely.
+    Every reader in this module (compute_abnormal_returns, direction_report,
+    liquidity_matched_direction_report, placebo_test) goes through this one
+    function, so the exclusion is central, not per-consumer.
     """
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     cols = ", ".join(f"return_{h}d_pct" for h in HORIZONS)
@@ -405,7 +420,8 @@ def _watch_rows(days: int, promoted_only: bool = False) -> list:
     with get_connection() as conn:
         rows = conn.execute(
             f"SELECT ticker, signal_ts, ai_verdict AS direction, {cols} "
-            f"FROM forward_signals WHERE signal_type = 'WATCH' AND signal_ts >= ?{promoted_clause}",
+            f"FROM forward_signals WHERE signal_type = 'WATCH' AND {NEWS_WATCH_ONLY_SQL} "
+            f"AND signal_ts >= ?{promoted_clause}",
             params,
         ).fetchall()
     out = []
@@ -722,91 +738,284 @@ def format_liquidity_matched_report(d: dict) -> str:
 # Methodology upgrade #3: placebo / control-date test
 # ─────────────────────────────────────────────────────────────────────────
 
+# Robustness filters shared by the real and placebo samples in placebo_test().
+# Applied IDENTICALLY to both, so they cannot bias the comparison toward
+# either side -- they only keep corrupt price data out of both.
+#
+# 1. Split / bad-bar guard: any single bar-to-bar close ratio inside the
+#    measurement window beyond x3 (or below 1/3) marks the window as suspect.
+#    auto_adjust normally removes splits, but yfinance occasionally misses one
+#    (especially recent reverse splits on small caps -- a 1:10 reverse split
+#    shows up as a +900% "day"), and recycled/delisted symbols produce the
+#    same signature. A genuine 3x / -67% one-day move does happen on a
+#    micro-cap; dropping it is the documented price of not letting split
+#    artifacts dominate a mean/sd. Non-finite or non-positive bars in the
+#    window also mark it suspect.
+# 2. Observation-level cap: |abnormal return| > PLACEBO_MAX_ABS_ABNORMAL_PCT
+#    over the window is dropped -- beyond +/-100% excess in 7-30 days the
+#    value is overwhelmingly a data error, and a handful of such values is
+#    what produced the ~55% placebo sd in the 2026-10-21 run (vs ~8% real).
+# The number of observations each filter dropped is reported per sample.
+PLACEBO_MAX_DAILY_MOVE_RATIO = 3.0
+PLACEBO_MAX_ABS_ABNORMAL_PCT = 100.0
+
+
+def _window_is_clean(close, start_ts, days: int,
+                      max_daily_ratio: float = PLACEBO_MAX_DAILY_MOVE_RATIO) -> bool:
+    """True when the bars spanning _forward_pct_return(close, start_ts, days)'s
+    exact window are all finite/positive and no consecutive-bar ratio exceeds
+    max_daily_ratio (or falls below its reciprocal). See the filter notes
+    above PLACEBO_MAX_DAILY_MOVE_RATIO."""
+    i0 = close.index.searchsorted(start_ts)
+    i1 = close.index.searchsorted(start_ts + _timedelta_days(days))
+    if i0 >= len(close) or i1 >= len(close) or i1 <= i0:
+        return False
+    vals = [float(v) for v in close.iloc[i0:i1 + 1]]
+    for v in vals:
+        if not math.isfinite(v) or v <= 0:
+            return False
+    lo = 1.0 / max_daily_ratio
+    for a, b in zip(vals, vals[1:]):
+        r = b / a
+        if r > max_daily_ratio or r < lo:
+            return False
+    return True
+
+
+def _abnormal_obs(close, bench_close, start_ts, horizon: int, max_daily_ratio: float,
+                   max_abs_abn: float) -> tuple:
+    """(abnormal_pct, raw_pct, drop_reason) for one observation, measured on
+    the identical [start_ts, start_ts+horizon] window for ticker and
+    benchmark -- the same raw-minus-benchmark definition
+    compute_abnormal_returns() uses. drop_reason is None for a kept
+    observation, else one of 'no_data' / 'bad_bars' / 'cap'."""
+    raw = _forward_pct_return(close, start_ts, horizon)
+    bench = _forward_pct_return(bench_close, start_ts, horizon)
+    if raw is None or bench is None or not math.isfinite(raw) or not math.isfinite(bench):
+        return None, None, "no_data"
+    if not _window_is_clean(close, start_ts, horizon, max_daily_ratio):
+        return None, None, "bad_bars"
+    abn = raw - bench
+    if abs(abn) > max_abs_abn:
+        return None, None, "cap"
+    return abn, raw, None
+
+
 def placebo_test(
     days: int = 90,
     horizon: int = 7,
     buffer_days: int = 5,
     n_placebo_per_event: int = 3,
     seed: int = 42,
+    benchmark: str = DEFAULT_BENCHMARK,
+    window_margin_days: int = 7,
+    max_daily_move_ratio: float = PLACEBO_MAX_DAILY_MOVE_RATIO,
+    max_abs_abnormal_pct: float = PLACEBO_MAX_ABS_ABNORMAL_PCT,
+    closes: Optional[dict] = None,
 ) -> dict:
     """
-    Compare the raw forward return measured at real WATCH event dates against
-    random non-catalyst dates for the SAME tickers, excluding a
-    `buffer_days`-wide window around every real event for that ticker so a
-    placebo date can never accidentally land inside a real move's aftermath.
-    Confirms the measured effect isn't just generic drift/beta that would show
-    up on any day for these same names — pattern observed in
-    matthias-wyss/iti-8k-analysis (GitHub), not previously done anywhere in
-    this codebase.
+    Compare the ABNORMAL (excess-vs-`benchmark`) forward return at real WATCH
+    event dates against random non-catalyst dates for the SAME tickers,
+    excluding a `buffer_days`-wide window around every real event for that
+    ticker so a placebo date can never land inside a real move's aftermath.
+    Confirms the measured effect isn't just generic drift/beta that would
+    show up on any day for these same names -- pattern observed in
+    matthias-wyss/iti-8k-analysis (GitHub).
 
-    `seed` makes the random placebo-date sample reproducible run to run.
+    Fixed 2026-10-21 (the original compared RAW returns, which measured
+    market regime, not the event):
+      * Both samples are abnormal returns (ticker minus `benchmark`, identical
+        window, same definition as compute_abnormal_returns()), and both are
+        measured on the SAME fetched daily-close series -- the real side no
+        longer uses the DB's stored return_Xd_pct (entry_price at intraday
+        signal time -> a later close), a different measurement than the
+        placebo's close-to-close that would bias the comparison by itself.
+        The DB-based abnormal figure is still reported as `real_db` for
+        cross-checking.
+      * Placebo dates are restricted to the calendar window the matured real
+        events span (min..max real date, +/- `window_margin_days`), so both
+        samples face the same market regime.
+      * A placebo date is excluded when its forward window would overlap any
+        real event's +-`buffer_days` zone (previously only the start date was
+        checked) -- otherwise pre-event placebo windows capture the very
+        run-up that got the ticker selected as a momentum/supertrend hit.
+      * Non-finite / split-like / implausible observations are dropped from
+        BOTH samples by the same rules (see PLACEBO_MAX_DAILY_MOVE_RATIO /
+        PLACEBO_MAX_ABS_ABNORMAL_PCT), with drop counts reported.
 
-    Returns {"status": "insufficient_data"} when there are fewer than 3
-    matured real observations at `horizon` — the placebo comparison is
-    meaningless below that. Otherwise returns real/placebo n/mean/t plus a
-    Welch's-t two-sample comparison (`diff_t_stat`) and
-    `distinguishable_from_placebo` (True when |diff_t_stat| > 2.0).
+    A real event counts only once matured (stored return_{horizon}d_pct is
+    not NULL), as before. `seed` makes the placebo sample reproducible.
+    `closes` optionally supplies pre-fetched {ticker: close Series} (e.g. one
+    batch download reused across several horizons, so a re-run doesn't issue
+    one yfinance request per ticker per horizon); tickers absent from it --
+    and the benchmark, if absent -- are fetched individually as before.
+
+    Returns {"status": "insufficient_data", "real_n"} with fewer than 3
+    matured real observations, {"status": "benchmark_unavailable"} when the
+    benchmark series can't be fetched. Otherwise: real/placebo n/mean/sd/t
+    (abnormal), `diff_t_stat` (Welch), `distinguishable_from_placebo`
+    (|diff_t_stat| > 2.0) -- both NAIVE, kept for backward compatibility --
+    plus: `diff_t_stat_clustered` / `distinguishable_from_placebo_clustered`
+    (Welch on per-date means; the comparison to trust), `real_clustered` /
+    `placebo_clustered`, `return_basis`, `benchmark`,
+    `real_raw`/`placebo_raw` (raw returns on the same kept observations, for
+    context only), `real_db`, `placebo_window`, `dropped`, `filters`.
     """
     import pandas as pd
 
+    closes = closes or {}
     rows = _watch_rows(days)
     ret_col = f"return_{horizon}d_pct"
 
-    real_by_ticker: dict = defaultdict(list)
+    real_by_ticker: dict = defaultdict(list)     # every event (buffer exclusion)
+    matured: list = []                            # (ticker, date, stored_raw)
     for r in rows:
         try:
             d = pd.Timestamp(r["signal_ts"][:10]).normalize()
         except Exception:
             continue
         real_by_ticker[r["ticker"]].append(d)
+        raw_db = r.get(ret_col)
+        if raw_db is not None and math.isfinite(raw_db):
+            matured.append((r["ticker"], d, raw_db))
 
-    real_returns = [r[ret_col] for r in rows if r.get(ret_col) is not None]
-    if len(real_returns) < 3:
-        return {"status": "insufficient_data", "real_n": len(real_returns)}
+    if len(matured) < 3:
+        return {"status": "insufficient_data", "real_n": len(matured)}
 
-    rng = random.Random(seed)
-    placebo_returns: list = []
+    win_lo = min(d for _, d, _ in matured) - pd.Timedelta(days=window_margin_days)
+    win_hi = max(d for _, d, _ in matured) + pd.Timedelta(days=window_margin_days)
+    lookback = max(days, (datetime.now() - win_lo.to_pydatetime()).days) + buffer_days + 10
+
+    bench_close = closes.get(benchmark)
+    if bench_close is None:
+        bench_close = _fetch_benchmark_close(benchmark, lookback)
+    if bench_close is None or len(bench_close) == 0:
+        logger.warning(f"[catalyst_event_study] placebo_test: benchmark {benchmark} unavailable")
+        return {"status": "benchmark_unavailable", "benchmark": benchmark,
+                "real_n": len(matured)}
+
     price_cache: dict = {}
+
+    def _close_for(ticker):
+        if ticker not in price_cache:
+            c = closes.get(ticker)
+            if c is None:
+                c = _fetch_ticker_close(ticker, lookback)
+            price_cache[ticker] = c
+        return price_cache[ticker]
+
+    dropped = {"real": defaultdict(int), "placebo": defaultdict(int)}
+
+    # ── real side: same series, same definition as the placebo side ──────
+    real_rows: list = []          # {"date", "ticker", "abn"} for date clustering
+    real_raw: list = []
+    real_db: list = []
+    bench_ret_cache: dict = {}
+    for ticker, d, raw_db in matured:
+        if d not in bench_ret_cache:
+            bench_ret_cache[d] = _forward_pct_return(bench_close, d, horizon)
+        b = bench_ret_cache[d]
+        if b is not None and math.isfinite(b) and abs(raw_db - b) <= max_abs_abnormal_pct:
+            real_db.append(raw_db - b)
+        close = _close_for(ticker)
+        if close is None or len(close) == 0:
+            dropped["real"]["no_data"] += 1
+            continue
+        abn, raw, why = _abnormal_obs(close, bench_close, d, horizon,
+                                      max_daily_move_ratio, max_abs_abnormal_pct)
+        if why:
+            dropped["real"][why] += 1
+            continue
+        real_rows.append({"date": d, "ticker": ticker, "abn": abn})
+        real_raw.append(raw)
+
+    # ── placebo side: same tickers, same calendar window, same filters ────
+    rng = random.Random(seed)
+    placebo_abn: list = []
+    placebo_rows: list = []       # {"date", "ticker", "abn"} for date clustering
+    placebo_raw: list = []
     buffer_td = pd.Timedelta(days=buffer_days)
+    horizon_td = pd.Timedelta(days=horizon)
 
     for ticker, event_dates in real_by_ticker.items():
-        close = price_cache.get(ticker)
-        if close is None:
-            close = _fetch_ticker_close(ticker, days + horizon + buffer_days * 4)
-            price_cache[ticker] = close
-        if close is None or close.empty:
+        close = _close_for(ticker)
+        if close is None or len(close) == 0:
             continue
-
-        excluded = set()
-        for d in event_dates:
-            lo, hi = d - buffer_td, d + buffer_td
-            for ts in close.index:
-                if lo <= ts <= hi:
-                    excluded.add(ts)
-
-        eligible = [ts for ts in close.index if ts not in excluded]
+        last_ts = close.index[-1]
+        eligible = []
+        for ts in close.index:
+            if ts < win_lo or ts > win_hi or ts + horizon_td > last_ts:
+                continue
+            # The placebo's WHOLE forward window [ts, ts+horizon] must stay
+            # clear of every real event's +-buffer zone, not just its start
+            # date. Momentum/supertrend hits are selected BECAUSE the ticker
+            # just ran up; a placebo date shortly before an event has a
+            # window that covers that run-up. Measured 2026-10-21 on real
+            # data: such overlapping pre-event windows averaged +4.6% (7d) /
+            # +8.4% (30d) abnormal vs ~0 for non-overlapping dates — the
+            # start-date-only buffer was baking the selection run-up into
+            # the placebo baseline.
+            if any(d - horizon_td - buffer_td <= ts <= d + buffer_td for d in event_dates):
+                continue
+            eligible.append(ts)
         if not eligible:
             continue
 
         n_draw = n_placebo_per_event * len(event_dates)
         for _ in range(n_draw):
             d0 = rng.choice(eligible)
-            ret = _forward_pct_return(close, d0, horizon)
-            if ret is not None:
-                placebo_returns.append(ret)
+            abn, raw, why = _abnormal_obs(close, bench_close, d0, horizon,
+                                          max_daily_move_ratio, max_abs_abnormal_pct)
+            if why:
+                dropped["placebo"][why] += 1
+                continue
+            placebo_abn.append(abn)
+            placebo_raw.append(raw)
+            placebo_rows.append({"date": d0, "ticker": ticker, "abn": abn})
 
-    real_stats = _t_stat(real_returns)
-    placebo_stats = _t_stat(placebo_returns)
+    real_abn = [r["abn"] for r in real_rows]
+    real_stats = _t_stat(real_abn)
+    placebo_stats = _t_stat(placebo_abn)
     diff_t = None
     if real_stats["n"] >= 3 and placebo_stats["n"] >= 3:
-        diff_t = _welch_t(real_returns, placebo_returns)
+        diff_t = _welch_t(real_abn, placebo_abn)
+
+    # Date-clustered comparison: same-date observations (across tickers) are
+    # cross-sectionally correlated on BOTH sides -- thousands of placebo draws
+    # sit on a few dozen dates -- so the per-observation Welch t above
+    # overstates significance exactly the way direction_report()'s naive t
+    # does. Collapse each side to one mean per calendar date, then Welch on
+    # the date means. Read THIS figure, not diff_t_stat.
+    def _date_means(rs):
+        b: dict = defaultdict(list)
+        for x in rs:
+            b[x["date"]].append(x["abn"])
+        return [sum(v) / len(v) for v in b.values()]
+
+    real_dm, placebo_dm = _date_means(real_rows), _date_means(placebo_rows)
+    diff_t_clustered = _welch_t(real_dm, placebo_dm) if (len(real_dm) >= 3 and len(placebo_dm) >= 3) else None
 
     return {
         "status": "ok",
         "horizon": horizon,
         "buffer_days": buffer_days,
+        "benchmark": benchmark,
+        "return_basis": "abnormal",
         "real": real_stats,
         "placebo": placebo_stats,
         "diff_t_stat": diff_t,
         "distinguishable_from_placebo": (abs(diff_t) > 2.0) if diff_t is not None else None,
+        "diff_t_stat_clustered": diff_t_clustered,
+        "distinguishable_from_placebo_clustered": (
+            (abs(diff_t_clustered) > 2.0) if diff_t_clustered is not None else None),
+        "real_clustered": _date_clustered_stats(real_rows, "abn"),
+        "placebo_clustered": _date_clustered_stats(placebo_rows, "abn"),
+        "real_raw": _t_stat(real_raw),
+        "placebo_raw": _t_stat(placebo_raw),
+        "real_db": _t_stat(real_db),
+        "placebo_window": {"start": win_lo.date().isoformat(), "end": win_hi.date().isoformat(),
+                           "margin_days": window_margin_days},
+        "dropped": {k: dict(v) for k, v in dropped.items()},
+        "filters": {"max_daily_move_ratio": max_daily_move_ratio,
+                    "max_abs_abnormal_pct": max_abs_abnormal_pct},
     }

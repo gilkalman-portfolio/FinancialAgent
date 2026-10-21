@@ -697,11 +697,16 @@ class TestPlaceboTest:
             {"ticker": "A", "signal_ts": "2026-06-10T00:00:00", "return_7d_pct": 3.0},
             {"ticker": "B", "signal_ts": "2026-06-05T00:00:00", "return_7d_pct": -2.0},
         ]
+        dates = pd.date_range("2026-05-01", "2026-07-15", freq="D")
+        bench = pd.Series([100.0] * len(dates), index=pd.DatetimeIndex(dates))
         with patch.object(ces, "_watch_rows", return_value=rows), \
+             patch.object(ces, "_fetch_benchmark_close", return_value=bench), \
              patch.object(ces, "_fetch_ticker_close", return_value=None):
             result = ces.placebo_test(days=90, horizon=7)
         assert result["status"] == "ok"
         assert result["placebo"]["n"] == 0
+        assert result["real"]["n"] == 0
+        assert result["dropped"]["real"]["no_data"] == 3
 
     def test_seed_makes_placebo_sample_reproducible(self):
         rows = [
@@ -717,6 +722,252 @@ class TestPlaceboTest:
             r1 = ces.placebo_test(days=90, horizon=7, seed=7)
             r2 = ces.placebo_test(days=90, horizon=7, seed=7)
         assert r1["placebo"]["mean"] == r2["placebo"]["mean"]
+
+
+def _daily(start, end, fn):
+    dates = pd.date_range(start, end, freq="D")
+    return pd.Series([fn(i, d) for i, d in enumerate(dates)], index=pd.DatetimeIndex(dates))
+
+
+_PLACEBO_ROWS = [
+    {"ticker": "A", "signal_ts": "2026-06-01T10:00:00", "return_7d_pct": 5.0},
+    {"ticker": "A", "signal_ts": "2026-06-10T10:00:00", "return_7d_pct": 3.0},
+    {"ticker": "B", "signal_ts": "2026-06-05T10:00:00", "return_7d_pct": -2.0},
+]
+
+
+class TestPlaceboTestAbnormalAndRobust:
+    """2026-10-21 fix: placebo_test() compared RAW returns across different
+    market regimes, and corrupt bars (unadjusted splits) blew its placebo sd
+    up to ~55%."""
+
+    def test_returns_are_abnormal_not_raw(self):
+        """Ticker == benchmark * const: raw returns are strongly positive
+        (pure market beta), abnormal returns are exactly 0 on both sides."""
+        bench = _daily("2026-01-01", "2026-08-01", lambda i, d: 100.0 * (1.01 ** i))
+        tick = bench * 0.5
+        closes = {"A": tick, "B": tick, "IWM": bench}
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS), \
+             patch.object(ces, "_fetch_ticker_close", side_effect=AssertionError("no fetch")):
+            r = ces.placebo_test(days=90, horizon=7, benchmark="IWM", closes=closes, seed=3)
+        assert r["status"] == "ok"
+        assert r["return_basis"] == "abnormal"
+        assert r["benchmark"] == "IWM"
+        assert r["real"]["n"] == 3
+        assert r["real"]["mean"] == pytest.approx(0.0, abs=1e-9)
+        assert r["placebo"]["mean"] == pytest.approx(0.0, abs=1e-9)
+        assert r["real_raw"]["mean"] > 5.0          # raw would have shown "drift"
+        assert r["placebo_raw"]["mean"] > 5.0
+
+    def test_benchmark_param_is_used(self):
+        """The benchmark actually requested is what gets fetched."""
+        flat = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        seen = []
+
+        def _bench(name, lookback):
+            seen.append(name)
+            return flat
+
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS), \
+             patch.object(ces, "_fetch_benchmark_close", side_effect=_bench), \
+             patch.object(ces, "_fetch_ticker_close", return_value=flat):
+            ces.placebo_test(days=90, horizon=7, benchmark="IWM")
+        assert seen == ["IWM"]
+
+    def test_benchmark_unavailable_is_reported_not_silently_raw(self):
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS), \
+             patch.object(ces, "_fetch_benchmark_close", return_value=None):
+            r = ces.placebo_test(days=90, horizon=7)
+        assert r["status"] == "benchmark_unavailable"
+
+    def test_placebo_dates_confined_to_real_event_window(self):
+        """Ticker rallies +3%/day (vs a flat benchmark) only BEFORE May 15 —
+        a different regime from the June events. Placebo draws must come only
+        from the events' window (+-7d margin), so placebo abnormal mean is 0."""
+        bench = _daily("2026-01-01", "2026-08-01", lambda i, d: 100.0)
+
+        def tick_fn(i, d):
+            cutoff = pd.Timestamp("2026-05-15")
+            days_before = max(0, (cutoff - d).days)
+            return 100.0 / (1.03 ** days_before)
+
+        tick = _daily("2026-01-01", "2026-08-01", tick_fn)
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS):
+            r = ces.placebo_test(days=90, horizon=7, closes={"A": tick, "B": tick, "SPY": bench},
+                                 n_placebo_per_event=20, seed=5)
+        assert r["placebo_window"]["start"] == "2026-05-25"
+        assert r["placebo_window"]["end"] == "2026-06-17"
+        assert r["placebo"]["n"] > 0
+        assert r["placebo"]["mean"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_split_like_jump_dropped_from_placebo_and_counted(self):
+        """An unadjusted 1:10 reverse split (x10 overnight) must not reach the
+        placebo distribution — the corruption behind the ~55% placebo sd."""
+        bench = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        # Inside the placebo-eligible zone (after every event's buffer) and
+        # inside A's 06-10 real window too.
+        split_day = pd.Timestamp("2026-06-14")
+        tick = _daily("2026-05-01", "2026-07-15",
+                      lambda i, d: 10.0 if d < split_day else 100.0)
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS):
+            r = ces.placebo_test(days=90, horizon=7, closes={"A": tick, "B": tick, "SPY": bench},
+                                 n_placebo_per_event=30, seed=11)
+        assert r["dropped"]["placebo"].get("bad_bars", 0) > 0
+        assert r["dropped"]["real"].get("bad_bars", 0) == 1   # same rule on both sides
+        assert r["real"]["n"] == 2
+        assert r["placebo"]["mean"] == pytest.approx(0.0, abs=1e-9)
+        assert r["placebo"]["sd"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_placebo_window_may_not_overlap_the_pre_event_run_up(self):
+        """Momentum hits are selected because the ticker just ran up. A
+        placebo date a few days before the event has a forward window that
+        covers that run-up (real data 2026-10-21: +4.6% 7d / +8.4% 30d
+        abnormal). The whole placebo window must clear every event's zone."""
+        bench = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        event = pd.Timestamp("2026-06-10")
+
+        def tick_fn(i, d):
+            start = pd.Timestamp("2026-05-30")
+            n = min(max(0, (d - start).days), (event - start).days)
+            return 100.0 * (1.03 ** n)          # +3%/day run-up into the event, flat after
+
+        tick = _daily("2026-05-01", "2026-07-15", tick_fn)
+        rows = [{"ticker": t, "signal_ts": "2026-06-10T10:00:00", "return_7d_pct": 0.0}
+                for t in ("A", "B", "C")]
+        with patch.object(ces, "_watch_rows", return_value=rows):
+            r = ces.placebo_test(days=90, horizon=7, buffer_days=5, n_placebo_per_event=20,
+                                 closes={"A": tick, "B": tick, "C": tick, "SPY": bench}, seed=4)
+        assert r["placebo"]["n"] > 0
+        assert r["placebo"]["mean"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_implausible_abnormal_return_capped_and_counted(self):
+        """+20%/day (below the x3 one-bar guard) compounds to >+100% abnormal
+        over 7 days — dropped by the observation cap, counted as 'cap'."""
+        bench = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        tick = _daily("2026-05-01", "2026-07-15", lambda i, d: 1.0 * (1.2 ** i))
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS):
+            r = ces.placebo_test(days=90, horizon=7, closes={"A": tick, "B": tick, "SPY": bench})
+        assert r["real"]["n"] == 0
+        assert r["placebo"]["n"] == 0
+        assert r["dropped"]["real"]["cap"] == 3
+        assert r["dropped"]["placebo"]["cap"] > 0
+
+    def test_nan_bar_dropped_not_propagated(self):
+        bench = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        tick = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        tick[pd.Timestamp("2026-06-03")] = float("nan")
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS):
+            r = ces.placebo_test(days=90, horizon=7, closes={"A": tick, "B": tick, "SPY": bench},
+                                 n_placebo_per_event=10, seed=2)
+        for side in ("real", "placebo"):
+            m = r[side]["mean"]
+            assert m is None or math.isfinite(m)
+        assert r["dropped"]["real"].get("bad_bars", 0) >= 1
+
+    def test_clustered_diff_collapses_same_date_draws(self):
+        """Many tickers on the same few dates: the naive Welch t counts every
+        draw; the clustered one counts dates. Clustered |t| must not exceed
+        naive |t| when the effect is a per-date common shock."""
+        dates = pd.date_range("2026-05-01", "2026-07-31", freq="D")
+        bench = pd.Series([100.0] * len(dates), index=pd.DatetimeIndex(dates))
+        rng = __import__("random").Random(0)
+        shocks = {d: rng.gauss(0, 0.01) for d in dates}   # common daily shock, all tickers
+        lvl, vals = 100.0, []
+        for d in dates:
+            lvl *= 1 + shocks[d]
+            vals.append(lvl)
+        common = pd.Series(vals, index=pd.DatetimeIndex(dates))
+        tickers = [f"T{i}" for i in range(30)]
+        rows = [{"ticker": t, "signal_ts": f"2026-06-{day:02d}T10:00:00", "return_7d_pct": 0.0}
+                for t in tickers for day in (2, 30)]
+        closes = {t: common for t in tickers}
+        closes["SPY"] = bench
+        with patch.object(ces, "_watch_rows", return_value=rows):
+            r = ces.placebo_test(days=90, horizon=7, closes=closes, n_placebo_per_event=3, seed=9)
+        assert r["real_clustered"]["dates"] == 2
+        assert r["placebo_clustered"]["dates"] > 2
+        # Only 2 real dates -> clustered Welch can't be computed (needs >=3).
+        assert r["diff_t_stat_clustered"] is None
+        assert r["distinguishable_from_placebo_clustered"] is None
+        assert r["diff_t_stat"] is not None
+
+    def test_backward_compatible_keys_present(self):
+        flat = _daily("2026-05-01", "2026-07-15", lambda i, d: 100.0)
+        with patch.object(ces, "_watch_rows", return_value=_PLACEBO_ROWS), \
+             patch.object(ces, "_fetch_ticker_close", return_value=flat):
+            r = ces.placebo_test(days=90, horizon=7)
+        for k in ("status", "horizon", "buffer_days", "real", "placebo", "diff_t_stat",
+                  "distinguishable_from_placebo", "real_clustered", "real_db", "dropped"):
+            assert k in r
+        assert r["real_clustered"]["dates"] == 3
+
+
+class TestInsiderClusterRowsExcluded:
+    """2026-10-21: insider_cluster_scanner.py writes signal_type='WATCH' rows
+    too (catalyst_summary '[insider_cluster] ...', ai_verdict 'cluster_N').
+    They formed their own 'cluster_2/3/4' direction buckets in the news
+    event study and were matched as a news 'treatment' in the liquidity
+    report. Excluded centrally in _watch_rows()."""
+
+    def _fresh_db(self, monkeypatch):
+        import tempfile, os as _os
+        from pathlib import Path
+        fd, path = tempfile.mkstemp(suffix=".db")
+        _os.close(fd)
+        import src.database as db
+        monkeypatch.setattr(db, "DB_PATH", Path(path))
+        db.init_db()
+        monkeypatch.setattr(ces, "get_connection", db.get_connection)
+        import src.forward_signals as fs
+        monkeypatch.setattr(fs, "get_connection", db.get_connection)
+        return db
+
+    def _insert(self, db, ticker, ts, summary, verdict, publisher=None):
+        conn = db.get_connection()
+        conn.execute(
+            "INSERT INTO forward_signals (ticker, signal_ts, signal_type, entry_price, status, "
+            "catalyst_summary, ai_verdict, news_publisher) VALUES (?, ?, 'WATCH', 10.0, 'open', ?, ?, ?)",
+            (ticker, ts, summary, verdict, publisher),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_watch_rows_excludes_insider_cluster_rows(self, monkeypatch):
+        db = self._fresh_db(monkeypatch)
+        self._insert(db, "NEWS", "2026-06-01T10:00:00", "[momentum] some headline", "positive")
+        self._insert(db, "CTRL", "2026-06-01T10:00:00", "[supertrend] no fresh news (control)", "no_news")
+        self._insert(db, "LEGACY", "2026-06-01T10:00:00", None, None)
+        self._insert(db, "INSD", "2026-06-01T10:00:00",
+                     "[insider_cluster] 2 distinct insiders in 72h: ['A', 'B']", "cluster_2")
+        rows = ces._watch_rows(9000)
+        tickers = {r["ticker"] for r in rows}
+        assert tickers == {"NEWS", "CTRL", "LEGACY"}       # NULL summary kept
+        assert not any(r["direction"].startswith("cluster_") for r in rows)
+
+    def test_promoted_only_path_also_excludes(self, monkeypatch):
+        db = self._fresh_db(monkeypatch)
+        self._insert(db, "INSD", "2026-06-01T10:00:00", "[insider_cluster] x", "cluster_3")
+        conn = db.get_connection()
+        conn.execute("INSERT INTO watchlist_alerts (ticker, alert_type, message, sent_at) "
+                     "VALUES ('INSD', 'auto_wl_momentum', 'added', '2026-06-01T10:05:00')")
+        conn.commit()
+        conn.close()
+        assert ces._watch_rows(9000, promoted_only=True) == []
+
+    def test_last_watch_signature_ignores_insider_cluster_rows(self, monkeypatch):
+        """A cluster row recorded after a news hit must not become the news
+        dedup signature (it would let the identical next news hit through)."""
+        db = self._fresh_db(monkeypatch)
+        import src.forward_signals as fs
+        self._insert(db, "T", "2026-06-01T10:00:00", "[momentum] headline", "positive", "Reuters")
+        self._insert(db, "T", "2026-06-01T11:00:00", "[insider_cluster] x", "cluster_2")
+        assert fs._last_watch_signature("T") == ("positive", "Reuters")
+
+    def test_insider_scanner_tag_matches_shared_constant(self):
+        import src.forward_signals as fs
+        import src.insider_cluster_scanner as ics
+        assert ics.WATCH_SOURCE_TAG == fs.INSIDER_CLUSTER_WATCH_TAG
+        assert fs.INSIDER_CLUSTER_WATCH_TAG in fs.NEWS_WATCH_ONLY_SQL
 
 
 if __name__ == "__main__":

@@ -655,6 +655,28 @@ def format_digest_message(d: dict) -> str:
 # unverifiable from our side and is not something this project can correct
 # for; it is only something every consumer of this data must keep in mind.
 
+# WATCH is shared by TWO independent sources: this news-catalyst capture
+# (record_watch_signals() below — ai_verdict holds a sentiment direction) and
+# src/insider_cluster_scanner.py (catalyst_summary prefixed with this tag,
+# ai_verdict='cluster_N', its own dedup). Defined HERE, the lower-level module
+# (insider_cluster_scanner imports record_signal from this one, so the reverse
+# import would be circular), and re-exported by insider_cluster_scanner as its
+# WATCH_SOURCE_TAG — one source of truth for the tag.
+INSIDER_CLUSTER_WATCH_TAG = "[insider_cluster]"
+
+# SQL fragment every NEWS-catalyst WATCH reader must AND into its WHERE clause
+# so insider-cluster rows never leak into the news study's direction buckets
+# or the news dedup signature (found 2026-10-21: 15 cluster rows formed their
+# own 'cluster_2'/'cluster_3'/'cluster_4' "directions" in direction_report()
+# and were treated as a news "treatment" group in the liquidity-matched
+# report). COALESCE so a NULL catalyst_summary (legacy rows) stays included —
+# `NULL NOT LIKE x` is NULL, which would silently drop them. No user input
+# reaches this string; it is a constant.
+NEWS_WATCH_ONLY_SQL = (
+    f"COALESCE(catalyst_summary, '') NOT LIKE '{INSIDER_CLUSTER_WATCH_TAG}%'"
+)
+
+
 def _sentiment_direction(news: Optional[dict]) -> str:
     """Normalize a gap_scanner.fetch_recent_news_catalyst() result to a
     dedup/study bucket: 'positive' / 'negative' / 'neutral' / 'no_news'.
@@ -685,11 +707,16 @@ def _last_watch_signature(ticker: str) -> Optional[tuple]:
     of the same one — pure direction-based dedup was too coarse. Two no-news
     hits in a row both have publisher=None, which compares equal, so the
     control group is unaffected.
+
+    Insider-cluster WATCH rows are excluded (NEWS_WATCH_ONLY_SQL): otherwise
+    a cluster row ('cluster_N', None) recorded in between two identical news
+    hits would become "the last signature" and defeat this dedup, writing a
+    duplicate, correlated news observation.
     """
     with get_connection() as conn:
         row = conn.execute(
             "SELECT ai_verdict, news_publisher FROM forward_signals "
-            "WHERE ticker = ? AND signal_type = 'WATCH' "
+            f"WHERE ticker = ? AND signal_type = 'WATCH' AND {NEWS_WATCH_ONLY_SQL} "
             "ORDER BY signal_ts DESC LIMIT 1",
             (ticker,),
         ).fetchone()

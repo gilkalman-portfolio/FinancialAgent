@@ -104,6 +104,11 @@ _INDEX_LINE_RE = re.compile(
 )
 _XML_BLOCK_RE = re.compile(r"<XML>(.*?)</XML>", re.DOTALL)
 
+# MUST equal forward_signals.INSIDER_CLUSTER_WATCH_TAG — the news-catalyst
+# WATCH readers (event study, news dedup) exclude rows by this exact prefix
+# (forward_signals.NEWS_WATCH_ONLY_SQL). Kept as a literal rather than
+# imported because this module deliberately imports forward_signals lazily
+# (see scan_insider_clusters()); equality is pinned by a regression test.
 WATCH_SOURCE_TAG = "[insider_cluster]"
 
 
