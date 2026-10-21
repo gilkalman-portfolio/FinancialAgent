@@ -272,7 +272,11 @@ def render():
                        ROUND(AVG(CASE WHEN return_30d_pct > 0 THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate_30d
                 FROM forward_signals
                 WHERE return_7d_pct IS NOT NULL
-                  AND data_quality_flag != 'SUSPECT'
+                  -- COALESCE: NULL != 'SUSPECT' is NULL, which hid every row
+                  -- (the flag is NULL on all normal rows). WATCH rows are
+                  -- research captures from two different studies, not trades.
+                  AND COALESCE(data_quality_flag, '') != 'SUSPECT'
+                  AND signal_type IN ('BUY', 'SELL')
                 GROUP BY signal_type
             """).fetchall()
         if rows:
