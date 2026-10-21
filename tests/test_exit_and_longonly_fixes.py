@@ -515,6 +515,7 @@ class TestTrailingStopUsesLookedUpStopOrderId:
         _insert_order(_test_db, "SENEA", "BUY", 100, "FILLED",
                       (datetime.now() - timedelta(days=2)).isoformat(),
                       ibkr_order_id=1, stop_order_id=777)
+        _insert_position(_test_db, "SENEA", 100, 100.0, 0.0)  # trail only held positions
 
         conn = MagicMock()
         conn.get_open_orders.return_value = [{
@@ -539,6 +540,7 @@ class TestTrailingStopUsesLookedUpStopOrderId:
         scan instead of silently skipping the raise."""
         from src import ibkr_worker
 
+        _insert_position(_test_db, "NOROW", 100, 100.0, 0.0)  # trail only held positions
         conn = MagicMock()
         conn.get_open_orders.return_value = [{
             "order_id": 42, "ticker": "NOROW", "action": "SELL",

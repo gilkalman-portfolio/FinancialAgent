@@ -105,7 +105,20 @@ BAR_SIZE = "1 hour"
 HISTORICAL_DURATION = "10 D"
 ATR_PERIOD = 10
 ATR_MULTIPLIER = 3.0
-TRAILING_ATR_MULTIPLIER = 2.5   # trailing stop = price - 2.5 * ATR_1h
+# Trailing stop = last closed 1h close - TRAILING_ATR_MULTIPLIER * DAILY ATR(14).
+# Deliberately the SAME geometry as the initial bracket stop
+# (execution_engine.calc_position_size: entry - _ATR_STOP_MULT * daily ATR(14),
+# floored at 1% of price), so the trail only ratchets once price has actually
+# moved up — never on the first pass after entry. The previous rule
+# (2.5 x ATR of 1h bars) was ~0.85 daily ATRs, less than half the initial
+# 2-daily-ATR stop, so every new position had its stop yanked up within minutes
+# of entry, while still flat (2026-10-21 investigation: 71/75 trades raised,
+# median 5.8 min after submission). tests/test_trailing_stop_daily_atr.py pins
+# the multiplier to execution_engine._ATR_STOP_MULT.
+TRAILING_ATR_MULTIPLIER = 2.0
+TRAILING_ATR_PERIOD = 14                 # daily bars, SMA of TR (== execution_engine._get_atr)
+TRAILING_MIN_STOP_PCT = 0.01             # same 1% floor as the initial stop distance
+TRAILING_DAILY_DURATION = "30 D"
 TRAILING_STOP_INTERVAL_SECS = 15 * 60   # update trailing stops every 15 min
 TIME_STOP_DAYS = 15                      # exit zombie if held > 15 trading days
 TIME_STOP_BAND_PCT = 3.0                 # zombie: -3% < pnl < +3%
@@ -128,6 +141,58 @@ def _atr(df, period: int = ATR_PERIOD) -> float:
         (low - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
     return float(tr.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1])
+
+
+def _daily_atr(df, period: int = TRAILING_ATR_PERIOD) -> float | None:
+    """Daily ATR as SMA of the last `period` True Ranges, completed bars only.
+
+    Mirrors execution_engine._get_atr() (the initial-stop ATR) so the trail and
+    the initial bracket stop are measured in the same unit. Drops today's
+    in-progress daily bar if IBKR returned one. Returns None if too short.
+    """
+    import pandas as pd
+    if df is None or df.empty:
+        return None
+    try:
+        last = pd.Timestamp(df.index[-1])
+        if last.date() >= datetime.now(_ET).date():
+            df = df.iloc[:-1]
+    except Exception:
+        pass
+    if len(df) < period + 1:
+        return None
+    high, low, prev_close = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    val = float(tr.tail(period).mean())
+    return val if val > 0 else None
+
+
+def _held_shares(ticker: str) -> float:
+    try:
+        with get_connection() as db:
+            r = db.execute("SELECT shares FROM ibkr_positions WHERE ticker = ?", (ticker,)).fetchone()
+        return float(r["shares"]) if r and r["shares"] is not None else 0.0
+    except Exception as e:
+        logger.warning(f"[worker] _held_shares({ticker}) failed: {e}")
+        return 0.0
+
+
+def _current_stop_price(conn: IBKRConnection, ticker: str, stop_order_id: int | None) -> float | None:
+    """Resting STP SELL trigger price for ticker (exact order if id given)."""
+    try:
+        for o in conn.get_open_orders():
+            if o.get("order_type") != "STP" or o.get("action") != "SELL":
+                continue
+            if stop_order_id is not None:
+                if o.get("order_id") != stop_order_id:
+                    continue
+            elif o.get("ticker") != ticker:
+                continue
+            aux = o.get("aux_price")
+            return float(aux) if aux is not None else None
+    except Exception as e:
+        logger.warning(f"[worker] _current_stop_price({ticker}) failed: {e}")
+    return None
 
 
 def _send_telegram(message: str) -> Optional[bool]:
@@ -692,9 +757,13 @@ def _lookup_stop_order_id(ticker: str) -> int | None:
 def _update_trailing_stops(conn: IBKRConnection) -> None:
     """Raise ATR-based trailing stops for all open positions.
 
-    For each position that has an active STP SELL order in IBKR, computes
-    price - TRAILING_ATR_MULTIPLIER * ATR_1h. If the result is above the current
-    stop price, modifies the order upward. Never lowers a stop.
+    For each HELD position that has an active STP SELL order in IBKR, computes
+    last-closed-1h-close - max(TRAILING_ATR_MULTIPLIER * daily ATR(14), 1%).
+    That is the initial bracket stop's own geometry, so a just-opened position
+    is never tightened before price has moved in its favour. If the result is
+    above the current stop price (and below the current price), modifies the
+    order upward. Never lowers a stop. Skips bracket legs whose parent has not
+    filled yet (no ibkr_positions row) — there is nothing to trail.
     Runs at most every TRAILING_STOP_INTERVAL_SECS.
     """
     global _last_trailing_stop_ts
@@ -726,13 +795,25 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
     updated = 0
     for ticker, current_stop in stop_map.items():
         try:
+            if _held_shares(ticker) <= 0:
+                logger.debug(f"[worker] {ticker}: trailing stop skipped — no held position (entry not filled)")
+                continue
             df = conn.historical_bars(ticker, bar_size=BAR_SIZE, duration="5 D")
-            if df.empty or len(df) < ATR_PERIOD + 2:
+            if df.empty or len(df) < 2:
                 continue
             df = df.iloc[:-1]  # drop in-progress bar
             current_price = float(df["Close"].iloc[-1])
-            atr_val = _atr(df)
-            new_stop = round(current_price - TRAILING_ATR_MULTIPLIER * atr_val, 2)
+            daily = conn.historical_bars(ticker, bar_size="1 day", duration=TRAILING_DAILY_DURATION)
+            atr_val = _daily_atr(daily)
+            if atr_val is None:
+                logger.debug(f"[worker] {ticker}: trailing stop skipped — not enough daily bars for ATR")
+                continue
+            distance = max(TRAILING_ATR_MULTIPLIER * atr_val, TRAILING_MIN_STOP_PCT * current_price)
+            new_stop = round(current_price - distance, 2)
+
+            if new_stop >= current_price:
+                logger.warning(f"[worker] {ticker}: trailing stop {new_stop:.2f} >= price {current_price:.2f} — skipped")
+                continue
 
             if new_stop <= current_stop:
                 logger.debug(
@@ -745,7 +826,7 @@ def _update_trailing_stops(conn: IBKRConnection) -> None:
                 logger.info(
                     f"[worker] {ticker}: trailing stop raised "
                     f"${current_stop:.2f} -> ${new_stop:.2f} "
-                    f"(price=${current_price:.2f}, ATR={atr_val:.2f})"
+                    f"(price=${current_price:.2f}, ATR_d={atr_val:.2f})"
                 )
                 updated += 1
         except Exception as e:
@@ -1157,7 +1238,18 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                 if result["status"] != "SUBMITTED":
                     logger.info(f"[worker] T1 {ticker}: {result['status']} — {result.get('reason')}")
                     continue
-                conn.modify_stop_order(ticker, breakeven, stop_order_id=_lookup_stop_order_id(ticker))
+                # Never LOWER a stop: if the trail already sits above breakeven,
+                # "move to breakeven" would loosen it (SENEA/TDW/FOX/IT did exactly
+                # that, e.g. IT 196.65 -> 192.92 on 2026-10-15).
+                _sid = _lookup_stop_order_id(ticker)
+                _cur = _current_stop_price(conn, ticker, _sid)
+                if _cur is None or breakeven > _cur:
+                    conn.modify_stop_order(ticker, breakeven, stop_order_id=_sid)
+                else:
+                    logger.info(
+                        f"[worker] T1 {ticker}: stop ${_cur:.2f} already >= breakeven "
+                        f"${breakeven:.2f} — left unchanged"
+                    )
 
                 logger.info(
                     f"[worker] TIER-1 exit: {ticker} selling {result['shares']}sh "
