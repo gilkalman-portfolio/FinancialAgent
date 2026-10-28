@@ -57,8 +57,15 @@ class IBKRConnection:
         self.client_id = client_id
         self.ib = IB()
 
-    def connect(self, timeout: float = 10.0) -> None:
-        self.ib.connect(self.host, self.port, clientId=self.client_id, timeout=timeout)
+    def connect(self, timeout: float = 10.0, open_orders_only: bool = False) -> None:
+        kwargs = {}
+        if open_orders_only:
+            # Skip positions/account/executions/completed-orders startup fetches —
+            # a clientId-0 orphan sweep needs open orders only, and the
+            # completed-orders request alone was observed to stall until timeout.
+            from ib_async.ib import StartupFetch
+            kwargs["fetchFields"] = StartupFetch.ORDERS_OPEN
+        self.ib.connect(self.host, self.port, clientId=self.client_id, timeout=timeout, **kwargs)
         logger.info(f"[ibkr] connected to {self.host}:{self.port} clientId={self.client_id}")
 
     def disconnect(self) -> None:
@@ -237,6 +244,7 @@ class IBKRConnection:
             o = trade.order
             result.append({
                 "order_id": o.orderId,
+                "perm_id": o.permId or None,
                 "ticker": trade.contract.symbol,
                 "action": o.action,
                 "qty": int(o.totalQuantity),

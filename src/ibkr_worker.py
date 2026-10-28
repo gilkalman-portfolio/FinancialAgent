@@ -127,6 +127,11 @@ TIER1_PCT = 7.0   # +7%: sell 40%, move stop to breakeven
 TIER2_PCT = 14.0  # +14%: sell 30% of original, trail rest
 CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "1"))
 PORT = int(os.environ.get("IBKR_PORT", str(PAPER_PORT)))
+# Orders IBKR has unbound from the client that placed them come back with
+# orderId=0 / clientId=0 and are invisible to CLIENT_ID's openTrades(). Only a
+# clientId-0 session can see them (ib_async binds them to negative ids on
+# connect), so the resting-sell reconcile opens one each cycle. Negative = off.
+ORPHAN_CLIENT_ID = int(os.environ.get("IBKR_ORPHAN_CLIENT_ID", "0"))
 
 
 def _atr(df, period: int = ATR_PERIOD) -> float:
@@ -904,22 +909,72 @@ def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
       ("cancelling would strip protection"), which is true but incomplete:
       the correct move was always to shrink the leg to match, not choose
       between removing protection and leaving a live short trigger armed.
+
+    Orders IBKR has orphaned (orderId=0, clientId=0) are checked too, through a
+    second clientId-0 session — see _open_orphan_connection. RIG, 2026-10-23:
+    bought 1087sh, T1 sold 434, and the bracket target (still 1087) filled
+    against the 653 held, shorting exactly 434. Its legs had been orphaned
+    around 10-20, so this function never saw them to resize.
     """
     try:
-        orders = conn.get_open_orders()
+        own_orders = conn.get_open_orders()
     except Exception as e:
         logger.warning(f"[worker] resting-sell reconcile: get_open_orders failed: {e}")
         return 0
 
-    sells = [o for o in orders if o.get("action") == "SELL"]
-    if not sells:
+    sources = [(conn, own_orders)]
+    orphan_conn = _open_orphan_connection(conn)
+    if orphan_conn is not None:
+        try:
+            sources.append((orphan_conn, orphan_conn.get_open_orders()))
+        except Exception as e:
+            logger.warning(f"[worker] resting-sell reconcile: orphan order read failed: {e}")
+    try:
+        return _reconcile_sell_sources(sources)
+    finally:
+        if orphan_conn is not None:
+            try:
+                orphan_conn.disconnect()
+            except Exception:
+                pass
+
+
+def _open_orphan_connection(conn: IBKRConnection) -> IBKRConnection | None:
+    """A clientId-0 session, the only client that can see orphaned orders.
+
+    Returns None (orphans skipped this cycle, own orders still reconciled) when
+    disabled or when the connect fails — e.g. another clientId-0 client is live.
+    """
+    if ORPHAN_CLIENT_ID < 0 or ORPHAN_CLIENT_ID == getattr(conn, "client_id", None):
+        return None
+    oc = IBKRConnection(host=conn.host, port=conn.port, client_id=ORPHAN_CLIENT_ID)
+    try:
+        oc.connect(timeout=10.0, open_orders_only=True)
+        return oc
+    except Exception as e:
+        logger.warning(f"[worker] orphan-order session (clientId={ORPHAN_CLIENT_ID}) failed: {e}")
+        try:
+            oc.disconnect()
+        except Exception:
+            pass
+        return None
+
+
+def _reconcile_sell_sources(sources: list[tuple[IBKRConnection, list[dict]]]) -> int:
+    """Apply the resting-SELL invariant to each (connection, its open orders).
+
+    Each order is cancelled/resized through the connection that can see it — a
+    clientId-1 session cannot touch a clientId-0 order and vice versa.
+    """
+    if not any(o.get("action") == "SELL" for _, orders in sources for o in orders):
         return 0
 
     # A ticker with a still-open BUY is mid-entry: a bracket's stop/target legs
     # are placed alongside the parent, before it fills, so a SELL here is waiting
     # on its own parent — not orphaned by a reset. Touching it here permanently
     # strips protection the moment the parent does fill.
-    pending_buys = {o.get("ticker") for o in orders if o.get("action") == "BUY"}
+    pending_buys = {o.get("ticker") for _, orders in sources for o in orders
+                    if o.get("action") == "BUY"}
 
     held: dict[str, float] = {}
     try:
@@ -932,55 +987,63 @@ def _reconcile_resting_sell_orders(conn: IBKRConnection) -> int:
 
     cancelled = []
     resized = []
-    resized_tickers: set[str] = set()
+    resized_keys: set[tuple[int, str]] = set()
     now_mono = time.monotonic()
     still_unbacked: set[int] = set()
-    for o in sells:
-        t = o.get("ticker")
-        if t in pending_buys:
-            continue
-        have = held.get(t, 0.0)
-        qty = int(o.get("qty") or 0)
-        if have > 0:
-            if qty > have and t not in resized_tickers:
-                resized_tickers.add(t)
-                try:
-                    ids = conn.resize_sell_orders(t, int(have))
-                    if ids:
-                        resized.append(f"{t} {qty}sh -> {int(have)}sh (#{','.join(str(i) for i in ids)})")
-                        logger.warning(
-                            f"[worker] resized resting SELL: {t} {qty}sh -> {int(have)}sh "
-                            f"— was oversized after a partial exit"
-                        )
-                except Exception as e:
-                    logger.error(f"[worker] failed to resize resting SELL {t}: {e}")
-            continue
-        oid = o["order_id"]
-        still_unbacked.add(oid)
-        first = _unbacked_first_seen.setdefault(oid, now_mono)
-        # The debounce exists for a position that vanished with no explanation
-        # (a sync glitch). When our own order_log shows we closed it, there is
-        # nothing to confirm — waiting only leaves a live short trigger armed:
-        # 2026-10-16 FUBO's time stop sold 1508sh at 17:58, the old bracket STP
-        # sat in this window (reset by two worker restarts) and filled at 18:10,
-        # opening a 1508sh short.
-        if (now_mono - first < UNBACKED_SELL_CONFIRM_SECS
-                and not _closed_by_recorded_sell(t)):
-            logger.warning(
-                f"[worker] unbacked SELL {t} {qty}sh (#{oid}) — position reads {have:.0f}; "
-                f"waiting {UNBACKED_SELL_CONFIRM_SECS // 60} min to confirm before cancelling"
-            )
-            continue
-        try:
-            if conn.cancel_order(oid):
-                _unbacked_first_seen.pop(oid, None)
-                cancelled.append(f"{t} {qty}sh (#{oid})")
-                logger.error(
-                    f"[worker] CANCELLED unbacked SELL: {t} {qty}sh — position is "
-                    f"{have:.0f}, this order could only have opened a short"
+    for src, orders in sources:
+        orphan = src is not sources[0][0]
+        tag = " [orphaned]" if orphan else ""
+        for o in orders:
+            if o.get("action") != "SELL":
+                continue
+            t = o.get("ticker")
+            if t in pending_buys:
+                continue
+            have = held.get(t, 0.0)
+            qty = int(o.get("qty") or 0)
+            if have > 0:
+                if qty > have and (id(src), t) not in resized_keys:
+                    resized_keys.add((id(src), t))
+                    try:
+                        ids = src.resize_sell_orders(t, int(have))
+                        if ids:
+                            resized.append(f"{t} {qty}sh -> {int(have)}sh (#{','.join(str(i) for i in ids)}){tag}")
+                            logger.warning(
+                                f"[worker] resized resting SELL{tag}: {t} {qty}sh -> {int(have)}sh "
+                                f"— was oversized after a partial exit"
+                            )
+                    except Exception as e:
+                        logger.error(f"[worker] failed to resize resting SELL{tag} {t}: {e}")
+                continue
+            oid = o["order_id"]
+            # permId is stable across sessions; an orphan's bound (negative)
+            # orderId is not guaranteed to be.
+            key = o.get("perm_id") or oid
+            still_unbacked.add(key)
+            first = _unbacked_first_seen.setdefault(key, now_mono)
+            # The debounce exists for a position that vanished with no explanation
+            # (a sync glitch). When our own order_log shows we closed it, there is
+            # nothing to confirm — waiting only leaves a live short trigger armed:
+            # 2026-10-16 FUBO's time stop sold 1508sh at 17:58, the old bracket STP
+            # sat in this window (reset by two worker restarts) and filled at 18:10,
+            # opening a 1508sh short.
+            if (now_mono - first < UNBACKED_SELL_CONFIRM_SECS
+                    and not _closed_by_recorded_sell(t)):
+                logger.warning(
+                    f"[worker] unbacked SELL{tag} {t} {qty}sh (#{oid}) — position reads {have:.0f}; "
+                    f"waiting {UNBACKED_SELL_CONFIRM_SECS // 60} min to confirm before cancelling"
                 )
-        except Exception as e:
-            logger.error(f"[worker] failed to cancel unbacked SELL {t}: {e}")
+                continue
+            try:
+                if src.cancel_order(oid):
+                    _unbacked_first_seen.pop(key, None)
+                    cancelled.append(f"{t} {qty}sh (#{oid}){tag}")
+                    logger.error(
+                        f"[worker] CANCELLED unbacked SELL{tag}: {t} {qty}sh — position is "
+                        f"{have:.0f}, this order could only have opened a short"
+                    )
+            except Exception as e:
+                logger.error(f"[worker] failed to cancel unbacked SELL{tag} {t}: {e}")
 
     # Forget orders whose position came back (or that are gone) — the clock
     # restarts from zero if they ever look unbacked again.
