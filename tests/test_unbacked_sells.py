@@ -41,6 +41,8 @@ def _db(monkeypatch, tmp_path):
     # Debounce off by default here; TestDebounce covers it explicitly.
     monkeypatch.setattr("src.ibkr_worker.UNBACKED_SELL_CONFIRM_SECS", 0)
     monkeypatch.setattr("src.ibkr_worker._unbacked_first_seen", {})
+    # No real clientId-0 session in tests; TestOrphanedOrders supplies a mock.
+    monkeypatch.setattr("src.ibkr_worker._open_orphan_connection", lambda conn: None)
 
     c = _conn()
     c.execute("""CREATE TABLE order_log (id INTEGER PRIMARY KEY, ticker TEXT, action TEXT,
@@ -60,8 +62,8 @@ def _pos(db, ticker, shares):
                   (ticker, shares, shares * 10, datetime.now().isoformat()))
 
 
-def _order(ticker, action="SELL", qty=100, oid=1, otype="STP"):
-    return {"order_id": oid, "ticker": ticker, "action": action, "qty": qty,
+def _order(ticker, action="SELL", qty=100, oid=1, otype="STP", perm=None):
+    return {"order_id": oid, "perm_id": perm, "ticker": ticker, "action": action, "qty": qty,
             "order_type": otype, "status": "Submitted",
             "lmt_price": None, "aux_price": 9.0}
 
@@ -283,3 +285,146 @@ class TestDebounce:
         with patch.object(ibkr_worker, "_send_telegram"):
             assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
         conn.cancel_order.assert_not_called()
+
+
+class TestOrphanedOrders:
+    """RIG, 2026-10-23: IBKR had unbound the bracket legs (orderId=0, clientId=0),
+    so the worker's clientId-1 session never saw them. T1 sold 434 of 1087 and
+    the target leg — still 1087 — filled against 653 held, shorting 434. The
+    same sweep found FUBO 1521 / SBGI 971 orphaned SELLs armed against zero."""
+
+    @staticmethod
+    def _wire(monkeypatch, own_orders, orphan_orders):
+        from src import ibkr_worker
+        own = MagicMock()
+        own.get_open_orders.return_value = own_orders
+        orphan = MagicMock()
+        orphan.get_open_orders.return_value = orphan_orders
+        orphan.cancel_order.return_value = True
+        orphan.resize_sell_orders.return_value = [-2]
+        monkeypatch.setattr(ibkr_worker, "_open_orphan_connection", lambda conn: orphan)
+        return own, orphan
+
+    def test_rig_replay_orphaned_legs_resized_through_orphan_session(self, _db, monkeypatch):
+        from src import ibkr_worker
+        _pos(_db, "RIG", 653)
+        own, orphan = self._wire(monkeypatch, [], [
+            _order("RIG", qty=1087, oid=-2, otype="STP", perm=645430363),
+            _order("RIG", qty=1087, oid=-11, otype="LMT", perm=645430364),
+        ])
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(own)
+        orphan.resize_sell_orders.assert_called_once_with("RIG", 653)
+        own.resize_sell_orders.assert_not_called()
+        orphan.disconnect.assert_called_once()
+
+    def test_orphan_sell_against_zero_is_cancelled_through_orphan_session(self, _db, monkeypatch):
+        from src import ibkr_worker
+        own, orphan = self._wire(monkeypatch, [], [
+            _order("FUBO", qty=1521, oid=-3, otype="LMT", perm=645430335),
+            _order("SBGI", qty=971, oid=-4, otype="LMT", perm=645430367),
+        ])
+        with patch.object(ibkr_worker, "_send_telegram") as tg:
+            assert ibkr_worker._reconcile_resting_sell_orders(own) == 2
+        assert sorted(c.args[0] for c in orphan.cancel_order.call_args_list) == [-4, -3]
+        own.cancel_order.assert_not_called()
+        assert "[orphaned]" in tg.call_args[0][0]
+
+    def test_orphan_stop_against_a_short_is_cancelled(self, _db, monkeypatch):
+        """RIG as of 10-28: -434 held, orphaned STP still SELL 1087."""
+        from src import ibkr_worker
+        _pos(_db, "RIG", -434)
+        own, orphan = self._wire(monkeypatch, [], [
+            _order("RIG", qty=1087, oid=-2, otype="STP", perm=645430363)])
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(own) == 1
+        orphan.cancel_order.assert_called_once_with(-2)
+
+    def test_own_and_orphan_orders_both_reconciled(self, _db, monkeypatch):
+        from src import ibkr_worker
+        _pos(_db, "IT", 36)
+        own, orphan = self._wire(
+            monkeypatch,
+            [_order("BOX", qty=154, oid=11)],
+            [_order("IT", qty=59, oid=-7, otype="STP", perm=645430345)],
+        )
+        own.cancel_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(own)
+        own.cancel_order.assert_called_once_with(11)
+        orphan.resize_sell_orders.assert_called_once_with("IT", 36)
+
+    def test_pending_own_buy_protects_orphan_leg_of_same_ticker(self, _db, monkeypatch):
+        from src import ibkr_worker
+        own, orphan = self._wire(
+            monkeypatch,
+            [_order("TMDX", action="BUY", qty=50, oid=20)],
+            [_order("TMDX", qty=50, oid=-5, perm=1)],
+        )
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(own) == 0
+        orphan.cancel_order.assert_not_called()
+
+    def test_debounce_keyed_by_perm_id_survives_rebinding(self, _db, monkeypatch):
+        """A new clientId-0 session may bind the same order to a different
+        negative id; the 10-min clock must not restart because of it."""
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "UNBACKED_SELL_CONFIRM_SECS", 600)
+        clock = [1000.0]
+        monkeypatch.setattr(ibkr_worker.time, "monotonic", lambda: clock[0])
+        own, orphan = self._wire(monkeypatch, [], [_order("STNG", qty=144, oid=-2, perm=777)])
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(own) == 0
+            orphan.get_open_orders.return_value = [_order("STNG", qty=144, oid=-9, perm=777)]
+            clock[0] += 601
+            assert ibkr_worker._reconcile_resting_sell_orders(own) == 1
+        orphan.cancel_order.assert_called_once_with(-9)
+
+    def test_orphan_read_failure_still_reconciles_own_orders(self, _db, monkeypatch):
+        from src import ibkr_worker
+        own, orphan = self._wire(monkeypatch, [_order("BOX", qty=154, oid=11)], [])
+        orphan.get_open_orders.side_effect = RuntimeError("timeout")
+        own.cancel_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(own) == 1
+        orphan.disconnect.assert_called_once()
+
+
+class TestOpenOrphanConnection:
+    # The autouse fixture stubs _open_orphan_connection; these tests need the real one.
+    from src.ibkr_worker import _open_orphan_connection as _real_open
+    _real_open = staticmethod(_real_open)
+    @staticmethod
+    def _own(client_id=1):
+        own = MagicMock()
+        own.host, own.port, own.client_id = "127.0.0.1", 4002, client_id
+        return own
+
+    def test_disabled_by_negative_client_id(self, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "ORPHAN_CLIENT_ID", -1)
+        with patch.object(ibkr_worker, "IBKRConnection") as cls:
+            assert self._real_open(self._own()) is None
+        cls.assert_not_called()
+
+    def test_skipped_when_worker_already_is_client_zero(self, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "ORPHAN_CLIENT_ID", 0)
+        with patch.object(ibkr_worker, "IBKRConnection") as cls:
+            assert self._real_open(self._own(client_id=0)) is None
+        cls.assert_not_called()
+
+    def test_connects_as_client_zero_open_orders_only(self, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "ORPHAN_CLIENT_ID", 0)
+        with patch.object(ibkr_worker, "IBKRConnection") as cls:
+            oc = self._real_open(self._own())
+        cls.assert_called_once_with(host="127.0.0.1", port=4002, client_id=0)
+        oc.connect.assert_called_once_with(timeout=10.0, open_orders_only=True)
+
+    def test_connect_failure_returns_none(self, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr(ibkr_worker, "ORPHAN_CLIENT_ID", 0)
+        with patch.object(ibkr_worker, "IBKRConnection") as cls:
+            cls.return_value.connect.side_effect = ConnectionRefusedError("in use")
+            assert self._real_open(self._own()) is None
