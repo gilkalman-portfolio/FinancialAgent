@@ -433,6 +433,28 @@ class TestScanOpeningPrints:
         assert len(clamped) == 1
         assert clamped[0]["ticker"] == "HUBB"
 
+    def test_small_move_mega_cap_not_clamped_when_adv_lookup_fails(self):
+        """Regression, 2026-11-04: MU/AAPL/NVDA moved 0.4-1.2% on $2.0-3.2B
+        (ordinary mega-cap opening volume) on 11-02/03, yfinance answered the
+        ADV lookup with "Too Many Requests", the fail-closed path clamped all
+        four, and the job halted itself over readings that could never have
+        alerted. A reading under pct_move_min must never count as a clamp,
+        and must not spend an ADV lookup either."""
+        from src.gap_scanner import scan_opening_prints
+        idx = _opening_index(n_bars=4)
+        frame = _make_frame(
+            idx,
+            # AAPL 11-03 shape: +0.8%, ~$3.2B
+            closes_by_ticker={"AAPL": [325.40, 326.50, 327.30, 328.02]},
+            volumes_by_ticker={"AAPL": [2_450_000] * 4},
+        )
+        with patch("src.gap_scanner._download_with_retry", return_value=frame), \
+             patch("src.gap_scanner._fetch_ticker_adv", return_value=None) as adv:
+            results, clamped = scan_opening_prints(["AAPL"], pct_move_min=10.0, min_dollar_volume=500_000)
+        assert results == []
+        assert clamped == []
+        adv.assert_not_called()
+
     def test_legitimate_large_move_under_ceiling_still_included(self):
         """The clamp must not swallow a real, large-but-plausible move --
         it should only reject readings past the implausibility ceiling."""

@@ -492,6 +492,21 @@ def scan_opening_prints(
                  if ticker in volumes.columns else pd.Series(0.0, index=c.index))
             dollar_volume = float((c * v).sum())
 
+            # The plausibility guard only exists to stop a corrupted reading
+            # from going out as an alert, so it only runs on readings that
+            # WOULD alert. A reading under the move/volume bar is dropped
+            # here either way; counting it as a clamp did nothing but feed
+            # _job_halted_on_clamps() false positives. 2026-11-02/03: MU,
+            # AAPL, NVDA moved 0.4-1.2% on $2.0-3.2B (ordinary mega-cap
+            # opening volume), the ADV exemption below couldn't run because
+            # yfinance returned "Too Many Requests", the fail-closed path
+            # clamped all four, and the job halted itself on 11-04 over
+            # readings that could never have produced an alert. Every
+            # confirmed-bad reading so far (PDFS, CGON, HUBB, SFNC, NWN, EIG)
+            # moved >= 12%, so this keeps catching all of them.
+            if move_pct < pct_move_min or dollar_volume < min_dollar_volume:
+                continue
+
             implausible_move = move_pct > _MAX_PLAUSIBLE_MOVE_PCT
             implausible_volume = dollar_volume > _MAX_PLAUSIBLE_DOLLAR_VOLUME
             if implausible_volume:
@@ -529,15 +544,14 @@ def scan_opening_prints(
                 })
                 continue
 
-            if move_pct >= pct_move_min and dollar_volume >= min_dollar_volume:
-                results.append({
-                    "ticker": ticker,
-                    "price": round(latest_close, 4),
-                    "open_print": round(open_print, 4),
-                    "move_pct": round(move_pct, 2),
-                    "dollar_volume": round(dollar_volume, 2),
-                    "volume": round(float(v.sum()), 2),
-                })
+            results.append({
+                "ticker": ticker,
+                "price": round(latest_close, 4),
+                "open_print": round(open_print, 4),
+                "move_pct": round(move_pct, 2),
+                "dollar_volume": round(dollar_volume, 2),
+                "volume": round(float(v.sum()), 2),
+            })
         except Exception as e:
             logger.debug(f"Opening print scan {ticker}: {e}")
 
