@@ -207,7 +207,8 @@ def _alert_sent_recently(ticker: str, alert_type: str, hours: int = 24) -> bool:
 # Telegram notification, and _CLAMP_HALT_THRESHOLD clamps within
 # _CLAMP_HALT_WINDOW_DAYS halts the job (skips scanning, sends one escalation
 # notice, does not auto-resume) until a human investigates — this only stops
-# the informational alert job, never trading. See CLAUDE.md Incident Archive.
+# the informational alert job, never trading. See .claude/rules/incident-archive.md
+# (2026-08-25 opening-print entry).
 _CLAMP_ALERT_TYPE = "data_quality_clamp"
 _CLAMP_HALT_THRESHOLD = 3
 _CLAMP_HALT_WINDOW_DAYS = 7
@@ -243,12 +244,13 @@ def _job_halted_on_clamps(job_name: str, cfg: dict) -> bool:
     if not _alert_sent_recently("SYSTEM", f"{job_name}_halted", hours=24):
         try:
             sent = TelegramNotifier().send_message(
-                f"🛑 *{job_name}* halted — {count} data-quality clamp(s) in the last "
-                f"{_CLAMP_HALT_WINDOW_DAYS} days (threshold: {_CLAMP_HALT_THRESHOLD}).\n"
-                f"The underlying data corruption is still unexplained (see CLAUDE.md "
-                f"Incident Archive) — investigate before re-enabling. To resume without "
-                f"a fix, set gap_scanner.{job_name}_halt_override=true in "
-                f"scheduler_config.json."
+                f"🛑 *{job_name}* paused: {count} corrupted readings in the last "
+                f"{_CLAMP_HALT_WINDOW_DAYS} days (limit: {_CLAMP_HALT_THRESHOLD}).\n"
+                f"The price/volume feed for this alert keeps returning impossible "
+                f"numbers, so the alert is off until someone checks the data source. "
+                f"Trading is NOT affected — only this informational alert.\n"
+                f"To turn it back on: set gap_scanner.{job_name}_halt_override=true "
+                f"in scheduler_config.json."
             )
             if sent:
                 watchlist_save_alert("SYSTEM", f"{job_name}_halted",
@@ -272,9 +274,12 @@ def _report_clamps(clamped: list, job_name: str) -> None:
             for c in clamped
         ]
         msg = (
-            f"⚠️ *{job_name}*: {len(clamped)} implausible reading(s) discarded "
-            f"(not sent as alerts — treated as corrupted data, see CLAUDE.md):\n"
+            f"⚠️ *{job_name}*: skipped {len(clamped)} reading(s) with impossible "
+            f"numbers (likely bad data from the feed, not real moves). "
+            f"No action needed — these were not sent as alerts:\n"
             + "\n".join(lines)
+            + f"\n(If this repeats {_CLAMP_HALT_THRESHOLD}x within "
+            f"{_CLAMP_HALT_WINDOW_DAYS} days, the alert pauses itself.)"
         )
         sent = TelegramNotifier().send_message(msg)
         if not sent:
@@ -1199,7 +1204,7 @@ def run_opening_print_alert():
     try:
         init_db()
         if _job_halted_on_clamps("opening_print_alert", cfg):
-            logger.warning("run_opening_print_alert: halted — see the Telegram notice / CLAUDE.md")
+            logger.warning("run_opening_print_alert: halted on repeated data-quality clamps — see the Telegram notice / .claude/rules/incident-archive.md")
             return
         from src.gap_scanner import scan_opening_prints
         from src.index_loader import get_index
