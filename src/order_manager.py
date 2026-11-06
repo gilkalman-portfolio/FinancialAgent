@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
+from src import resting_sells
 from src.database import get_connection, retry_on_busy
 from src.signal_combiner import CombinedAlert
 
@@ -185,6 +186,7 @@ def submit_exit(
     shares: int,
     limit_price: float,
     reason: str,
+    make_room: Callable[[str, int], tuple[bool, list[str]]] | None = None,
 ) -> dict[str, Any]:
     """Guarded SELL for the worker's internal exit paths.
 
@@ -200,8 +202,19 @@ def submit_exit(
          GTC bracket stop still protects the position, so blocking software exits
          while halted costs nothing and stops runaway loops cold)
       2. shares <= held - already-working, so an exit can never cross zero
-      3. order_log written BEFORE the broker call, so a crash mid-flight leaves a
+      3. the broker's resting SELLs (bracket STP/LMT legs, orphans included
+         when the caller's make_room can see them) are shrunk to
+         held - exit_qty BEFORE the exit is sent; if that can't be confirmed
+         the exit is VETOED with retry=True and nothing is placed. YOU,
+         2026-11-04: the bracket target LMT 278 stayed resting while T1 sold
+         111 of 278 held; both filled at the open, shorting 111. The order_log
+         check in (2) never saw the bracket legs — they aren't software SELLs.
+      4. order_log written BEFORE the broker call, so a crash mid-flight leaves a
          trackable row rather than an invisible order
+
+    make_room(ticker, max_resting) -> (confirmed, changes). Defaults to the
+    client's own open orders only (resting_sells.cap_ticker); the worker passes
+    one that also covers orphaned clientId-0 orders.
 
     Returns {"status": PAUSED|VETOED|SUBMITTED|ERROR, ...}.
     """
@@ -235,6 +248,29 @@ def submit_exit(
             f"[order_manager] exit {ticker}: reducing {shares} -> {sellable} "
             f"(held={held}, working={pending})"
         )
+
+    # Never stack: every resting SELL already at the broker plus this exit
+    # must fit inside the position.
+    max_resting = held - sellable
+    try:
+        if make_room is None:
+            ok, changes = resting_sells.cap_ticker(
+                [(ibkr_client, ibkr_client.get_open_orders())], ticker, max_resting)
+        else:
+            ok, changes = make_room(ticker, max_resting)
+    except Exception as e:
+        ok, changes = False, [f"resting-order check failed: {e}"]
+    if not ok:
+        note = (f"{reason} — blocked: could not confirm resting SELLs shrunk to "
+                f"{max_resting} (held={held}, exit={sellable}): {'; '.join(changes)}")
+        _write_order_log(
+            ticker=ticker, action="SELL", shares=0, entry_price=limit_price,
+            stop_price=0, target_price=0, status="VETOED", notes=note,
+        )
+        logger.error(f"[order_manager] exit {ticker} VETOED: {note}")
+        return {"status": "VETOED", "ticker": ticker, "reason": note, "retry": True}
+    if changes:
+        logger.warning(f"[order_manager] exit {ticker}: made room — {'; '.join(changes)}")
 
     log_id = _write_order_log(
         ticker=ticker, action="SELL", shares=sellable, entry_price=limit_price,

@@ -42,6 +42,10 @@ def _test_db(monkeypatch, tmp_path):
     monkeypatch.setattr("src.ibkr_worker.get_connection", _get_conn)
     monkeypatch.setattr("src.order_manager.get_connection", _get_conn)
     monkeypatch.setattr("src.execution_engine.get_connection", _get_conn)
+    # No real clientId-0 session in tests. With it enabled, submit_exit's
+    # make_room fails closed (cannot see orphaned legs) and every exit is
+    # vetoed; orphan handling is covered in test_exit_routing/test_unbacked_sells.
+    monkeypatch.setattr("src.ibkr_worker.ORPHAN_CLIENT_ID", -1)
 
     conn = _get_conn()
     conn.executescript("""

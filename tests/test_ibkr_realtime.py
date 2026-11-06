@@ -267,3 +267,94 @@ class TestModifyStopOrderConfirmation:
         with caplog.at_level("WARNING"):
             assert conn.modify_stop_order("MSFT", 305.0, confirm_timeout=1.0) is True
         assert "2 resting STP SELL orders" in caplog.text
+
+
+class _QtyIB:
+    """Fake IB for resize_order(): broker answers on the next ib.sleep()."""
+
+    def __init__(self, mode="accept"):
+        self.mode = mode
+        self.trades = []
+        self.openOrderEvent = _Event()
+        self.errorEvent = _Event()
+        self._pending = []
+        self.cancelOrder = MagicMock(side_effect=lambda o: self._pending.append(("cancel", o)))
+        self.placeOrder = MagicMock(side_effect=lambda c, o: self._pending.append(("qty", o)))
+
+    def openTrades(self):
+        return list(self.trades)
+
+    def sleep(self, secs=0.02):
+        pending, self._pending = self._pending, []
+        for kind, order in pending:
+            trade = next(t for t in self.trades if t.order is order)
+            if self.mode == "silent":
+                continue
+            if self.mode == "reject":
+                self.errorEvent.emit(order.orderId, 201, "Order rejected", None)
+                continue
+            if kind == "cancel":
+                trade.orderStatus.status = "Cancelled"
+            else:
+                self.openOrderEvent.emit(trade)
+        return True
+
+
+def _qty_trade(order_id, qty):
+    t = _fake_trade("YOU", order_id, "LMT", "SELL")
+    t.order.totalQuantity = qty
+    return t
+
+
+class TestResizeOrder:
+    """resize_order() is what submit_exit relies on to shrink bracket legs
+    BEFORE a partial exit (YOU, 2026-11-04). It must only say True once the
+    broker confirmed."""
+
+    @pytest.fixture
+    def qconn(self, monkeypatch):
+        monkeypatch.setattr(ibkr_realtime, "IB", MagicMock)
+        c = ibkr_realtime.IBKRConnection()
+        c.ib = _QtyIB()
+        return c
+
+    def test_confirmed_resize(self, qconn):
+        t = _qty_trade(85955, 278)
+        qconn.ib.trades = [t]
+        assert qconn.resize_order(85955, 167, confirm_timeout=1.0) is True
+        assert t.order.totalQuantity == 167
+
+    def test_rejected_resize_is_false_and_local_qty_restored(self, qconn):
+        qconn.ib.mode = "reject"
+        t = _qty_trade(85955, 278)
+        qconn.ib.trades = [t]
+        assert qconn.resize_order(85955, 167, confirm_timeout=1.0) is False
+        assert t.order.totalQuantity == 278
+
+    def test_silent_broker_times_out_false(self, qconn):
+        qconn.ib.mode = "silent"
+        t = _qty_trade(85955, 278)
+        qconn.ib.trades = [t]
+        assert qconn.resize_order(85955, 167, confirm_timeout=0.2) is False
+
+    def test_zero_cancels_and_waits_for_cancelled_status(self, qconn):
+        t = _qty_trade(85954, 278)
+        qconn.ib.trades = [t]
+        assert qconn.resize_order(85954, 0, confirm_timeout=1.0) is True
+        qconn.ib.cancelOrder.assert_called_once_with(t.order)
+        qconn.ib.placeOrder.assert_not_called()
+
+    def test_unknown_or_done_order_is_false(self, qconn):
+        assert qconn.resize_order(1, 10, confirm_timeout=0.1) is False
+        done = _qty_trade(2, 50)
+        done.isDone.return_value = True
+        qconn.ib.trades = [done]
+        assert qconn.resize_order(2, 10, confirm_timeout=0.1) is False
+        qconn.ib.placeOrder.assert_not_called()
+
+    def test_get_open_orders_exposes_grouping_keys(self, qconn):
+        t = _qty_trade(85955, 278)
+        t.order.parentId, t.order.ocaGroup, t.order.tif, t.order.permId = 85953, "", "GTC", 7
+        qconn.ib.trades = [t]
+        o = qconn.get_open_orders()[0]
+        assert (o["parent_id"], o["oca_group"], o["tif"]) == (85953, "", "GTC")

@@ -428,3 +428,139 @@ class TestOpenOrphanConnection:
         with patch.object(ibkr_worker, "IBKRConnection") as cls:
             cls.return_value.connect.side_effect = ConnectionRefusedError("in use")
             assert self._real_open(self._own()) is None
+
+
+def _leg(ticker, qty, oid, otype, parent=0, tif="GTC", oca=""):
+    o = _order(ticker, qty=qty, oid=oid, otype=otype)
+    o.update(parent_id=parent, tif=tif, oca_group=oca)
+    return o
+
+
+class TestCumulativeCap:
+    """YOU, 2026-11-04: the per-order check passed both resting SELLs — T1 LMT
+    111 (DAY) and the bracket target LMT 278 — because each fit inside the 278
+    held on its own. Both filled at the open: short 111. The cap is on the
+    TOTAL, counting a bracket's STP+LMT OCA pair once."""
+
+    @staticmethod
+    def _you_orders():
+        return [
+            _leg("YOU", 278, 85954, "STP", parent=85953),
+            _leg("YOU", 278, 85955, "LMT", parent=85953),
+            _leg("YOU", 111, 86100, "LMT", tif="DAY"),   # the T1 partial exit
+        ]
+
+    def test_you_replay_bracket_shrunk_to_make_room_for_t1(self, _db):
+        from src import ibkr_worker, resting_sells
+        _pos(_db, "YOU", 278)
+        conn = MagicMock()
+        orders = self._you_orders()
+        conn.get_open_orders.return_value = orders
+        conn.resize_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram") as tg:
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+
+        calls = sorted(c.args for c in conn.resize_order.call_args_list)
+        assert calls == [(85954, 167), (85955, 167)], "bracket absorbs the cut, T1 keeps 111"
+        conn.resize_sell_orders.assert_not_called()   # no single order exceeded 278
+        conn.cancel_order.assert_not_called()
+        assert "YOU" in tg.call_args[0][0]
+
+        after = [{**o, "qty": 167} if o["order_id"] in (85954, 85955) else o for o in orders]
+        claims = resting_sells.build_claims([(conn, o) for o in after])
+        assert sum(c.qty for c in claims) == 278
+
+    def test_bracket_pair_alone_is_one_claim_not_two(self, _db):
+        from src import ibkr_worker
+        _pos(_db, "YOU", 278)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = self._you_orders()[:2]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+        conn.resize_order.assert_not_called()
+
+    def test_orphaned_bracket_plus_own_t1(self, _db, monkeypatch):
+        """Bracket legs orphaned to clientId 0 (no parent link left), T1 placed
+        by our own session: still capped, through the orphan session."""
+        from src import ibkr_worker
+        _pos(_db, "YOU", 278)
+        own = MagicMock()
+        own.get_open_orders.return_value = [_leg("YOU", 111, 86100, "LMT", tif="DAY")]
+        orphan = MagicMock()
+        orphan.get_open_orders.return_value = [
+            _leg("YOU", 278, -2, "STP"), _leg("YOU", 278, -3, "LMT")]
+        orphan.resize_order.return_value = True
+        monkeypatch.setattr(ibkr_worker, "_open_orphan_connection", lambda c: orphan)
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(own)
+        assert sorted(c.args for c in orphan.resize_order.call_args_list) == [(-3, 167), (-2, 167)]
+        own.resize_order.assert_not_called()
+
+    def test_two_software_exits_over_held_cut_the_later_one(self, _db):
+        from src import ibkr_worker
+        _pos(_db, "AAA", 100)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [
+            _leg("AAA", 60, 10, "LMT", tif="DAY"), _leg("AAA", 60, 11, "LMT", tif="DAY")]
+        conn.resize_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+        conn.resize_order.assert_called_once_with(11, 40)
+
+    def test_excess_equal_to_whole_claim_cancels_it(self, _db):
+        """Full software exit resting alongside an untouched bracket — the
+        bracket claim goes to zero (cancelled), the exit keeps its size."""
+        from src import ibkr_worker
+        _pos(_db, "FUBO", 1508)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = [
+            _leg("FUBO", 1508, 1, "STP", parent=9), _leg("FUBO", 1508, 2, "LMT", parent=9),
+            _leg("FUBO", 1508, 3, "LMT", tif="DAY")]
+        conn.resize_order.return_value = True
+        with patch.object(ibkr_worker, "_send_telegram") as tg:
+            n = ibkr_worker._reconcile_resting_sell_orders(conn)
+        assert sorted(c.args for c in conn.resize_order.call_args_list) == [(1, 0), (2, 0)]
+        assert n == 2
+        assert "CANCELLED" in tg.call_args_list[0][0][0]
+
+    def test_unconfirmed_resize_does_not_raise(self, _db):
+        from src import ibkr_worker
+        _pos(_db, "YOU", 278)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = self._you_orders()
+        conn.resize_order.return_value = False
+        with patch.object(ibkr_worker, "_send_telegram"):
+            assert ibkr_worker._reconcile_resting_sell_orders(conn) == 0
+
+    def test_pending_buy_ticker_is_skipped(self, _db):
+        from src import ibkr_worker
+        _pos(_db, "YOU", 278)
+        conn = MagicMock()
+        conn.get_open_orders.return_value = self._you_orders() + [
+            _order("YOU", action="BUY", qty=50, oid=99, otype="LMT")]
+        with patch.object(ibkr_worker, "_send_telegram"):
+            ibkr_worker._reconcile_resting_sell_orders(conn)
+        conn.resize_order.assert_not_called()
+
+
+class TestClaimGrouping:
+    def test_oca_group_counts_once(self):
+        from src import resting_sells
+        src = object()
+        claims = resting_sells.build_claims([
+            (src, _leg("X", 50, 1, "STP", oca="g1")), (src, _leg("X", 50, 2, "LMT", oca="g1"))])
+        assert [c.qty for c in claims] == [50]
+
+    def test_day_lmt_never_paired_with_a_stop(self):
+        from src import resting_sells
+        src = object()
+        claims = resting_sells.build_claims([
+            (src, _leg("X", 50, 1, "STP")), (src, _leg("X", 50, 2, "LMT", tif="DAY"))])
+        assert sorted(c.qty for c in claims) == [50, 50]
+
+    def test_groups_never_span_sources(self):
+        from src import resting_sells
+        a, b = object(), object()
+        claims = resting_sells.build_claims([
+            (a, _leg("X", 50, 1, "STP", parent=7)), (b, _leg("X", 50, 1, "LMT", parent=7))])
+        assert len(claims) == 2
