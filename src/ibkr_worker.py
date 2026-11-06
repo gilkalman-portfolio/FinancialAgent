@@ -1577,13 +1577,13 @@ def _check_score_deterioration(conn: IBKRConnection) -> None:
                 if dup:
                     continue
 
-                db.execute(
+                dedup_row_id = db.execute(
                     "INSERT INTO watchlist_alerts "
                     "(ticker, alert_type, message, sent_at, score, price) "
                     "VALUES (?, 'score_deterioration_exit', ?, ?, ?, ?)",
                     (ticker, f"Score drop exit: {entry_score:.0f}->{current_score:.0f}",
                      now.isoformat(), current_score, price),
-                )
+                ).lastrowid
 
             exit_price = round(price * 0.999, 2)
             shares_to_exit = int(pos["shares"])
@@ -1597,6 +1597,15 @@ def _check_score_deterioration(conn: IBKRConnection) -> None:
                 logger.info(
                     f"[worker] score exit {ticker}: {result['status']} — {result.get('reason')}"
                 )
+                if result.get("retry"):
+                    # Nothing was sold (resting legs couldn't be shrunk first):
+                    # drop the 24h dedup row so the exit retries next cycle.
+                    try:
+                        with get_connection() as db:
+                            db.execute("DELETE FROM watchlist_alerts WHERE id = ?",
+                                       (dedup_row_id,))
+                    except Exception as e:
+                        logger.warning(f"[worker] score exit {ticker}: dedup rollback failed: {e}")
                 continue
 
             logger.info(

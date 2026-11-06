@@ -428,3 +428,52 @@ class TestTieredExitReplay:
             tier = c.execute(
                 "SELECT exit_tier FROM ibkr_positions WHERE ticker='YOU'").fetchone()[0]
         assert tier == 0, "nothing sold, so T1 must retry next cycle"
+
+
+class TestScoreExitRetriesWhenBlocked:
+    """A score-deterioration exit writes its 24h dedup row before submitting.
+    If submit_exit blocks it (legs couldn't be shrunk), nothing was sold, so
+    the dedup row must go: otherwise the exit is silently skipped for a day."""
+
+    @pytest.fixture
+    def worker(self, _db, monkeypatch):
+        from src import ibkr_worker
+        monkeypatch.setattr("src.ibkr_worker.get_connection", _db)
+        monkeypatch.setattr(ibkr_worker, "ORPHAN_CLIENT_ID", -1)
+        monkeypatch.setattr(ibkr_worker, "_send_telegram", lambda m: True)
+        with _db() as c:
+            c.executescript("""
+                CREATE TABLE forward_signals (ticker TEXT, signal_type TEXT,
+                    composite_score REAL, signal_ts TEXT);
+                CREATE TABLE scan_runs (id INTEGER PRIMARY KEY, scan_type TEXT);
+                CREATE TABLE scan_results (ticker TEXT, run_id INTEGER,
+                    explosion_score REAL, scanned_at TEXT);
+                CREATE TABLE watchlist_alerts (id INTEGER PRIMARY KEY, ticker TEXT,
+                    alert_type TEXT, message TEXT, sent_at TEXT, score REAL, price REAL);
+            """)
+            now = datetime.now().isoformat()
+            c.execute("INSERT INTO forward_signals VALUES ('YOU','BUY',80,?)", (now,))
+            c.execute("INSERT INTO scan_runs VALUES (1,'scheduled')")
+            c.execute("INSERT INTO scan_results VALUES ('YOU',1,40,?)", (now,))
+            c.execute("INSERT INTO ibkr_positions (ticker, shares, avg_cost, unrealized_pnl,"
+                      " market_value, last_synced) VALUES ('YOU',278,48,0,?,?)",
+                      (278 * 48.0, now))
+        return ibkr_worker
+
+    def _dedup_rows(self, _db):
+        with _db() as c:
+            return c.execute("SELECT COUNT(*) FROM watchlist_alerts WHERE "
+                             "alert_type='score_deterioration_exit'").fetchone()[0]
+
+    def test_blocked_exit_removes_dedup_row(self, worker, _db):
+        b = _FakeBroker(confirm=False)
+        worker._check_score_deterioration(b)
+        assert not any(c[0] == "place" for c in b.calls)
+        assert self._dedup_rows(_db) == 0, "must retry next cycle"
+
+    def test_sent_exit_keeps_dedup_row(self, worker, _db):
+        b = _FakeBroker()
+        worker._check_score_deterioration(b)
+        assert ("place", "YOU", 278) in b.calls
+        assert b.worst_case_sold("YOU") == 278
+        assert self._dedup_rows(_db) == 1
