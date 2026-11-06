@@ -252,6 +252,12 @@ class IBKRConnection:
                 "status": trade.orderStatus.status,
                 "lmt_price": getattr(o, "lmtPrice", None),
                 "aux_price": getattr(o, "auxPrice", None),  # stop trigger price for STP orders
+                # Grouping keys for src/resting_sells.py: a bracket's STP stop and
+                # LMT target are one OCA pair — at most one of them can ever fill —
+                # so they count once against the held position, not twice.
+                "parent_id": getattr(o, "parentId", 0) or 0,
+                "oca_group": getattr(o, "ocaGroup", "") or "",
+                "tif": getattr(o, "tif", "") or "",
             })
         return result
 
@@ -515,6 +521,105 @@ class IBKRConnection:
                 )
                 resized.append(o.orderId)
         return resized
+
+    def resize_order(
+        self,
+        order_id: int,
+        new_qty: int,
+        confirm_timeout: float = MODIFY_CONFIRM_TIMEOUT_SECS,
+    ) -> bool:
+        """Set one open order's quantity and WAIT for the broker to confirm.
+
+        new_qty <= 0 cancels the order instead. Returns True only when the
+        broker echoed the order back at new_qty (or reported it cancelled);
+        False if the order isn't open in this session, is already done, was
+        rejected, or no acknowledgement arrived in time — the same confirm
+        discipline as modify_stop_order().
+
+        Unlike resize_sell_orders() (caps every SELL of a ticker, fire-and-
+        forget), this targets one order and confirms, because submit_exit()
+        must know the bracket legs really shrank BEFORE it sends a partial
+        exit — YOU, 2026-11-04: T1 sold 111 while the bracket target stayed at
+        278 against 278 held; both filled at the open, shorting 111.
+        """
+        target = None
+        for trade in self.ib.openTrades():
+            if trade.order.orderId == order_id:
+                target = trade
+                break
+        if target is None:
+            logger.warning(f"[ibkr] resize_order: order_id={order_id} not open in this session")
+            return False
+        if target.isDone():
+            logger.warning(
+                f"[ibkr] resize_order: order_id={order_id} is "
+                f"{target.orderStatus.status} — cannot resize"
+            )
+            return False
+
+        o = target.order
+        ticker = target.contract.symbol
+        old_qty = int(o.totalQuantity)
+        new_qty = max(0, int(new_qty))
+        echoed: list[int] = []
+        errors: list[tuple[int, str]] = []
+
+        def _on_open_order(trade) -> None:
+            if trade.order.orderId == order_id:
+                echoed.append(int(trade.order.totalQuantity))
+
+        def _on_error(req_id, code, msg, *args) -> None:
+            if req_id == order_id:
+                errors.append((int(code), str(msg)))
+
+        def _cancelled() -> bool:
+            return target.orderStatus.status in ("Cancelled", "ApiCancelled")
+
+        def _confirmed() -> bool:
+            if new_qty == 0:
+                return _cancelled()
+            return any(q == new_qty for q in echoed)
+
+        self.ib.openOrderEvent += _on_open_order
+        self.ib.errorEvent += _on_error
+        try:
+            if new_qty == 0:
+                self.ib.cancelOrder(o)
+            else:
+                o.totalQuantity = new_qty
+                self.ib.placeOrder(target.contract, o)
+            deadline = time.monotonic() + confirm_timeout
+            while time.monotonic() < deadline:
+                if _confirmed():
+                    break
+                # 202 = "Order Canceled" — the expected answer to a cancel.
+                if any(c not in _BENIGN_ORDER_CODES and c != 202 for c, _ in errors):
+                    break
+                self.ib.sleep(0.05)
+        finally:
+            self.ib.openOrderEvent -= _on_open_order
+            self.ib.errorEvent -= _on_error
+
+        if _confirmed():
+            logger.info(
+                f"[ibkr] resized order: {ticker} order_id={order_id} "
+                f"{old_qty} -> {new_qty}{' (cancelled)' if new_qty == 0 else ''} (confirmed)"
+            )
+            return True
+
+        if new_qty > 0 and not echoed:
+            o.totalQuantity = old_qty  # keep the local copy honest
+        if errors:
+            reason = "; ".join(f"{c}: {m}" for c, m in errors)
+        elif echoed:
+            reason = f"broker echoed qty {echoed[-1]} instead"
+        else:
+            reason = f"no broker acknowledgement within {confirm_timeout:.1f}s"
+        logger.warning(
+            f"[ibkr] resize NOT confirmed: {ticker} order_id={order_id} "
+            f"{old_qty} -> {new_qty} — {reason}"
+        )
+        return False
 
     # ── Position & Account queries (Phase 2) ────────────────────────────
 

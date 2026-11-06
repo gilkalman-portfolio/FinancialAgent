@@ -35,6 +35,9 @@ def _db(monkeypatch, tmp_path):
     monkeypatch.setattr("src.database.get_connection", _get_conn)
     monkeypatch.setattr("src.ibkr_worker.get_connection", _get_conn)
     monkeypatch.setattr("src.order_manager.get_connection", _get_conn)
+    # No real clientId-0 session in tests; with it enabled submit_exit's
+    # make_room fails closed and the T1 is vetoed (see test_exit_routing).
+    monkeypatch.setattr("src.ibkr_worker.ORPHAN_CLIENT_ID", -1)
     c = _get_conn()
     c.executescript("""
         CREATE TABLE ibkr_positions (ticker TEXT PRIMARY KEY, shares REAL, avg_cost REAL,

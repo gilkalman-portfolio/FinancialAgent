@@ -56,6 +56,7 @@ from src.forward_signals import record_fill
 from src.ibkr_realtime import IBKRConnection, PAPER_PORT
 from src.monitoring_queue import build_queue
 from src.order_manager import submit_exit
+from src import resting_sells
 from src.position_tracker import PositionTracker
 from src.signal_combiner import SupertrendEvent, evaluate
 from src.supertrend import supertrend
@@ -960,6 +961,46 @@ def _open_orphan_connection(conn: IBKRConnection) -> IBKRConnection | None:
         return None
 
 
+def _orphan_sweep_enabled(conn: IBKRConnection) -> bool:
+    return ORPHAN_CLIENT_ID >= 0 and ORPHAN_CLIENT_ID != getattr(conn, "client_id", None)
+
+
+def _make_room_for_exit(conn: IBKRConnection, ticker: str,
+                        max_resting: int) -> tuple[bool, list[str]]:
+    """order_manager.submit_exit()'s make_room for the worker: shrink every
+    resting SELL on ticker — our own AND orphaned clientId-0 orders — so their
+    total is <= max_resting, BEFORE an exit is sent. Fails closed: if either
+    order book can't be read, the exit must not go out (it could stack on
+    legs we can't see — RIG 10-23 had exactly such orphaned legs).
+    """
+    try:
+        sources = [(conn, conn.get_open_orders())]
+    except Exception as e:
+        return False, [f"open-order read failed: {e}"]
+    orphan_conn = None
+    if _orphan_sweep_enabled(conn):
+        orphan_conn = _open_orphan_connection(conn)
+        if orphan_conn is None:
+            return False, ["orphan-order session unavailable — cannot see clientId-0 legs"]
+    try:
+        if orphan_conn is not None:
+            try:
+                sources.append((orphan_conn, orphan_conn.get_open_orders()))
+            except Exception as e:
+                return False, [f"orphan open-order read failed: {e}"]
+        return resting_sells.cap_ticker(sources, ticker, max_resting)
+    finally:
+        if orphan_conn is not None:
+            try:
+                orphan_conn.disconnect()
+            except Exception:
+                pass
+
+
+def _exit_room(conn: IBKRConnection):
+    return lambda ticker, max_resting: _make_room_for_exit(conn, ticker, max_resting)
+
+
 def _reconcile_sell_sources(sources: list[tuple[IBKRConnection, list[dict]]]) -> int:
     """Apply the resting-SELL invariant to each (connection, its open orders).
 
@@ -1044,6 +1085,36 @@ def _reconcile_sell_sources(sources: list[tuple[IBKRConnection, list[dict]]]) ->
                     )
             except Exception as e:
                 logger.error(f"[worker] failed to cancel unbacked SELL{tag} {t}: {e}")
+
+    # Cumulative pass. The loop above checks each order against held on its
+    # own; the real invariant is the TOTAL. YOU, 2026-11-04: T1 LMT 111 and the
+    # bracket target LMT 278 rested against 278 held — each passed alone, both
+    # filled at the open, short 111. Claims are summed per ticker across own
+    # and orphaned orders, a bracket's STP+LMT OCA pair counting once; the
+    # excess is taken out of the bracket legs first (see resting_sells).
+    by_ticker: dict[str, list[tuple[IBKRConnection, dict]]] = {}
+    for src, orders in sources:
+        for o in orders:
+            if o.get("action") == "SELL":
+                by_ticker.setdefault(o.get("ticker"), []).append((src, o))
+    for t, entries in by_ticker.items():
+        have = held.get(t, 0.0)
+        if have <= 0 or t in pending_buys:
+            continue
+        claims = resting_sells.build_claims(entries, qty_cap=have)
+        plan = resting_sells.plan_cap(claims, int(have))
+        if not plan:
+            continue
+        logger.error(
+            f"[worker] {t}: resting SELLs total "
+            f"{sum(c.qty for c in claims)}sh against {int(have)}sh held — "
+            + " + ".join(c.describe() for c in claims)
+        )
+        ok, changes = resting_sells.apply_plan(plan)
+        for ch in changes:
+            (cancelled if ch.endswith("cancelled") else resized).append(ch + " [cumulative]")
+        if not ok:
+            logger.error(f"[worker] {t}: cumulative resting-SELL cap NOT fully applied — {changes}")
 
     # Forget orders whose position came back (or that are gone) — the clock
     # restarts from zero if they ever look unbacked again.
@@ -1250,6 +1321,7 @@ def _check_time_stops(conn: IBKRConnection) -> None:
             result = submit_exit(
                 conn, ticker, shares_to_exit, exit_price,
                 f"TIME STOP: {days_held}d zombie",
+                make_room=_exit_room(conn),
             )
             if result["status"] != "SUBMITTED":
                 logger.info(f"[worker] time stop {ticker}: {result['status']} — {result.get('reason')}")
@@ -1266,6 +1338,32 @@ def _check_time_stops(conn: IBKRConnection) -> None:
             )
         except Exception as e:
             logger.warning(f"[worker] time stop check failed for {ticker}: {e}")
+
+
+_exit_block_alerted: dict[str, str] = {}
+
+
+def _rearm_tier(ticker: str, tier: int, label: str, reason: str | None) -> None:
+    """Undo the pre-advance of exit_tier when submit_exit sent nothing because
+    the resting bracket legs could not be shrunk first. Safe to retry: no SELL
+    was placed. One Telegram per ticker per day, so a stuck leg is visible
+    without paging every 5 minutes."""
+    try:
+        with get_connection() as db:
+            db.execute("UPDATE ibkr_positions SET exit_tier = ? WHERE ticker = ?", (tier, ticker))
+    except Exception as e:
+        logger.warning(f"[worker] {label} {ticker}: could not re-arm exit_tier: {e}")
+    today = datetime.now().date().isoformat()
+    if _exit_block_alerted.get(ticker) != today:
+        _exit_block_alerted[ticker] = today
+        _send_telegram(
+            f"⛔ {label} PARTIAL EXIT HELD BACK — {ticker}\n"
+            f"The resting stop/target legs could not be confirmed resized first, so the "
+            f"partial exit was not sent (sending it would let both fill and open a short).\n"
+            f"{reason or ''}\n\n"
+            f"🎯 Action: none required — it retries every cycle; the "
+            f"bracket still protects the full position. Check TWS if this repeats."
+        )
 
 
 def _check_tiered_exits(conn: IBKRConnection) -> None:
@@ -1326,9 +1424,14 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                 result = submit_exit(
                     conn, ticker, shares_to_sell, exit_price,
                     f"T1 partial exit ({pnl_pct:+.1f}%)",
+                    make_room=_exit_room(conn),
                 )
                 if result["status"] != "SUBMITTED":
                     logger.info(f"[worker] T1 {ticker}: {result['status']} — {result.get('reason')}")
+                    if result.get("retry"):
+                        # Nothing was sold (resting legs couldn't be shrunk
+                        # first) — re-arm T1 so it retries next cycle.
+                        _rearm_tier(ticker, 0, "T1", result.get("reason"))
                     continue
                 # Never LOWER a stop: if the trail already sits above breakeven,
                 # "move to breakeven" would loosen it (SENEA/TDW/FOX/IT did exactly
@@ -1371,9 +1474,12 @@ def _check_tiered_exits(conn: IBKRConnection) -> None:
                 result = submit_exit(
                     conn, ticker, shares_to_sell, exit_price,
                     f"T2 partial exit ({pnl_pct:+.1f}%)",
+                    make_room=_exit_room(conn),
                 )
                 if result["status"] != "SUBMITTED":
                     logger.info(f"[worker] T2 {ticker}: {result['status']} — {result.get('reason')}")
+                    if result.get("retry"):
+                        _rearm_tier(ticker, 1, "T2", result.get("reason"))
                     continue
 
                 logger.info(
@@ -1471,13 +1577,13 @@ def _check_score_deterioration(conn: IBKRConnection) -> None:
                 if dup:
                     continue
 
-                db.execute(
+                dedup_row_id = db.execute(
                     "INSERT INTO watchlist_alerts "
                     "(ticker, alert_type, message, sent_at, score, price) "
                     "VALUES (?, 'score_deterioration_exit', ?, ?, ?, ?)",
                     (ticker, f"Score drop exit: {entry_score:.0f}->{current_score:.0f}",
                      now.isoformat(), current_score, price),
-                )
+                ).lastrowid
 
             exit_price = round(price * 0.999, 2)
             shares_to_exit = int(pos["shares"])
@@ -1485,11 +1591,21 @@ def _check_score_deterioration(conn: IBKRConnection) -> None:
             result = submit_exit(
                 conn, ticker, shares_to_exit, exit_price,
                 f"Score deterioration exit: {entry_score:.0f}->{current_score:.0f}",
+                make_room=_exit_room(conn),
             )
             if result["status"] != "SUBMITTED":
                 logger.info(
                     f"[worker] score exit {ticker}: {result['status']} — {result.get('reason')}"
                 )
+                if result.get("retry"):
+                    # Nothing was sold (resting legs couldn't be shrunk first):
+                    # drop the 24h dedup row so the exit retries next cycle.
+                    try:
+                        with get_connection() as db:
+                            db.execute("DELETE FROM watchlist_alerts WHERE id = ?",
+                                       (dedup_row_id,))
+                    except Exception as e:
+                        logger.warning(f"[worker] score exit {ticker}: dedup rollback failed: {e}")
                 continue
 
             logger.info(
