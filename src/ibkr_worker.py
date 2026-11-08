@@ -1884,6 +1884,78 @@ def main() -> int:
 
 _last_heartbeat: float = 0.0
 
+# ── IBKR server-link state (Gateway <-> IBKR, not worker <-> Gateway) ─────────
+# During an IBKR-side outage (weekend maintenance: 2026-10-17, 11-01/02,
+# 11-07/08) the Gateway keeps accepting API connections but repeats Error 1100
+# every ~20-150s, and data requests hang. The stall guard used to read that as
+# a displaced session and restart every ~13 min — 20 restarts and 40 Telegram
+# messages on 11-07 for an outage nobody can act on. Now the worker waits:
+# cycles are skipped while the link is down, the stall clock is held, and one
+# Telegram goes out when it drops (after a grace) and one when it returns.
+LINK_DOWN_TTL_SECS = 5 * 60        # no 1100 for this long == restored (1102 may be missed between cycles)
+LINK_ALERT_GRACE_SECS = 5 * 60     # brief blips (12:31:46 -> 12:32:11 on 11-07) stay silent
+LINK_PROBE_SECS = 3.0              # pump the event loop after connect so a pending 1100 is seen
+_LINK_LOST_CODES = frozenset({1100})
+_LINK_RESTORED_CODES = frozenset({1101, 1102})
+_link_down_first: float | None = None   # monotonic start of the current outage
+_link_last_1100: float = 0.0            # monotonic of the latest 1100
+_link_alerted: bool = False
+
+
+def _on_ib_error(req_id, code, msg="", *args) -> None:
+    """errorEvent handler — tracks the Gateway's link to IBKR's servers."""
+    global _link_down_first, _link_last_1100
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return
+    now = time.monotonic()
+    if code in _LINK_LOST_CODES:
+        if not _link_is_down(now):
+            _link_down_first = now
+            logger.warning("[worker] IBKR server link LOST (Error 1100) — cycles paused until restored")
+        _link_last_1100 = now
+    elif code in _LINK_RESTORED_CODES and _link_down_first is not None:
+        logger.info(f"[worker] IBKR server link restored (Error {code})")
+        _link_down_first = None
+
+
+def _link_is_down(now: float | None = None) -> bool:
+    if _link_down_first is None:
+        return False
+    now = time.monotonic() if now is None else now
+    return now - _link_last_1100 < LINK_DOWN_TTL_SECS
+
+
+def _link_watch(now: float | None = None) -> None:
+    """Called from the stall-guard thread: clear an expired outage and send the
+    one-down / one-up Telegram pair."""
+    global _link_down_first, _link_alerted
+    now = time.monotonic() if now is None else now
+    if _link_down_first is not None and not _link_is_down(now):
+        logger.info("[worker] IBKR server link: no Error 1100 for "
+                    f"{LINK_DOWN_TTL_SECS // 60} min — treating as restored")
+        _link_down_first = None
+    if _link_down_first is not None:
+        if not _link_alerted and now - _link_down_first >= LINK_ALERT_GRACE_SECS:
+            _link_alerted = True
+            _send_telegram(
+                "🟡 IBKR servers unreachable\n"
+                "IB Gateway reports Error 1100 (its link to IBKR is down) — usually "
+                "IBKR's weekend maintenance. The worker is waiting, not restarting; "
+                "resting bracket orders stay live at IBKR.\n\n"
+                "🎯 Action: none. You'll get one message when it's back."
+            )
+    elif _link_alerted:
+        _link_alerted = False
+        _send_telegram("🟢 IBKR servers reachable again — worker resumed normal cycles.")
+
+
+def _stall_reference() -> float:
+    """Start of the stall clock: the last cycle heartbeat, held forward while
+    the IBKR link is down (a request hung by the outage is not a stall)."""
+    return max(_last_heartbeat, _link_last_1100 if _link_down_first is not None else 0.0)
+
 
 def _start_stall_guard() -> None:
     """Kill the process if a cycle stops making progress.
@@ -1909,9 +1981,13 @@ def _start_stall_guard() -> None:
     def _watch() -> None:
         while True:
             time.sleep(STALL_CHECK_SECS)
+            try:
+                _link_watch()
+            except Exception as e:
+                logger.warning(f"[worker] link watch failed: {e}")
             if _last_heartbeat <= 0:
                 continue
-            stalled = time.monotonic() - _last_heartbeat
+            stalled = time.monotonic() - _stall_reference()
             if stalled > STALL_TIMEOUT_SECS:
                 logger.error(
                     f"[worker] STALLED — no cycle progress for {stalled:.0f}s "
@@ -1933,6 +2009,10 @@ def _start_stall_guard() -> None:
 
     threading.Thread(target=_watch, name="stall-guard", daemon=True).start()
     logger.info(f"[worker] stall guard armed ({STALL_TIMEOUT_SECS}s)")
+
+
+class _LinkDown(Exception):
+    """Cycle skipped: the Gateway's link to IBKR is down."""
 
 
 def _main_body() -> int:
@@ -1977,7 +2057,17 @@ def _main_body() -> int:
             _last_heartbeat = time.monotonic()
             try:
                 conn = IBKRConnection(port=PORT, client_id=CLIENT_ID)
+                conn.ib.errorEvent += _on_ib_error   # before connect: 1100 can arrive during it
                 conn.connect(timeout=15.0)
+                conn.ib.sleep(LINK_PROBE_SECS)
+
+                if _link_is_down():
+                    mins = (time.monotonic() - _link_down_first) / 60
+                    logger.warning(
+                        f"[worker] IBKR server link down for {mins:.0f} min — skipping cycle"
+                    )
+                    conn.disconnect()
+                    raise _LinkDown()
 
                 # Subscribe to order status events for fill/cancel callbacks
                 conn.ib.orderStatusEvent += _on_order_status
@@ -1995,6 +2085,8 @@ def _main_body() -> int:
                     conn.disconnect()
             except KeyboardInterrupt:
                 raise
+            except _LinkDown:
+                pass
             except Exception as e:
                 logger.error(f"[worker] cycle failed: {type(e).__name__}: {e}")
 
